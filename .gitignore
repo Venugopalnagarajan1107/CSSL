@@ -1,0 +1,16 @@
+# Live tournament data: PINs, phone numbers, photos, backups. Never upload these.
+data/
+*.log
+crash.log
+
+# Installed packages (recreated by "npm install")
+node_modules/
+
+# Mac / editor clutter
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets
+.env
+*.pem

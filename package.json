@@ -1,0 +1,22 @@
+{
+  "name": "tournament-app",
+  "version": "5.0.0",
+  "description": "Mobile web app to run badminton, carrom, chess and table tennis tournaments",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js",
+    "load": "node test/load.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "qrcode": "^1.5.4",
+    "web-push": "^3.6.7"
+  },
+  "overrides": {
+    "uuid": "^11.1.1"
+  }
+}
