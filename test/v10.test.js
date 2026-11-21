@@ -59,11 +59,13 @@ test('multi-sheet excel import: sheet picker, header mapping, event-per-sheet, m
     // missing name column is refused
     assert.equal((await post('/api/admin/import-players', '?dry=1', { sheets: [{ index: 2, map: {} }] })).status, 400);
 
-    // admin can delete an imported player; it is removed from events and goes to trash
-    assert.equal((await call('DELETE', '/api/admin/players/' + alpha[0].id, null, admin)).status, 200);
+    // profiles are permanent; the organizer removes the player from the event instead
+    assert.equal((await call('DELETE', '/api/admin/players/' + alpha[0].id, null, admin)).status, 403);
+    const tid = (await call('GET', '/api/state', null, admin)).body.tournaments[0].id;
+    assert.equal((await call('POST', '/api/admin/tournaments/' + tid + '/roster', { remove: alpha[0].id }, admin)).status, 200);
     const g = (await call('GET', '/api/state', null, admin)).body;
-    assert.ok(!g.players.some((p) => p.id === alpha[0].id));
-    assert.ok(!g.events.find((e) => e.id === e1.id).participantIds.includes(alpha[0].id));
-    assert.ok((await call('GET', '/api/admin/trash', null, admin)).body.some((x) => x.name === 'Sheet Alpha'));
+    assert.ok(g.players.some((p) => p.id === alpha[0].id), 'profile kept');
+    assert.ok(!g.events.find((e) => e.id === e1.id).participantIds.includes(alpha[0].id), 'out of the event’s games');
+    assert.ok(!g.tournaments[0].playerIds.includes(alpha[0].id), 'off the event roster');
   } finally { await s.stop(); }
 });

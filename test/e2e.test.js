@@ -77,8 +77,8 @@ test('full tournament flow', async () => {
   await call('POST', '/api/matches/' + m.id + '/ops', { ops: [{ type: 'point', s: 'B', inc: 1, cid: 'late' }] }, refTok);
   assert.equal((await call('GET', '/api/state')).body.matches[0].log.length, 50);
 
-  // cannot delete a player who has matches
-  assert.equal((await call('DELETE', '/api/admin/players/' + ids[0], null, admin)).status, 409);
+  // player profiles are permanent – never deleted (only pending registrations can be rejected)
+  assert.equal((await call('DELETE', '/api/admin/players/' + ids[0], null, admin)).status, 403);
   // reset + delete match, then delete player
   const chiefRef = (await call('POST', '/api/admin/referees', { name: 'Chief', kind: 'chief', pin: '5599' }, admin)).body;
   const chiefTok = (await call('POST', '/api/login', { role: 'referee', refereeId: chiefRef.id, pin: '5599' })).body.token;
@@ -86,7 +86,7 @@ test('full tournament flow', async () => {
   await call('POST', '/api/admin/matches/' + m.id + '/reset', null, chiefTok);
   assert.equal((await call('GET', '/api/state')).body.matches[0].log.length, 0);
   await call('DELETE', '/api/admin/matches/' + m.id, null, admin);
-  assert.equal((await call('DELETE', '/api/admin/players/' + ids[0], null, admin)).status, 200);
+  assert.equal((await call('DELETE', '/api/admin/players/' + ids[0], null, admin)).status, 403, 'still permanent after the match is gone');
 
   // chess result mode
   const chess = st.events.find((e) => e.name === 'Chess');
@@ -97,7 +97,8 @@ test('full tournament flow', async () => {
   assert.equal(E.derive(st.matches[0], st.events.find((e) => e.id === chess.id)).draw, true);
 
   // exports + backup
-  const x = await fetch(BASE + '/api/export.xlsx');
+  assert.equal((await fetch(BASE + '/api/export.xlsx')).status, 403, 'reports are for organizers and referees only');
+  const x = await fetch(BASE + '/api/export.xlsx', { headers: { 'x-token': admin } });
   assert.equal(x.status, 200);
   const buf = Buffer.from(await x.arrayBuffer());
   assert.equal(buf.slice(0, 2).toString(), 'PK', 'xlsx is a zip');

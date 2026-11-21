@@ -48,11 +48,14 @@ const store = {
 };
 
 let S = store.get('state', null);
+/* SA = everything from the server; S = the same data narrowed to the selected event (its games, matches, teams, registration).
+   Player profiles, referees, organizers and the gallery are shared, so they are the same in both. */
+let SA = S;
 let me = store.get('me', { role: null });
 let pending = store.get('pending', []);
 let offline = false;
 const Views = {};
-let ui = { sport: store.get('sport', ''), eventTab: {}, matchFilter: { event: '', status: '' }, adminTab: 'setup', certJob: null, section: store.get('section', 'adults'), matchView: 'list', playerSection: '', tvIdx: 0, rubber: {} };
+let ui = { tid: store.get('tid', ''), sport: store.get('sport', ''), eventTab: {}, matchFilter: { event: '', status: '' }, adminTab: 'setup', certJob: null, section: store.get('section', 'adults'), matchView: 'list', playerSection: '', tvIdx: 0, rubber: {} };
 
 /* ------------------------------------------------------------------- api */
 async function api(method, url, body, raw) {
@@ -84,13 +87,14 @@ function load() {
     try {
       const r = await fetch('/api/state', { cache: 'no-cache', headers: { 'x-token': me.token || '' } });
       if (!r.ok) throw new Error('bad status');
-      S = await r.json(); store.set('state', S); offline = false;
+      SA = await r.json(); store.set('state', SA); scope(); offline = false;
     } catch (e) { offline = true; }
     if (S) document.documentElement.style.setProperty('--brand', S.tournament.primary || '#0f766e');
-  })().finally(() => { loadP = null; if (loadQueued) { loadQueued = false; setTimeout(load, 250); } });
+  })().finally(() => { loadP = null; if (loadQueued) { loadQueued = false; setTimeout(() => load().then(() => { if (!busy()) render(); }), 250); } });
   return loadP;
 }
-async function refresh() { await load(); render(); }
+/* After a change: wait for any load that started before the change, then fetch again, so the screen never shows stale data. */
+async function refresh() { if (loadP) { try { await loadP; } catch (e) { /* ignore */ } } await load(); render(); }
 
 /* ---------------------------------------------------------- offline queue */
 let flushing = false;
@@ -141,13 +145,36 @@ setInterval(flush, 5000);
 window.addEventListener('online', () => { offline = false; flush(); });
 
 /* ------------------------------------------------------------ data helpers */
-const byId = (col, id) => (S[col] || []).find((x) => x.id === id);
+const byId = (col, id) => (((SA || S) || {})[col] || []).find((x) => x.id === id);
+const realTours = () => ((SA && SA.tournaments) || []).filter((t) => t.kind !== 'friendly');
+function curTid() { const ts = realTours(); if (!ts.some((t) => t.id === ui.tid)) ui.tid = (ts.find((t) => t.status !== 'closed') || ts[0] || {}).id || ''; return ui.tid; }
+const tourById = (id) => ((SA && SA.tournaments) || []).find((t) => t.id === id);
+const curT = () => tourById(curTid()) || { id: '', name: 'Event', organizerIds: [], refereeIds: [], playerIds: [], status: 'open' };
+const isFriendlyEv = (ev) => !!ev && ev.tid === 'friendly';
+function scope() {
+  if (!SA) return;
+  const tid = curTid(), games = new Set(SA.events.filter((e) => e.tid === tid).map((e) => e.id));
+  const reg = SA.registration || {}, one = (reg.tours || []).find((x) => x.tid === tid);
+  S = { ...SA, events: SA.events.filter((e) => games.has(e.id)), matches: SA.matches.filter((m) => games.has(m.eventId)), teams: SA.teams.filter((t) => !t.tid || t.tid === tid),
+    registration: one ? { ...reg, ...one } : { ...reg, open: false, events: [], pending: 0 } };
+}
+function pickEvent(tid) { ui.tid = tid; store.set('tid', tid); scope(); render(); }
+const canManageTour = (t) => isAdmin() && !!t && (isOrganizer() || (t.organizerIds || []).includes(me.adminId));
 const evOf = (m) => byId('events', m.eventId);
 const nameOf = (ev, id) => { const x = byId(ev.sideType === 'team' ? 'teams' : 'players', id); return x ? x.name : '?'; };
 const sideLabel = (ev, ids) => ids.map((i) => nameOf(ev, i)).join(' & ');
-const isStaff = () => !!me.role && me.role !== 'captain';
+const isStaff = () => !!(me.adminId || me.refId || me.role === 'admin' || me.role === 'referee');
 const isAdmin = () => me.role === 'admin';
-const canScore = () => me.role === 'referee' && me.kind !== 'volunteer';   /* only referees change scores */
+/* main organizer (full rights) vs sport lead / game organizer (only their games) */
+const isOrganizer = () => isAdmin() && !(me.sports || []).length && !me.limited;
+const canManage = (ev) => isAdmin() && !!ev && (isOrganizer() || (me.sports || []).includes(ev.sport) || (ev.organizerIds || []).includes(me.adminId) || ((tourById(ev.tid) || {}).organizerIds || []).includes(me.adminId));
+const staffMissing = (ev) => (isFriendlyEv(ev) || (ev.refereeIds || []).length ? [] : ['a referee']);
+const maskPhone = (v) => { const d = String(v || '').replace(/\D/g, ''); return d.length < 5 ? (d ? '•••' : '') : d.slice(0, 2) + '•'.repeat(Math.max(3, d.length - 5)) + d.slice(-3); };
+/* A match's referees, shown as one name-like object so existing "Referee: X" displays keep working. */
+const refsOf = (m) => { const rs = (m.refereeIds || []).map((id) => byId('referees', id)).filter(Boolean); return rs.length ? { name: rs.map((r) => r.name).join(', '), id: rs[0].id } : null; };
+const orgName = (id) => ((S.organizers || []).find((a) => a.id === id) || {}).name;
+const refName = (id) => (byId('referees', id) || {}).name;
+const canScore = () => !!(me.refId || me.role === 'referee') && me.kind !== 'volunteer';   /* only referees change scores */
 const SEC = { adults: 'Adults', kids: 'Kids' };
 const secOf = (ev) => (ev && ev.section) || 'adults';
 const eventsOf = (sec) => S.events.filter((e) => secOf(e) === sec);
@@ -178,7 +205,7 @@ function liveMatch(m) {
 }
 const pendingFor = (id) => pending.filter((p) => p.matchId === id).length;
 
-const playerStats = (pid) => E.playerStats(pid, S, S.matches.map(liveMatch));
+const playerStats = (pid) => E.playerStats(pid, SA, SA.matches.map(liveMatch));   /* a profile covers every event */
 const r2 = E.r2;
 
 /* ----------------------------------------------------------------- images */
@@ -237,7 +264,7 @@ function matchCard(m, opts) {
   if (ev.scoring === 'result' && d.status === 'completed') mid = d.draw ? '½ – ½' : d.winner === 'A' ? '1 – 0' : '0 – 1';
   return h('a', { class: 'card match ' + d.status, href: '#/match/' + m.id },
     h('div', { class: 'mc-top' }, chip(d.status),
-      h('span', { class: 'muted' }, [opts.event ? ev.name : null, m.stage !== 'League' ? m.stage : (m.round ? 'Round ' + m.round + (m.totalRounds ? ' of ' + m.totalRounds : '') : null), m.court, fmtSlot(m)].filter(Boolean).join(' • '))),
+      h('span', { class: 'muted' }, [opts.event ? ev.name + (m.no ? ' #' + m.no : '') : m.no ? 'Match #' + m.no : null, m.stage !== 'League' ? m.stage : (m.round ? 'Round ' + m.round + (m.totalRounds ? ' of ' + m.totalRounds : '') : null), m.court, fmtSlot(m)].filter(Boolean).join(' • '))),
     h('div', { class: 'mc-row' },
       h('div', { class: 'mc-side' + (d.winner === 'A' ? ' win' : '') }, A),
       h('div', { class: 'mc-mid' }, mid),
@@ -323,11 +350,11 @@ Views.home = () => {
   const live = ms.filter((x) => x.d.status === 'live'), next = ms.filter((x) => x.d.status === 'scheduled').slice(0, 4);
   const done = ms.filter((x) => x.d.status === 'completed').slice(-4).reverse();
   return h('div', {},
-    sponsorStrip(), sectionTabs(), sportChips(),
+    sponsorStrip(), eventSwitcher(), seasonCard(), sectionTabs(), sportChips(),
     S.registration && S.registration.open ? h('a', { class: 'card tip', href: '#/register' }, '📝 Registration is open – tap here to register as a player') : null,
     isAdmin() && S.registration && S.registration.pending ? h('a', { class: 'card warnbox', href: '#/admin', onclick: () => { ui.adminTab = 'registration'; } }, '⏳ ' + S.registration.pending + ' registration(s) waiting for your approval') : null,
     live.length ? h('section', {}, h('h2', {}, h('span', { class: 'dot' }), 'Live now'), live.map((x) => matchCard(x.m, { event: true }))) : null,
-    h('section', {}, h('h2', {}, 'Events'), h('div', { class: 'grid' }, eventsOf(ui.section).filter(sportPass).map((ev) => {
+    h('section', {}, h('h2', {}, 'Games – ' + curT().name), h('div', { class: 'grid' }, eventsOf(ui.section).filter(sportPass).map((ev) => {
       const rows = E.standings(ev, S.matches.map(liveMatch)).filter((r) => r.played > 0).slice(0, 3);
       const c = E.champion(ev, S.matches);
       return h('a', { class: 'card ev', href: '#/event/' + ev.id },
@@ -377,24 +404,26 @@ Views.event = (id) => {
   const body = tab === 'bracket' ? h('div', {}, championBanner(ev), bracketView(ev))
     : tab === 'standings' ? h('div', {}, championBanner(ev), standingsTable(ev), hasKO && fmt.type !== 'knockout' ? h('div', {}, h('h3', {}, 'Knockout'), bracketView(ev)) : null)
     : tab === 'fixtures' ? h('div', {}, ms.length ? ms.map((x) => matchCard(x.m)) : h('p', { class: 'empty' }, 'No fixtures yet.'))
+      : ev.sideType === 'team' && canManage(ev) ? teamBuilder(ev)
       : h('div', { class: 'list' }, (ev.participantIds || []).map((pid) => {
         if (ev.sideType === 'team') { const t = byId('teams', pid); return h('div', { class: 'row' }, h('b', {}, t ? t.name : '?'), h('span', { class: 'muted small' }, t ? t.memberIds.map((x) => (byId('players', x) || {}).name).join(', ') : '')); }
         const p = byId('players', pid); return h('a', { class: 'row', href: '#/player/' + pid }, avatar(p, 32), h('b', {}, p ? p.name : '?'));
       }));
   return h('div', {},
-    h('div', { class: 'page-h' }, h('a', { class: 'back', href: '#/' }, '‹'), h('h1', {}, ev.name), secOf(ev) === 'kids' ? h('span', { class: 'chip kids' }, 'Kids') : null),
+    h('div', { class: 'page-h' }, h('a', { class: 'back', href: '#/season' }, '‹'), h('h1', {}, ev.name), secOf(ev) === 'kids' ? h('span', { class: 'chip kids' }, 'Kids') : null),
     ev.note ? h('p', { class: 'muted small' }, ev.note) : null,
     h('p', { class: 'muted small' }, formatSummary(ev)),
+    staffLine(ev),
     h('div', { class: 'seg' }, [(fmt.type === 'knockout' ? ['bracket', 'Bracket'] : null), ['standings', fmt.type === 'knockout' ? 'Table' : 'Standings'], ['fixtures', 'Fixtures (' + ms.length + ')'], ['people', ev.sideType === 'team' ? 'Teams' : 'Players']].filter(Boolean).map(([k, l]) => h('button', { class: tab === k || (!ui.eventTab[id] && k === 'bracket') ? 'on' : '', onclick: () => setTab(k) }, l))),
     h('div', { class: 'actions noprint' },
-      h('button', { class: 'btn ghost', onclick: () => window.print() }, '🖨 Print / PDF'),
+      isStaff() ? h('button', { class: 'btn ghost', onclick: () => window.print() }, '🖨 Print / PDF') : null,
       h('button', { class: 'btn ghost', onclick: () => shareText(standingsText(ev)) }, '↗ Share'),
-      isAdmin() ? h('button', { class: 'btn', onclick: () => fixtureModal(ev.id) }, '+ Fixture') : null,
-      isAdmin() ? h('button', { class: 'btn ghost', onclick: () => generateModal(ev) }, fmt.type === 'swiss' ? '⚡ Next Swiss round' : fmt.type === 'knockout' ? '⚡ Draw bracket' : fmt.type === 'groups' ? '⚡ Draw groups' : '⚡ Generate fixtures') : null,
-      isAdmin() && canNext ? h('button', { class: 'btn ghost', onclick: () => finalsFlow(ev) }, nextLabel) : null,
-      isAdmin() && hasDraw ? h('button', { class: 'btn ghost', onclick: () => resetDrawFlow(ev) }, '↺ Reset draw') : null,
-      isAdmin() ? h('button', { class: 'btn ghost', onclick: () => participantModal(ev) }, '⇄ Withdraw / replace') : null,
-      isAdmin() ? h('button', { class: 'btn ghost', onclick: () => eventModal(ev) }, '⚙ Edit event') : null),
+      canManage(ev) ? h('button', { class: 'btn', onclick: () => needStaff(ev, () => fixtureModal(ev.id)) }, '+ Fixture') : null,
+      canManage(ev) ? h('button', { class: 'btn ghost', onclick: () => needStaff(ev, () => generateModal(ev)) }, fmt.type === 'swiss' ? '⚡ Next Swiss round' : fmt.type === 'knockout' ? '⚡ Draw bracket' : fmt.type === 'groups' ? '⚡ Draw groups' : '⚡ Generate fixtures') : null,
+      canManage(ev) && canNext ? h('button', { class: 'btn ghost', onclick: () => finalsFlow(ev) }, nextLabel) : null,
+      canManage(ev) && hasDraw ? h('button', { class: 'btn ghost', onclick: () => resetDrawFlow(ev) }, '↺ Reset draw') : null,
+      canManage(ev) ? h('button', { class: 'btn ghost', onclick: () => participantModal(ev) }, '⇄ Withdraw / replace') : null,
+      canManage(ev) ? h('button', { class: 'btn ghost', onclick: () => eventModal(ev) }, '⚙ Game settings') : null),
     body);
 };
 
@@ -425,21 +454,42 @@ function scheduleView(rows) {
     !rows.length ? h('p', { class: 'empty' }, 'No matches yet.') : null);
 }
 
-Views.matches = () => {
+function eventMatches() {
   const f = ui.matchFilter, evs = eventsOf(ui.section).filter(sportPass);
   if (f.event && !evs.some((e) => e.id === f.event)) f.event = '';
   const rows = S.matches.map((m) => ({ m, ev: evOf(m), d: E.derive(liveMatch(m), evOf(m)) })).filter((x) => x.ev && secOf(x.ev) === ui.section && sportPass(x.ev) && (!f.event || x.m.eventId === f.event) && (!f.status || x.d.status === f.status));
   const order = { live: 0, scheduled: 1, completed: 2 };
   rows.sort((a, b) => order[a.d.status] - order[b.d.status] || b.m.createdAt - a.m.createdAt);
   return h('div', {},
-    h('h1', {}, 'Matches'), sectionTabs(), sportChips(),
+    sectionTabs(), sportChips(),
     h('div', { class: 'seg' }, [['list', 'List'], ['schedule', 'Schedule']].map(([k, l]) => h('button', { class: ui.matchView === k ? 'on' : '', onclick: () => { ui.matchView = k; render(); } }, l))),
     h('div', { class: 'filters' },
-      h('select', { 'aria-label': 'Event', onchange: (e) => { f.event = e.target.value; render(); } }, h('option', { value: '' }, 'All events'), evs.map((e) => h('option', { value: e.id, selected: f.event === e.id }, e.name))),
+      h('select', { 'aria-label': 'Game', onchange: (e) => { f.event = e.target.value; render(); } }, h('option', { value: '' }, 'All games'), evs.map((e) => h('option', { value: e.id, selected: f.event === e.id }, e.name))),
       h('select', { 'aria-label': 'Status', onchange: (e) => { f.status = e.target.value; render(); } }, [['', 'Any status'], ['live', 'Live'], ['scheduled', 'Upcoming'], ['completed', 'Completed']].map(([v, l]) => h('option', { value: v, selected: f.status === v }, l)))),
     ui.matchView === 'schedule' ? scheduleView(rows) : (rows.length ? rows.map((x) => matchCard(x.m, { event: true })) : h('p', { class: 'empty' }, 'No matches yet.')),
-    isAdmin() ? h('button', { class: 'btn fab', onclick: () => fixtureModal(f.event || (evs[0] || {}).id) }, '+ Fixture') : null);
+    canManageTour(curT()) && curT().status !== 'closed' ? h('button', { class: 'btn', onclick: () => { const ev = byId('events', f.event) || evs[0]; if (!ev) return toast('Create a game first', true); needStaff(ev, () => fixtureModal(ev.id)); } }, '+ Fixture') : null);
+}
+/* Top-level Matches: friendly ("raw") matches between any players, outside every event. */
+Views.matches = () => {
+  const ms = SA.matches.filter((m) => isFriendlyEv(byId('events', m.eventId))).map((m) => ({ m, d: E.derive(liveMatch(m), byId('events', m.eventId)) }));
+  const order = { live: 0, scheduled: 1, completed: 2 }; ms.sort((a, b) => order[a.d.status] - order[b.d.status] || b.m.createdAt - a.m.createdAt);
+  return h('div', {}, h('h1', {}, 'Friendly matches'),
+    h('p', { class: 'muted small' }, 'Quick matches between any players, outside the events. Results count in players’ profiles and all-time rankings. Event matches are under 🏆 Event → Matches.'),
+    isStaff() ? h('button', { class: 'btn', onclick: () => friendlyModal() }, '+ New match') : h('p', { class: 'muted small' }, 'Organizers and referees can start a friendly match.'),
+    ms.length ? ms.map((x) => matchCard(x.m, { event: true })) : h('p', { class: 'empty' }, 'No friendly matches yet.'));
 };
+function friendlyModal() {
+  const people = SA.players.filter((p) => p.status !== 'pending').sort((a, b) => a.name.localeCompare(b.name));
+  const sport = h('select', {}, [['badminton', '🏸 Badminton'], ['tt', '🏓 Table tennis'], ['carrom', '🎯 Carrom'], ['chess', '♟️ Chess']].map(([v, l]) => h('option', { value: v }, l)));
+  const kind = h('select', {}, h('option', { value: 'singles' }, 'Singles'), h('option', { value: 'doubles' }, 'Doubles'));
+  const pick = () => h('select', {}, h('option', { value: '' }, '— choose player —'), people.map((p) => h('option', { value: p.id }, p.name + (p.section === 'kids' ? ' (kids)' : ''))));
+  const a = [pick(), pick()], b = [pick(), pick()], court = h('input', { placeholder: 'Court / table (optional)' });
+  const sides = h('div', {});
+  const draw = () => { const n = kind.value === 'doubles' ? 2 : 1; sides.replaceChildren(h('div', { class: 'two' }, h('div', {}, h('b', {}, 'Side A'), a.slice(0, n)), h('div', {}, h('b', {}, 'Side B'), b.slice(0, n)))); };
+  kind.addEventListener('change', draw); draw();
+  modal('New friendly match', h('div', {}, field('Sport', sport), field('Format', kind), sides, field('Court', court)),
+    [{ label: 'Start', fn: async () => { const n = kind.value === 'doubles' ? 2 : 1; const m = await api('POST', '/api/staff/friendly', { sport: sport.value, kind: kind.value, sideA: a.slice(0, n).map((x) => x.value), sideB: b.slice(0, n).map((x) => x.value), court: court.value }); await refresh(); location.hash = '#/match/' + m.id; } }]);
+}
 
 /* ------- match page: scoreboard + referee controls ------- */
 Views.match = (id) => {
@@ -448,7 +498,7 @@ Views.match = (id) => {
   const ev = evOf(m), lm = liveMatch(m), d = E.derive(lm, ev);
   const staff = canScore(), A = sideLabel(ev, m.sideA), B = sideLabel(ev, m.sideB);
   const can = staff && d.status !== 'completed';
-  const ref = byId('referees', m.refereeId);
+  const ref = refsOf(m);
   const side = (s, name) => {
     const gw = s === 'A' ? d.gamesA : d.gamesB, cur = d.current ? (s === 'A' ? d.current.a : d.current.b) : null;
     const win = d.winner === s;
@@ -463,7 +513,7 @@ Views.match = (id) => {
   if (staff && navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {});
   const np = pendingFor(m.id);
   return h('div', {},
-    h('div', { class: 'page-h' }, h('a', { class: 'back', href: '#/event/' + ev.id }, '‹'), h('h1', {}, ev.name)),
+    h('div', { class: 'page-h' }, h('a', { class: 'back', href: isFriendlyEv(ev) ? '#/matches' : '#/event/' + ev.id }, '‹'), h('h1', {}, ev.name + (m.no ? ' #' + m.no : ''))),
     h('div', { class: 'muted small center' }, [m.stage === 'League' && m.round ? 'Round ' + m.round + (m.totalRounds ? ' of ' + m.totalRounds : '') : m.stage, m.court, m.time, ref ? 'Referee: ' + ref.name : null].filter(Boolean).join(' • ')),
     h('div', { class: 'center' }, chip(d.status)),
     h('div', { class: 'scoreboard' }, side('A', A), h('div', { class: 'sb-vs' }, 'VS'), side('B', B)),
@@ -535,7 +585,7 @@ function tieView(m) {
   const ev = evOf(m), lm = liveMatch(m), d = E.derive(lm, ev);
   const staff = canScore(), A = sideLabel(ev, m.sideA), B = sideLabel(ev, m.sideB);
   const can = staff && d.status !== 'completed';
-  const ref = byId('referees', m.refereeId), np = pendingFor(m.id);
+  const ref = refsOf(m), np = pendingFor(m.id);
   const total = d.rubbers.length, needW = Math.floor(total / 2) + 1, clinch = (ev.rubberRules || {}).clinch !== false;
   const selId = ui.rubber[m.id], selR = lm.rubbers.find((r) => r.id === selId);
   if (staff && navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {});
@@ -552,7 +602,7 @@ function tieView(m) {
         me.kind === 'chief' && ev.scoring === 'points' ? h('button', { class: 'btn ghost sm', onclick: () => scoresModal(m, ev, d, r.id) }, '✏ Correct') : null));
   });
   return h('div', {},
-    h('div', { class: 'page-h' }, h('a', { class: 'back', href: '#/event/' + ev.id }, '‹'), h('h1', {}, ev.name)),
+    h('div', { class: 'page-h' }, h('a', { class: 'back', href: isFriendlyEv(ev) ? '#/matches' : '#/event/' + ev.id }, '‹'), h('h1', {}, ev.name + (m.no ? ' #' + m.no : ''))),
     h('div', { class: 'muted small center' }, [m.stage, m.court, fmtSlot(m), ref ? 'Referee: ' + ref.name : null].filter(Boolean).join(' • ')),
     h('div', { class: 'center' }, chip(d.status)),
     h('div', { class: 'scoreboard' },
@@ -644,6 +694,166 @@ Views.players = () => {
   draw(); return wrap;
 };
 
+/* ------- season: one active season (e.g. "CSSL - Season 3") holds all games; past seasons are kept read-only ------- */
+function seasonCard() {
+  const t = S.tournament;
+  const ds = S.matches.filter((m) => evOf(m)).map((m) => E.derive(liveMatch(m), evOf(m)).status);
+  const done = ds.filter((x) => x === 'completed').length;
+  const status = !ds.length || ds.every((x) => x === 'scheduled') ? 'Upcoming' : done === ds.length ? 'Completed' : 'In progress';
+  return h('a', { class: 'card season', href: '#/season' },
+    h('div', { class: 'season-h' }, h('b', {}, '🏆 ' + curT().name), h('span', { class: 'chip plain' }, curT().status === 'closed' ? 'Closed' : status)),
+    h('div', { class: 'muted small' }, [t.dates, t.venue, S.events.length + ' games', ds.length ? done + ' of ' + ds.length + ' matches played' : 'no fixtures yet'].filter(Boolean).join(' • ')),
+    h('div', { class: 'muted small' }, 'Tap for games, organizers and referees ›'));
+}
+Views.seasons = () => {
+  const fmt = (t) => (t ? new Date(t).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '');
+  const ts = realTours().slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)), past = (SA.seasons || []).slice().reverse();
+  return h('div', {}, h('div', { class: 'page-h' }, h('a', { class: 'back', href: '#/' }, '‹'), h('h1', {}, 'All events')),
+    ts.map((t) => h('a', { class: 'card', href: '#/season', onclick: () => { ui.tid = t.id; store.set('tid', t.id); scope(); } },
+      h('div', { class: 'season-h' }, h('b', {}, t.name), h('span', { class: 'chip ' + (t.status === 'closed' ? 'plain' : 'live') }, t.status === 'closed' ? 'Closed' : 'Open')),
+      h('div', { class: 'muted small' }, [t.dates, SA.events.filter((e) => e.tid === t.id).length + ' games', (t.playerIds || []).length + ' players', 'started ' + fmt(t.createdAt)].filter(Boolean).join(' • ')))),
+    past.length ? h('h2', {}, 'Archived seasons') : null,
+    past.map((x) => h('div', { class: 'card' }, h('b', {}, x.name), h('div', { class: 'muted small' }, fmt(x.startedAt) + ' – ' + fmt(x.endedAt) + ' • ' + x.matches + ' matches'),
+      x.champions.length ? h('div', { class: 'list' }, x.champions.map((c) => h('div', { class: 'small' }, h('b', {}, c.event + (c.section === 'kids' ? ' (kids)' : '') + ': '), '🥇 ' + c.first + (c.second ? ' • 🥈 ' + c.second : '') + (c.third ? ' • 🥉 ' + c.third : '')))) : null)));
+};
+
+/* ------- the Event (season) page: games with their organizer and referees, referees, organizers ------- */
+const KIND_LABEL = (ev) => (ev.sideType === 'team' ? 'Team event' : ev.sideSize === 2 ? 'Individual – doubles' : 'Individual – singles');
+function staffLine(ev) {
+  const miss = staffMissing(ev);
+  const orgs = (ev.organizerIds || []).map(orgName).filter(Boolean), refs = (ev.refereeIds || []).map(refName).filter(Boolean);
+  return h('div', { class: 'card staff' + (miss.length ? ' warnbox' : '') },
+    h('div', { class: 'small' }, '👔 Organizer: ', h('b', {}, [...new Set(orgs.concat(((tourById(ev.tid) || {}).organizerIds || []).map(orgName).filter(Boolean)))].join(', ') || '—'), ' • 🧑‍⚖️ Referees: ', h('b', {}, refs.join(', ') || '— not set —')),
+    miss.length && canManage(ev) ? h('div', { class: 'small' }, '⚠ This game needs ' + miss.join(' and ') + ' before fixtures can be made.') : null,
+    canManage(ev) && !isFriendlyEv(ev) ? h('button', { class: 'btn ghost sm', onclick: () => staffModal(ev) }, miss.length ? 'Assign referee' : 'Change referees') : null);
+}
+const needStaff = (ev, go) => { const miss = staffMissing(ev); if (!miss.length) return go(); toast('First assign ' + miss.join(' and ') + ' to ' + ev.name, true); staffModal(ev); };
+Views.season = (sub) => {
+  const T = curT(), tab = sub || ui.seasonTab || 'games', mine = canManageTour(T), closed = T.status === 'closed';
+  const setTab = (k) => { ui.seasonTab = k; location.hash = '#/season/' + k; };
+  const roster = new Set(T.playerIds || []);
+  const tabs = [['games', 'Games'], ['matches', 'Matches'], ['teams', 'Teams'], ['players', 'Players (' + roster.size + ')'], ['referees', 'Referees'], ['organizers', 'Organizers']];
+  const games = (sec) => eventsOf(sec).map((ev) => {
+    const miss = staffMissing(ev), waiting = ev.sideType === 'team' ? (ev.interestedIds || []).filter((id) => !(ev.participantIds || []).some((tid) => ((byId('teams', tid) || {}).memberIds || []).includes(id))).length : 0;
+    return h('a', { class: 'card ev', href: '#/event/' + ev.id },
+      h('div', { class: 'season-h' }, h('b', {}, (SPORT_ICON[ev.sport] || '🏅') + ' ' + ev.name), h('span', { class: 'chip plain' }, KIND_LABEL(ev))),
+      h('div', { class: 'muted small' }, [(ev.participantIds || []).length + (ev.sideType === 'team' ? ' teams' : ' players'), waiting ? waiting + ' waiting for a team' : '', S.matches.filter((m) => m.eventId === ev.id).length + ' matches'].filter(Boolean).join(' • ')),
+      h('div', { class: 'small' }, '🧑‍⚖️ ' + ((ev.refereeIds || []).map(refName).filter(Boolean).join(', ') || '—')),
+      miss.length && isAdmin() ? h('div', { class: 'small bad' }, '⚠ needs ' + miss.join(' and ')) : null);
+  });
+  const names = (ids, f) => (ids || []).map(f).filter(Boolean);
+  const body = tab === 'matches' ? eventMatches()
+    : tab === 'teams' ? eventTeams(T)
+    : tab === 'players' ? eventPlayers(T)
+    : tab === 'referees' ? h('div', {},
+      h('div', { class: 'card' }, h('b', {}, '🧑‍⚖️ Referees of ' + T.name), h('div', { class: 'chips' }, names(T.refereeIds, refName).map((n) => h('span', { class: 'chip plain' }, n))),
+        mine ? h('button', { class: 'btn ghost sm', onclick: () => tourStaffModal(T, 'referees') }, '+ Add / change referees') : null),
+      isOrganizer() ? h('details', {}, h('summary', {}, 'All referee accounts, PINs and referee sign-up'), Views.referees(true)) : null)
+    : tab === 'organizers' ? h('div', {},
+      h('div', { class: 'card' }, h('b', {}, '👔 Organizers of ' + T.name), h('p', { class: 'muted small' }, 'The person who created the event and anyone added here manage everything in it: games, teams, players, fixtures and referees.' + (T.createdBy ? ' Created by ' + T.createdBy + '.' : '')),
+        h('div', { class: 'chips' }, names(T.organizerIds, orgName).map((n) => h('span', { class: 'chip plain' }, n))),
+        mine ? h('button', { class: 'btn ghost sm', onclick: () => tourStaffModal(T, 'organizers') }, '+ Add / change organizers') : null),
+      isOrganizer() ? h('details', {}, h('summary', {}, 'All organizer accounts and PINs'), adminsCard()) : null)
+    : h('div', {},
+      mine && !closed ? h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: () => newGameModal() }, '+ New game'), isOrganizer() ? h('button', { class: 'btn ghost', onclick: () => shiftModal() }, '⏱ Running late?') : null) : null,
+      ['adults', 'kids'].map((sec) => eventsOf(sec).length ? h('section', {}, h('h2', {}, SEC[sec]), h('div', { class: 'grid' }, games(sec))) : null),
+      !S.events.length ? h('p', { class: 'empty' }, 'No games yet.' + (mine ? ' Tap “+ New game” – badminton, table tennis, carrom, chess…, individual or team.' : '')) : null);
+  return h('div', {},
+    eventSwitcher(),
+    h('div', { class: 'season-h' }, h('h1', {}, '🏆 ' + T.name), closed ? h('span', { class: 'chip' }, 'Closed') : null, mine ? h('button', { class: 'btn ghost sm', onclick: () => tourDetailsModal(T) }, '⚙ Details') : null),
+    h('p', { class: 'muted small' }, [T.dates, T.venue, S.events.length + ' games', roster.size + ' players', '👔 ' + (names(T.organizerIds, orgName).join(', ') || '—')].filter(Boolean).join(' • ')),
+    h('div', { class: 'seg scroll' }, tabs.map(([k, l]) => h('button', { class: tab === k ? 'on' : '', onclick: () => setTab(k) }, l))),
+    body);
+};
+/* Which event you are looking at; anyone with a PIN can start a new one. */
+function eventSwitcher() {
+  const ts = realTours().slice().sort((a, b) => (a.status === 'closed') - (b.status === 'closed') || (b.createdAt || 0) - (a.createdAt || 0));
+  return h('div', { class: 'evswitch' },
+    ts.length > 1 ? h('select', { 'aria-label': 'Event', onchange: (e) => pickEvent(e.target.value) }, ts.map((t) => h('option', { value: t.id, selected: t.id === curTid() }, t.name + (t.status === 'closed' ? ' (closed)' : '')))) : null,
+    isStaff() ? h('button', { class: 'btn ghost sm', onclick: () => newEventModal() }, '+ New event') : null);
+}
+
+/* ------- rankings: points for wins/draws plus medals, per sport or overall, this season or all-time ------- */
+let rankCache = {};
+function seasonRec() {
+  if (rankCache.S !== S || rankCache.p !== pending.length) rankCache = { S, p: pending.length, cur: E.seasonRecords(S, S.matches.map(liveMatch)) };
+  return rankCache.cur;
+}
+let allCache = {};
+function allRec() { if (allCache.S !== SA || allCache.p !== pending.length) allCache = { S: SA, p: pending.length, rec: E.seasonRecords(SA, SA.matches.map(liveMatch)) }; return allCache.rec; }
+const rankPts = () => ({ ...E.RANK_POINTS, ...(S.tournament.rankPts || {}) });
+function rankRows(section, sport, period) {
+  const sets = period === 'all' ? [allRec()].concat((SA.seasons || []).map((x) => x.records)) : [seasonRec()];
+  return E.rankings(sets, { sport, players: S.players.filter((p) => (p.section || 'adults') === section), pts: rankPts() });
+}
+const medalText = (x) => [x.gold ? '🥇' + (x.gold > 1 ? x.gold : '') : '', x.silver ? '🥈' + (x.silver > 1 ? x.silver : '') : '', x.bronze ? '🥉' + (x.bronze > 1 ? x.bronze : '') : ''].filter(Boolean).join(' ');
+Views.rankings = () => {
+  const r = (ui.rank = ui.rank || { sport: '', period: 'season' });
+  const present = [...new Set(S.events.map((e) => e.sport))].filter((k) => SPORT_LABEL[k]);
+  const rows = rankRows(ui.section, r.sport, r.period), P = rankPts();
+  const seg = (opts, cur, set) => h('div', { class: 'seg' }, opts.map(([k, l]) => h('button', { class: cur === k ? 'on' : '', onclick: () => { set(k); render(); } }, l)));
+  return h('div', {}, h('h1', {}, 'Player rankings'),
+    h('p', { class: 'muted small' }, (r.period === 'all' ? 'All events, friendlies included' : curT().name) + ' • updates live as referees record scores'),
+    sectionTabs(),
+    seg([['season', 'This event'], ['all', 'All-time (every event)']], r.period, (k) => { r.period = k; }),
+    present.length > 1 ? h('div', { class: 'sportchips', role: 'group', 'aria-label': 'Sport' }, [['', '🏆', 'Overall']].concat(present.map((k) => [k, SPORT_ICON[k], SPORT_LABEL[k]])).map(([k, i, l]) => h('button', { type: 'button', class: 'pill sp' + (r.sport === k ? ' on' : ''), 'aria-pressed': r.sport === k ? 'true' : 'false', onclick: () => { r.sport = k; render(); } }, i + ' ' + l))) : null,
+    rows.length ? h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl rank' },
+      h('thead', {}, h('tr', {}, ['#', 'Player', 'P', 'W', 'D', 'L', 'Win %', 'Medals', 'Pts'].map((x, i) => h('th', { class: i === 1 ? 'l' : '' }, x)))),
+      h('tbody', {}, rows.map((x) => h('tr', {}, h('td', {}, x.rank <= 3 ? ['🥇', '🥈', '🥉'][x.rank - 1] : String(x.rank)), h('td', { class: 'l' }, h('a', { href: '#/player/' + x.id }, (byId('players', x.id) || { name: '?' }).name)),
+        h('td', {}, x.played), h('td', {}, x.won), h('td', {}, x.drawn), h('td', {}, x.lost), h('td', {}, x.winPct + '%'), h('td', {}, medalText(x) || '–'), h('td', {}, h('b', {}, x.points)))))))
+      : h('p', { class: 'empty' }, 'No completed matches yet' + (r.sport ? ' in ' + SPORT_LABEL[r.sport] : '') + '. Rankings appear as soon as referees finish matches.'),
+    h('p', { class: 'muted small' }, 'Points: win ' + P.win + ' • draw ' + P.draw + (P.loss ? ' • loss ' + P.loss : '') + ' • champion +' + P.gold + ' • runner-up +' + P.silver + ' • third place +' + P.bronze + '. Ties: more wins, then win %, then point difference. Team events count for the players in the line-up.'),
+    isOrganizer() ? h('button', { class: 'btn ghost sm', onclick: () => rankPtsModal() }, '⚙ Change points') : null);
+};
+function playerRankCard(p) {
+  const sec = p.section || 'adults';
+  const one = (sport, period) => { const rows = rankRows(sec, sport, period), x = rows.find((y) => y.id === p.id); return x ? { rank: x.rank, of: rows.length, pts: x.points } : null; };
+  const items = [];
+  const o = one('', 'season'); if (o) items.push(['Overall', o]);
+  Object.keys(seasonRec()[p.id] || {}).filter((k) => SPORT_LABEL[k]).forEach((k) => { const x = one(k, 'season'); if (x) items.push([SPORT_ICON[k] + ' ' + SPORT_LABEL[k], x]); });
+  { const a = one('', 'all'); if (a && realTours().length + (SA.seasons || []).length > 1) items.push(['All-time', a]); }
+  if (!items.length) return null;
+  return h('div', { class: 'card' }, h('b', {}, '🏅 Standings – ' + curT().name),
+    h('div', { class: 'chips' }, items.map(([l, x]) => h('a', { class: 'chip plain', href: '#/rankings' }, l + ': #' + x.rank + ' of ' + x.of + ' • ' + x.pts + ' pts'))));
+}
+
+/* ------- referees: public list, organizer management, sign-up ------- */
+const REF_KIND_LABEL = { referee: 'Referee', chief: 'Chief referee', volunteer: 'Volunteer' };
+Views.referees = (embedded) => {
+  if (embedded !== true) { location.replace('#/season/referees'); return h('p', { class: 'empty' }, 'Loading…'); }
+  const refs = S.referees.filter((r) => r.status !== 'pending');
+  const organizer = isOrganizer();
+  const assigned = (id) => { const ms = S.matches.filter((m) => (m.refereeIds || []).includes(id) && evOf(m)); return { n: ms.length, done: ms.filter((m) => E.derive(liveMatch(m), evOf(m)).status === 'completed').length }; };
+  const scope = (r) => [...(r.sports || []).filter((k) => SPORT_LABEL[k]).map((k) => SPORT_ICON[k] + ' ' + SPORT_LABEL[k]), ...(r.eventIds || []).map((id) => (byId('events', id) || {}).name).filter(Boolean)];
+  return h('div', {},
+    S.tournament.refSignupOpen && !me.role ? h('a', { class: 'card tip', href: '#/refsignup' }, '🙋 Want to referee? Tap here to sign up – the organizers approve every referee.') : null,
+    organizer ? refereesAdmin() : null,
+    refs.length ? h('div', { class: 'list' }, refs.map((r) => { const c = assigned(r.id), sc = scope(r);
+      return h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, r.name),
+        h('div', { class: 'muted small' }, [REF_KIND_LABEL[r.kind] || 'Referee', r.kind === 'chief' ? 'All sports' : sc.length ? sc.join(', ') : 'All sports', c.n ? c.done + ' of ' + c.n + ' assigned matches done' : ''].filter(Boolean).join(' • '))),
+        organizer ? h('button', { class: 'btn ghost sm', onclick: () => refereeModal(r) }, 'Edit') : null); }))
+      : h('p', { class: 'empty' }, 'No referees yet.' + (organizer ? '' : ' The organizers add them.')));
+};
+Views.refsignup = () => {
+  const head = h('div', { class: 'page-h' }, h('a', { class: 'back', href: '#/season/referees' }, '‹'), h('h1', {}, 'Referee sign-up'));
+  if (!S.tournament.refSignupOpen) return h('div', {}, head, h('p', { class: 'empty' }, 'Referee sign-up is closed. Please contact the organizers.'));
+  const v = { website: '' };
+  const name = h('input', { autocomplete: 'name', maxlength: 60 }), phone = h('input', { type: 'tel', autocomplete: 'tel', maxlength: 30 });
+  const note = h('textarea', { rows: 2, maxlength: 200, placeholder: 'Experience, which days you are free (optional)' });
+  const sports = [...new Set(S.events.map((e) => e.sport))].filter((k) => SPORT_LABEL[k]).map((k) => ({ k, cb: h('input', { type: 'checkbox' }) }));
+  const box = h('div', { class: 'card' },
+    h('p', { class: 'muted small' }, 'Sign up to referee at ' + curT().name + '. The organizers review every sign-up and give you a personal PIN to sign in.'),
+    field('Your name', name), field('Phone', phone, 'Only the organizers see this.'),
+    h('div', { class: 'field' }, h('span', {}, 'Sports you can referee'), h('div', { class: 'checks' }, sports.map((x) => h('label', { class: 'chk' }, x.cb, SPORT_ICON[x.k] + ' ' + SPORT_LABEL[x.k])))),
+    field('Note', note),
+    h('input', { class: 'hp', tabindex: '-1', autocomplete: 'off', 'aria-hidden': 'true', name: 'website', oninput: (e) => { v.website = e.target.value; } }),
+    h('button', { class: 'btn full', onclick: guard(async () => {
+      await api('POST', '/api/referee-signup', { name: name.value, phone: phone.value, note: note.value, sports: sports.filter((x) => x.cb.checked).map((x) => x.k), website: v.website });
+      box.replaceChildren(h('p', {}, '✅ Thanks, ' + name.value.trim() + '! The organizers will review your sign-up and give you a PIN. Then sign in from Menu → Sign in → Referee.'));
+    }) }, 'Sign up'));
+  return h('div', {}, head, box);
+};
+
 const SPORT_LABEL = { badminton: 'Badminton', tt: 'Table tennis', carrom: 'Carrom', chess: 'Chess', other: 'Other' };
 const SPORT_ICON = { badminton: '🏸', tt: '🏓', carrom: '🎯', chess: '♟️', other: '🏅' };
 const HAND = { R: 'Right-handed', L: 'Left-handed', B: 'Ambidextrous' };
@@ -665,7 +875,8 @@ Views.player = (id) => {
       h('div', { class: 'chips' }, [p.playerNo, SEC[p.section || 'adults'], p.ageGroup, p.gender === 'F' ? 'Female' : p.gender === 'M' ? 'Male' : '', HAND[p.hand], p.affiliation].filter(Boolean).map((x) => h('span', { class: 'chip plain' }, x))),
       p.bio ? h('p', { class: 'bio' }, p.bio) : null,
       p.extHidden && !isAdmin() ? h('p', { class: 'muted small' }, 'Extended profile is private.') : null,
-      isAdmin() ? h('div', { class: 'actions' }, h('button', { class: 'btn ghost sm', onclick: () => playerModal(p) }, 'Edit profile'), h('button', { class: 'btn danger sm', onclick: () => deletePlayer(p) }, '🗑 Delete')) : null)),
+      isAdmin() ? h('div', { class: 'actions' }, h('button', { class: 'btn ghost sm', onclick: () => playerModal(p) }, 'Edit profile')) : null)),
+    playerRankCard(p),
     h('div', { class: 'stats' }, stat(T.played, 'Matches'), stat(T.won, 'Won'), stat(T.lost, 'Lost'), stat(T.played ? Math.round((T.won / T.played) * 100) + '%' : '–', 'Win rate'),
       stat(r2(T.pf), 'Tally'), stat((T.pf - T.pa > 0 ? '+' : '') + r2(T.pf - T.pa), 'Point diff'), stat(games ? T.gw + '–' + T.gl : '–', 'Games W–L'), stat(games ? r2(T.pf / games) : '–', 'Avg pts / game'), stat(st.honours.length + manual.length, 'Honours')),
     st.form.length ? h('div', { class: 'card' }, h('b', {}, 'Recent form'), h('div', { class: 'form' }, st.form.map((x) => h('span', { class: 'res ' + x }, x))),
@@ -696,20 +907,64 @@ Views.player = (id) => {
 };
 
 /* ------- gallery ------- */
+/* Gallery: anyone with the link adds photos or videos and downloads them. Organizers remove anything; uploaders remove their own (key kept on this phone). */
+const galKeys = () => store.get('galKeys', {});
+function saveFile(url, name) { const a = h('a', { href: url, download: name || '' }); document.body.append(a); a.click(); a.remove(); }
+const galName = (g, i) => 'photo-' + (i + 1) + (g.url.match(/\.\w+$/) || [''])[0];
 Views.gallery = () => {
-  const cap = h('input', { placeholder: 'Caption for the photos you add (optional)', 'aria-label': 'Caption' });
-  const minors = h('input', { type: 'checkbox' });
-  const input = h('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true, onchange: guard(async (e) => {
-    const files = [...e.target.files]; if (!files.length) return;
-    toast('Uploading ' + files.length + ' photo(s)…');
-    for (const f of files) { const url = await uploadImage(f, 1400); await api('POST', '/api/gallery', { url, caption: cap.value, minors: minors.checked }); }
-    toast('Photos added'); await refresh();
+  const cap = h('input', { placeholder: 'Caption (optional)', 'aria-label': 'Caption', maxlength: 120 });
+  const by = h('input', { placeholder: 'Your name (optional)', 'aria-label': 'Your name', maxlength: 40, value: me.role ? me.name : store.get('galBy', '') });
+  const minors = h('input', { type: 'checkbox' }), ok = h('input', { type: 'checkbox' });
+  const status = h('div', { class: 'muted small' });
+  const input = h('input', { type: 'file', accept: 'image/*,video/*', multiple: true, hidden: true, onchange: guard(async (e) => {
+    const files = [...e.target.files]; e.target.value = ''; if (!files.length) return;
+    if (!ok.checked) throw new Error('Please tick that you took these or may share them.');
+    store.set('galBy', by.value.trim());
+    let done = 0; const keys = galKeys(), failed = [];
+    for (const f of files) {
+      status.textContent = 'Uploading ' + (done + 1) + ' of ' + files.length + '…';
+      try {
+        const video = /^video\//.test(f.type);
+        if (video && f.size > 200e6) throw new Error(f.name + ' is larger than 200 MB');
+        const body = video ? f : await resizeImage(f, 1600, 'image/jpeg');
+        const type = video ? (f.type === 'video/quicktime' || /\.mov$/i.test(f.name) ? 'video/quicktime' : f.type || 'video/mp4') : 'image/jpeg';
+        const q = new URLSearchParams({ caption: cap.value, by: by.value.trim(), minors: minors.checked ? '1' : '' });
+        const r = await fetch('/api/gallery/media?' + q, { method: 'POST', headers: { 'Content-Type': type, 'x-token': me.token || '' }, body });
+        const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || 'Upload failed');
+        keys[j.id] = j.deleteKey; done++;
+      } catch (err) { failed.push(err.message); }
+    }
+    store.set('galKeys', keys); status.textContent = '';
+    toast(done + ' added' + (failed.length ? ' • ' + failed.length + ' failed: ' + failed[0] : ''), !!failed.length); await refresh();
   }) });
+  const picked = new Set(); let selecting = false;
+  const grid = h('div', { class: 'gal' });
+  const bar = h('div', { class: 'actions' });
+  const drawBar = () => bar.replaceChildren(...(S.gallery.length ? [
+    h('button', { class: 'btn ghost sm', onclick: () => { selecting = !selecting; picked.clear(); drawGrid(); drawBar(); } }, selecting ? 'Cancel' : '☑ Select to download'),
+    selecting ? h('button', { class: 'btn ghost sm', onclick: () => { S.gallery.forEach((g) => picked.add(g.id)); drawGrid(); drawBar(); } }, 'Select all') : null,
+    selecting ? h('button', { class: 'btn sm', onclick: () => { const list = S.gallery.filter((g) => picked.has(g.id)); list.forEach((g, i) => setTimeout(() => saveFile(g.url, galName(g, S.gallery.indexOf(g))), i * 600)); toast('Downloading ' + list.length + '…'); } }, '⬇ Download ' + picked.size) : null,
+  ].filter(Boolean) : []));
+  const open = (g, i) => {
+    const mine = galKeys()[g.id];
+    modal(g.caption || (g.type === 'video' ? 'Video' : 'Photo'), h('div', {},
+      g.type === 'video' ? h('video', { src: g.url, controls: true, autoplay: true, playsinline: true, class: 'full' }) : h('img', { src: g.url, class: 'full', alt: g.caption || 'Photo' }),
+      h('div', { class: 'muted small' }, [g.by ? 'by ' + g.by : '', g.ts ? new Date(g.ts).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }) : ''].filter(Boolean).join(' • '))),
+    [{ label: '⬇ Download', cls: 'ghost', close: false, fn: () => saveFile(g.url, galName(g, i)) },
+      isAdmin() || mine ? { label: 'Remove', cls: 'danger', fn: async () => { const r = await fetch('/api/gallery/' + g.id, { method: 'DELETE', headers: { 'x-token': me.token || '', 'x-delete-key': mine || '' } }); if (!r.ok) throw new Error((await r.json()).error); toast('Removed'); await refresh(); } } : null].filter(Boolean));
+  };
+  const drawGrid = () => grid.replaceChildren(...S.gallery.map((g, i) => h('div', { class: 'gal-i' + (picked.has(g.id) ? ' picked' : ''), onclick: () => { if (selecting) { picked.has(g.id) ? picked.delete(g.id) : picked.add(g.id); drawGrid(); drawBar(); } else open(g, i); } },
+    g.type === 'video' ? h('video', { src: g.url + '#t=0.5', preload: 'metadata', muted: true, playsinline: true }) : h('img', { src: g.url, loading: 'lazy', alt: g.caption || 'Tournament photo' }),
+    g.type === 'video' ? h('span', { class: 'gal-play' }, '▶') : null,
+    selecting ? h('span', { class: 'gal-check' }, picked.has(g.id) ? '✓' : '') : null)));
+  drawGrid(); drawBar();
   return h('div', {}, h('h1', {}, 'Gallery'),
-    isStaff() ? h('div', { class: 'card' }, cap, h('label', { class: 'chk' }, minors, 'These photos show children (hidden from the public unless kids’ photos are enabled)'), h('div', { class: 'actions' }, input, h('button', { class: 'btn', onclick: () => input.click() }, '📷 Add photos'))) : null,
-    S.gallery.length ? h('div', { class: 'gal' }, S.gallery.map((g) => h('div', { class: 'gal-i' },
-      h('img', { src: g.url, loading: 'lazy', alt: g.caption || 'Tournament photo', onclick: () => modal(g.caption || 'Photo', h('img', { src: g.url, class: 'full' }), isAdmin() ? [{ label: 'Delete photo', cls: 'danger', fn: async () => { await api('DELETE', '/api/admin/gallery/' + g.id); await refresh(); } }] : null) }))))
-      : h('p', { class: 'empty' }, 'No photos yet.'));
+    h('div', { class: 'card' }, h('b', {}, '📷 Add photos or videos'), h('p', { class: 'muted small' }, 'Anyone can add pictures and videos of ' + (curT().name || 'the event') + '. Pick several at once. Videos up to 200 MB.'),
+      by, cap, h('label', { class: 'chk' }, ok, 'I took these, or the people in them are happy for them to be shared'),
+      h('label', { class: 'chk' }, minors, 'They show children (hidden from the public unless the organizers allow kids’ photos)'),
+      h('div', { class: 'actions' }, input, h('button', { class: 'btn', onclick: () => input.click() }, '⬆ Choose photos / videos')), status),
+    bar,
+    S.gallery.length ? grid : h('p', { class: 'empty' }, 'No photos or videos yet – be the first!'));
 };
 
 /* ------- menu, login, notifications, theme ------- */
@@ -756,7 +1011,7 @@ Views.menu = () => {
   });
   return h('div', {}, h('h1', {}, 'Menu'), h('div', { class: 'card' }, langPicker()),
     h('div', { class: 'card' }, me.role ? h('div', {}, h('b', {}, 'Signed in as ' + me.name), h('div', { class: 'muted small' }, me.role === 'captain' ? 'Team captain – set your line-ups' : me.role === 'admin' ? (me.sports && me.sports.length ? 'Sport lead' : 'Organizer') + ' – referees change scores, not organizers' : me.kind === 'chief' ? 'Chief referee – you can score and correct any match' : me.kind === 'volunteer' ? 'Volunteer – check-in and schedule' : 'Referee – you can score any match'),
-      h('div', { class: 'actions' }, isAdmin() ? h('a', { class: 'btn', href: '#/admin' }, 'Admin') : null, me.kind === 'chief' ? h('a', { class: 'btn', href: '#/flags' }, '⚑ Score reports') : null, canScore() ? h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: guard(() => downloadWith('/api/staff/paper-template.xlsx', 'paper-scores-template.xlsx')) }, '⬇ Paper-score Excel'), h('button', { class: 'btn ghost', onclick: () => paperUp.click() }, '⬆ Upload filled Excel')) : null, me.role === 'captain' ? h('a', { class: 'btn', href: '#/captain' }, '👥 My line-ups') : null, isAdmin() ? h('a', { class: 'btn ghost', href: '#/certs' }, 'Certificates') : null, h('button', { class: 'btn ghost', onclick: guard(async () => { await api('POST', '/api/logout').catch(() => {}); me = { role: null }; store.set('me', me); await load(); location.hash = '#/'; render(); }) }, 'Sign out')))
+      h('div', { class: 'actions' }, me.personId ? h('a', { class: 'btn ghost', href: '#/me' }, '👤 My profile') : null, isAdmin() ? h('a', { class: 'btn', href: '#/admin' }, 'Admin') : null, me.kind === 'chief' ? h('a', { class: 'btn', href: '#/flags' }, '⚑ Score reports') : null, canScore() ? h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: guard(() => downloadWith('/api/staff/paper-template.xlsx', 'paper-scores-template.xlsx')) }, '⬇ Paper-score Excel'), h('button', { class: 'btn ghost', onclick: () => paperUp.click() }, '⬆ Upload filled Excel')) : null, me.role === 'captain' ? h('a', { class: 'btn', href: '#/captain' }, '👥 My line-ups') : null, isAdmin() ? h('a', { class: 'btn ghost', href: '#/certs' }, 'Certificates') : null, h('button', { class: 'btn ghost', onclick: guard(async () => { await api('POST', '/api/logout').catch(() => {}); me = { role: null }; store.set('me', me); await load(); location.hash = '#/'; render(); }) }, 'Sign out')))
       : h('div', {}, h('b', {}, 'Referee or admin?'), h('p', { class: 'muted small' }, 'Sign in to score matches or manage the tournament.'), h('a', { class: 'btn', href: '#/login' }, 'Sign in'))),
     h('div', { class: 'card center' }, h('b', {}, '📲 Share this app'),
       isPrivateHost() ? h('p', { class: 'warnbox small' }, 'This address only works on this computer / Wi-Fi. Start the app with the public link so everyone can join from anywhere.') : null,
@@ -769,9 +1024,9 @@ Views.menu = () => {
     store.get('myProfile', null) ? h('div', { class: 'card' }, h('b', {}, 'My profile'), h('p', { class: 'muted small' }, 'You registered on this phone. Update your details any time.'), h('a', { class: 'btn ghost', href: '#/me/' + store.get('myProfile').id + '/' + store.get('myProfile').token }, 'Open my profile page')) : null,
     pushBox,
     h('div', { class: 'card' }, h('b', {}, 'Appearance'), h('div', { class: 'seg' }, ['auto', 'light', 'dark'].map((t) => h('button', { class: theme === t ? 'on' : '', onclick: () => { store.set('theme', t); applyTheme(); render(); } }, t[0].toUpperCase() + t.slice(1))))),
-    h('div', { class: 'card' }, h('b', {}, 'Results & display'), h('div', { class: 'actions' }, h('a', { class: 'btn ghost', href: '#/report' }, '🖨 Printable report (PDF)'),
-      isAdmin() ? h('button', { class: 'btn ghost', onclick: guard(async () => { const r = await api('POST', '/api/admin/export-link'); location.href = r.url; }) }, '📊 Excel export (with contacts)') : h('a', { class: 'btn ghost', href: '/api/export.xlsx', download: '' }, '📊 Excel export'),
-      h('a', { class: 'btn ghost', href: '#/feed' }, '🔔 Updates'), h('a', { class: 'btn ghost', href: '#/tv' }, '📺 Big-screen mode'), isStaff() ? h('a', { class: 'btn ghost', href: '#/print' }, '🖨 Fixture & score sheets') : null)),
+    h('div', { class: 'card' }, h('b', {}, 'Results & display'), h('div', { class: 'actions' }, isStaff() ? h('a', { class: 'btn ghost', href: '#/report' }, '🖨 Printable report (PDF)') : null,
+      isAdmin() ? h('button', { class: 'btn ghost', onclick: guard(async () => { const r = await api('POST', '/api/admin/export-link'); location.href = r.url; }) }, '📊 Excel export (with contacts)') : isStaff() ? h('button', { class: 'btn ghost', onclick: guard(() => downloadWith('/api/export.xlsx', 'tournament-results.xlsx')) }, '📊 Excel export') : null,
+      h('a', { class: 'btn ghost', href: '#/gallery' }, '📷 Gallery'), h('a', { class: 'btn ghost', href: '#/seasons' }, '📜 All events'), h('a', { class: 'btn ghost', href: '#/feed' }, '🔔 Updates'), h('a', { class: 'btn ghost', href: '#/tv' }, '📺 Big-screen mode'), isStaff() ? h('a', { class: 'btn ghost', href: '#/print' }, '🖨 Fixture & score sheets') : null)),
     h('div', { class: 'card muted small' }, h('b', {}, 'Install on your phone'), h('p', {}, 'Android (Chrome): menu ⋮ → Install app. iPhone (Safari): Share → Add to Home Screen. Works only on the https public link.')),
     h('p', { class: 'muted small center' }, offline ? 'Offline – showing last saved data' : 'Online'));
 };
@@ -820,25 +1075,40 @@ Views.captain = () => {
   return h('div', {}, h('h1', {}, me.name + ' – captain'), h('p', { class: 'muted small' }, 'Choose who plays each rubber. You can change it until the tie starts. Suspended players are not available.'), box);
 };
 Views.login = () => {
-  let role = 'referee';
-  const box = h('div', {});
-  const pin = h('input', { type: 'password', inputmode: 'numeric', autocomplete: 'off', placeholder: 'PIN', class: 'pin' });
-  const who = h('select', {}, S.referees.map((r) => h('option', { value: r.id }, r.name)));
-  const teamSel = h('select', {}, S.teams.filter((t) => t.hasCode).map((t) => h('option', { value: t.id }, t.name)));
-  const draw = () => box.replaceChildren(...[
-    h('div', { class: 'seg' }, [['referee', 'Referee'], ['captain', 'Captain'], ['admin', 'Admin']].map(([k, l]) => h('button', { class: role === k ? 'on' : '', onclick: () => { role = k; draw(); } }, l))),
-    role === 'referee' ? (S.referees.length ? field('Your name', who) : h('p', { class: 'empty' }, 'No referees yet. The admin adds referees in Admin → Referees.')) : null,
-    role === 'captain' ? (S.teams.length ? field('Your team', teamSel) : h('p', { class: 'empty' }, 'No teams yet.')) : null,
-    field(role === 'admin' ? 'Admin PIN' : role === 'captain' ? 'Team code' : 'Your PIN', pin),
-    h('button', { class: 'btn big full', onclick: guard(async () => {
-      const r = await api('POST', '/api/login', role === 'admin' ? { role, pin: pin.value } : role === 'captain' ? { role, teamId: teamSel.value, pin: pin.value } : { role, refereeId: who.value, pin: pin.value });
-      me = { role: r.role, name: r.name, token: r.token, kind: r.kind || '', sports: r.sports || [] }; store.set('me', me); toast('Signed in'); await load(); location.hash = r.role === 'admin' ? '#/admin' : r.role === 'captain' ? '#/captain' : '#/matches'; render();
-    }) }, 'Sign in')].filter(Boolean));
-  draw();
-  return h('div', {}, h('h1', {}, 'Sign in'), box);
+  const pin = h('input', { type: 'password', inputmode: 'numeric', autocomplete: 'current-password', placeholder: 'Your PIN', class: 'pin', 'aria-label': 'Your PIN' });
+  const go = guard(async () => {
+    const r = await api('POST', '/api/login', { pin: pin.value });
+    me = { role: r.role, name: r.name, token: r.token, kind: r.kind || '', sports: r.sports || [], limited: !!r.limited, adminId: r.adminId || '', refId: r.refId || '', personId: r.personId || '', teamId: r.teamId || '' };
+    store.set('me', me); toast('Welcome, ' + r.name); await load();
+    location.hash = r.adminId ? '#/season' : r.refId ? '#/season/matches' : r.role === 'captain' ? '#/captain' : r.personId ? '#/me' : '#/'; render();
+  });
+  pin.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+  return h('div', {}, h('h1', {}, 'Sign in'),
+    h('div', { class: 'card' }, h('p', { class: 'muted small' }, 'One PIN for everything – as a player, referee, organizer or admin. The app knows your roles. Forgot it? Ask an organizer for a new one.'),
+      field('PIN', pin), h('button', { class: 'btn big full', onclick: go }, 'Sign in')));
 };
 
-Views.report = () => h('div', {},
+/* My profile: the signed-in person – photo, PIN, and their own details (contact details are visible only to them and the organizers). */
+Views.me = (id, token) => (id && token ? Views.selfEdit(id, token) : myProfile());
+function myProfile() {
+  if (!me.personId) return h('div', {}, h('h1', {}, 'My profile'), h('p', { class: 'empty' }, me.role ? 'This sign-in is not linked to a player profile yet. Ask an admin (People & roles).' : 'Sign in with your PIN to see your profile.'), me.role ? null : h('a', { class: 'btn', href: '#/login' }, 'Sign in'));
+  const box = h('div', {}, h('p', { class: 'muted' }, 'Loading…'));
+  api('GET', '/api/me').then((r) => {
+    const P = r.profile || {};
+    const photoIn = h('input', { type: 'file', accept: 'image/*', hidden: true, onchange: guard(async (e) => { const f = e.target.files[0]; if (!f) return; const blob = await resizeImage(f, 600, 'image/jpeg'); await api('POST', '/api/me/photo', blob, 'image/jpeg'); toast('Photo updated'); await refresh(); }) });
+    const np = h('input', { type: 'password', inputmode: 'numeric', autocomplete: 'new-password', placeholder: 'New PIN (6–10 digits)' }), np2 = h('input', { type: 'password', inputmode: 'numeric', autocomplete: 'new-password', placeholder: 'Repeat new PIN' });
+    const roles = [r.adminId ? (r.limited || (r.sports || []).length ? '👔 Organizer' : '🛡 Admin') : '', r.refId ? '🧑‍⚖️ ' + (r.kind === 'chief' ? 'Chief referee' : r.kind === 'volunteer' ? 'Volunteer' : 'Referee') : '', r.teamId ? '🧢 Team captain' : '', '🏸 Player'].filter(Boolean);
+    box.replaceChildren(
+      h('div', { class: 'profile' }, avatar(P, 88), h('div', { class: 'grow' }, h('h2', {}, P.name || me.name), h('div', { class: 'chips' }, roles.map((x) => h('span', { class: 'chip plain' }, x))),
+        h('div', { class: 'actions' }, photoIn, h('button', { class: 'btn ghost sm', onclick: () => photoIn.click() }, '📷 ' + (P.photo ? 'Change photo' : 'Add my photo')), h('a', { class: 'btn ghost sm', href: '#/player/' + P.id }, 'My stats')))),
+      h('div', { class: 'card' }, h('b', {}, 'My details (only you and the organizers see these)'), h('div', { class: 'small' }, [P.phone ? '📞 ' + P.phone : '', P.email ? '✉️ ' + P.email : '', P.affiliation, P.ageGroup].filter(Boolean).join(' • ') || 'No contact details yet.')),
+      h('div', { class: 'card' }, h('b', {}, '🔑 Change my PIN'), h('p', { class: 'muted small' }, 'Choose 6–10 digits that are easy for you to remember and hard to guess.'), np, np2,
+        h('button', { class: 'btn', onclick: guard(async () => { if (np.value !== np2.value) throw new Error('The two PINs do not match'); await api('POST', '/api/me/pin', { pin: np.value }); np.value = np2.value = ''; toast('PIN changed – use it next time you sign in'); }) }, 'Save new PIN')));
+  }).catch((e) => box.replaceChildren(h('p', { class: 'empty' }, e.message)));
+  return h('div', {}, h('h1', {}, 'My profile'), box);
+}
+
+Views.report = () => !isStaff() ? h('div', {}, h('h1', {}, 'Report'), h('p', { class: 'empty' }, 'Reports are available to organizers and referees only.')) : h('div', {},
   h('div', { class: 'page-h noprint' }, h('a', { class: 'back', href: '#/menu' }, '‹'), h('h1', {}, 'Report'), h('button', { class: 'btn', onclick: () => window.print() }, '🖨 Print / Save PDF')),
   h('div', { class: 'report-h' }, h('h1', {}, S.tournament.name), h('div', { class: 'muted' }, [S.tournament.venue, S.tournament.dates].filter(Boolean).join(' • '))),
   ['adults', 'kids'].map((sec) => eventsOf(sec).length ? h('div', {}, h('h2', { class: 'sec-h' }, SEC[sec] + ' section'),
@@ -897,10 +1167,13 @@ const HINTS = { badminton: ['Attacking', 'Defensive', 'All-round', 'Net player']
 
 function copyBtn(text, label) { return h('button', { class: 'btn ghost', onclick: guard(async () => { await navigator.clipboard.writeText(text); toast('Copied'); }) }, label || 'Copy'); }
 
-Views.register = () => {
+Views.register = (tid) => {
+  if (tid && tourById(tid) && tid !== ui.tid) { ui.tid = tid; store.set('tid', tid); scope(); }
   const R = S.registration || {};
   const mine = store.get('myProfile', null);
-  const head = h('div', {}, h('div', { class: 'page-h' }, h('a', { class: 'back', href: '#/' }, '‹'), h('h1', {}, 'Register as a player')), langPicker());
+  const head = h('div', {}, h('div', { class: 'page-h' }, h('a', { class: 'back', href: '#/' }, '‹'), h('h1', {}, 'Register as a player')), R.open ? h('p', { class: 'muted' }, 'for ' + curT().name) : null, langPicker());
+  const openElse = ((SA.registration || {}).tours || []).filter((x) => x.open && x.tid !== curTid());
+  if (!R.open && openElse.length) return h('div', {}, head, h('div', { class: 'card' }, h('b', {}, 'Choose the event to register for'), openElse.map((x) => h('button', { class: 'btn full', style: 'margin-top:8px', onclick: () => pickEvent(x.tid) }, x.name))));
   if (!R.open) return h('div', {}, head, h('div', { class: 'card warnbox' }, 'Registration is closed right now.' + (R.deadline ? ' (It closed on ' + R.deadline + '.)' : '')), mine ? h('a', { class: 'btn', href: '#/me/' + mine.id + '/' + mine.token }, 'Open my profile') : null);
   const v = { section: ui.regSection || 'adults', consent: false, eventIds: [] };
   const box = h('div', {});
@@ -926,7 +1199,7 @@ Views.register = () => {
       h('input', { class: 'hp', tabindex: '-1', autocomplete: 'off', 'aria-hidden': 'true', name: 'website', oninput: (e) => { v.website = e.target.value; } }),
       h('label', { class: 'chk consent' }, h('input', { type: 'checkbox', checked: v.consent, onchange: (e) => { v.consent = e.target.checked; } }), kids ? R.kidsNotice : R.notice),
       h('button', { class: 'btn big full', onclick: guard(async () => {
-        const r = await api('POST', '/api/register', { ...v });
+        const r = await api('POST', '/api/register', { ...v, tid: curTid() });
         if (!r.id) { toast('Thanks!'); return; }   /* honeypot answer */
         store.set('myProfile', { id: r.id, token: r.editToken, name: v.name });
         showRegistered(box, r, v);
@@ -968,6 +1241,7 @@ function showRegistered(box, r, v) {
   const link = BASE() + '/#/me/' + r.id + '/' + r.editToken;
   box.replaceChildren(h('div', { class: 'card center' }, h('div', { class: 'big-emoji' }, '🎉'), h('h2', {}, 'You are registered!'),
     h('p', {}, h('b', {}, v.name), ' • ID ', h('b', {}, r.playerNo)), h('p', { class: 'muted' }, 'Status: waiting for organiser approval.'),
+    r.pin ? h('div', { class: 'card' }, h('b', {}, '🔑 Your PIN'), h('div', { class: 'bigpin' }, r.pin), h('p', { class: 'small' }, 'Use it to sign in (Menu → Sign in) – to add your photo, change this PIN to one you like, and later to referee or organize if you are given those roles. It is shown only now, so save it.')) : null,
     h('div', { class: 'warnbox small' }, 'Keep this private link – it lets you add a photo, playing style and update your details. Anyone who has it can edit your profile.'),
     h('div', { class: 'muted small wrap' }, link),
     notifyCard(r.id, r.editToken),
@@ -982,7 +1256,7 @@ async function selfApi(method, id, token, body, raw, sub) {
   return data;
 }
 
-Views.me = (id, token) => {
+Views.selfEdit = (id, token) => {
   const saved = store.get('myProfile', null);
   if (!id && saved) { id = saved.id; token = saved.token; }
   const box = h('div', {}, h('p', { class: 'muted' }, 'Loading…'));
@@ -1062,7 +1336,7 @@ Views.print = () => {
       h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl' }, h('thead', {}, h('tr', {}, ['Time', 'Court', 'Event', 'Match', 'Result'].map((x, i) => h('th', { class: i > 1 ? 'l' : '' }, x)))),
         h('tbody', {}, rows.map((x) => h('tr', {}, h('td', {}, fmtSlot(x.m) || '–'), h('td', {}, x.m.court || '–'), h('td', { class: 'l' }, x.ev.name + (x.m.stage !== 'League' ? ' (' + x.m.stage + ')' : '')), h('td', { class: 'l' }, sideLabel(x.ev, x.m.sideA) + '  vs  ' + sideLabel(x.ev, x.m.sideB)), h('td', { class: 'l' }, x.d.status === 'completed' ? E.scoreText(x.d) || (OUT[x.d.outcome] || '').trim() : '')))))))
     : h('div', {}, rows.map((x) => {
-      const ref = byId('referees', x.m.refereeId);
+      const ref = refsOf(x.m);
       return h('div', { class: 'ss' },
         h('div', { class: 'ss-h' }, h('b', {}, x.ev.name), h('span', {}, [x.m.stage !== 'League' ? x.m.stage : x.m.round ? 'Round ' + x.m.round : '', x.m.court, fmtSlot(x.m)].filter(Boolean).join(' • '))),
         h('div', { class: 'ss-names' }, h('div', {}, sideLabel(x.ev, x.m.sideA)), h('div', { class: 'vs' }, 'vs'), h('div', {}, sideLabel(x.ev, x.m.sideB))),
@@ -1091,16 +1365,18 @@ function renderHeader() {
     h('div', { class: 'status' },
       offline ? h('span', { class: 'pill off' }, 'Offline') : null,
       pending.length ? h('span', { class: 'pill warn' }, pending.length + ' to sync') : null,
-      me.role ? h('a', { class: 'pill ok', href: '#/menu' }, me.role === 'admin' ? 'Admin' : me.role === 'captain' ? '👥 ' + me.name : '🏸 ' + me.name) : h('a', { class: 'pill', href: '#/login' }, 'Sign in')));
+      me.role ? h('a', { class: 'pill ok', href: '#/menu' }, me.role === 'admin' ? 'Admin' : me.role === 'captain' ? '👥 ' + me.name : '🏸 ' + me.name) : h('a', { class: 'pill', href: '#/login' }, 'Sign in'),
+      h('a', { class: 'menu-btn', href: '#/menu', 'aria-label': 'Menu' }, '☰')));
   document.title = t.name;
 }
 
 function renderNav(name) {
-  const items = [['', '🏠', 'Home'], ['matches', '🏸', 'Matches'], ['players', '👥', 'Players'], ['gallery', '📷', 'Gallery'], ['menu', '☰', 'Menu']];
+  const items = [['', '🏠', 'Home'], ['season', '🏆', 'Event'], ['matches', '🏸', 'Matches'], ['rankings', '🏅', 'Rankings'], ['players', '👥', 'Players'], ['gallery', '📷', 'Gallery']];
   $('#nav').replaceChildren(...items.map(([r, i, l]) => h('a', { href: '#/' + r, class: (name === r || (r === '' && name === 'home')) ? 'on' : '' }, h('span', {}, i), l)));
 }
 
 function render() {
+  if (SA && S === SA) scope();
   if (!S) { $('#app').replaceChildren(h('p', { class: 'empty' }, offline ? 'Cannot reach the server.' : 'Loading…')); return; }
   const parts = location.hash.replace(/^#\/?/, '').split('/');
   const name = parts[0] || 'home';
@@ -1120,8 +1396,8 @@ function render() {
 }
 
 function busy() {
-  if (/^#\/(register|me)\b/.test(location.hash)) return true;
-  return document.querySelector('.modal') || (/^#\/(admin|login|certs)/.test(location.hash) && document.activeElement && document.activeElement.matches('input,select,textarea'));
+  if (/^#\/(register|me|refsignup)\b/.test(location.hash)) return true;
+  return document.querySelector('.modal') || (/^#\/(admin|login|certs|gallery|season)/.test(location.hash) && document.activeElement && document.activeElement.matches('input,select,textarea'));
 }
 
 window.addEventListener('hashchange', render);

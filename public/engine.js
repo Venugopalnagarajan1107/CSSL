@@ -400,6 +400,70 @@
     };
   }
 
+  /* Season record of every player, per sport, in one pass: { pid: { sport: {played,won,drawn,lost,pf,pa,gold,silver,bronze} } }.
+     Team events count for the team members who played (line-up when recorded). Medals come from each game's podium. */
+  function seasonRecords(data, matches) {
+    matches = matches || data.matches;
+    const byId = (col, id) => (data[col] || []).find((x) => x.id === id);
+    const members = (tid) => (byId('teams', tid) || { memberIds: [] }).memberIds;
+    const out = {};
+    const rec = (pid, sport) => { const p = (out[pid] = out[pid] || {}); return (p[sport] = p[sport] || { played: 0, won: 0, drawn: 0, lost: 0, pf: 0, pa: 0, gold: 0, silver: 0, bronze: 0 }); };
+    const people = (ev, ids, lineup) => (ev.sideType === 'player' ? ids : ids.flatMap((t) => members(t)).filter((pid) => !lineup || !lineup.length || lineup.includes(pid)));
+    for (const m0 of matches) {
+      const e0 = byId('events', m0.eventId); if (!e0) continue;
+      const list = e0.sideType === 'team' && m0.rubbers && m0.rubbers.length ? m0.rubbers.map((r) => ({ m: r, ev: rubberEvent(e0, r) })) : [{ m: m0, ev: e0 }];
+      for (const { m, ev } of list) {
+        const d = derive(m, ev); if (d.status !== 'completed') continue;
+        const sides = { A: people(ev, m.sideA || [], m0.lineupA), B: people(ev, m.sideB || [], m0.lineupB) };
+        ['A', 'B'].forEach((s) => {
+          sides[s].forEach((pid) => {
+            const r = rec(pid, e0.sport || 'other');
+            r.played++;
+            if (d.draw) r.drawn++; else if (d.winner === s) r.won++; else r.lost++;
+            if (ev.sideType === 'player') d.games.forEach((g) => { r.pf += (s === 'A' ? g.a : g.b) / sides[s].length; r.pa += (s === 'A' ? g.b : g.a) / sides[s].length; });
+          });
+        });
+      }
+    }
+    (data.events || []).forEach((ev) => {
+      const pod = podium(ev, matches); if (!pod) return;
+      const who = (ids) => (ev.sideType === 'player' ? ids : ids.flatMap((t) => members(t)));
+      who(pod.first).forEach((pid) => rec(pid, ev.sport || 'other').gold++);
+      who(pod.second).forEach((pid) => rec(pid, ev.sport || 'other').silver++);
+      who(pod.third).forEach((pid) => rec(pid, ev.sport || 'other').bronze++);
+    });
+    Object.values(out).forEach((p) => Object.values(p).forEach((r) => { r.pf = r2(r.pf); r.pa = r2(r.pa); }));
+    return out;
+  }
+
+  const RANK_POINTS = { win: 3, draw: 1, loss: 0, gold: 10, silver: 6, bronze: 4 };
+  /* Ranking table from one or more season records (current season + past seasons for all-time).
+     opts: { sport: '' for all, players: [...] to include, pts } -> rows sorted, with shared ranks on ties. */
+  function rankings(recordSets, opts) {
+    opts = opts || {};
+    const pts = { ...RANK_POINTS, ...(opts.pts || {}) };
+    const allow = opts.players ? new Set(opts.players.map((p) => p.id)) : null;
+    const tot = {};
+    recordSets.forEach((set) => Object.entries(set || {}).forEach(([pid, sports]) => {
+      if (allow && !allow.has(pid)) return;
+      Object.entries(sports).forEach(([sp, r]) => {
+        if (opts.sport && sp !== opts.sport) return;
+        const t = (tot[pid] = tot[pid] || { id: pid, played: 0, won: 0, drawn: 0, lost: 0, pf: 0, pa: 0, gold: 0, silver: 0, bronze: 0 });
+        Object.keys(t).forEach((k) => { if (k !== 'id') t[k] += Number(r[k]) || 0; });
+      });
+    }));
+    const rows = Object.values(tot).filter((t) => t.played > 0 || t.gold + t.silver + t.bronze > 0).map((t) => ({
+      ...t, pf: r2(t.pf), pa: r2(t.pa), winPct: t.played ? Math.round((t.won / t.played) * 100) : 0,
+      points: t.won * pts.win + t.drawn * pts.draw + t.lost * pts.loss + t.gold * pts.gold + t.silver * pts.silver + t.bronze * pts.bronze,
+    }));
+    rows.sort((a, b) => b.points - a.points || b.won - a.won || b.winPct - a.winPct || (b.pf - b.pa) - (a.pf - a.pa) || a.played - b.played);
+    rows.forEach((r, i) => {
+      const p = rows[i - 1];
+      r.rank = p && p.points === r.points && p.won === r.won && p.winPct === r.winPct && (p.pf - p.pa) === (r.pf - r.pa) && p.played === r.played ? p.rank : i + 1;
+    });
+    return rows;
+  }
+
   /* Is there a tie across the qualification cutoff? (more qualifiers than places) */
   function cutoffInfo(rows, finalists) {
     if (!finalists) return { tie: false };
@@ -409,5 +473,5 @@
 
   const scoreText = (d) => (d.tie ? d.gamesA + '-' + d.gamesB + ' rubbers' : d.games.map((g) => g.a + '-' + g.b).join(', '));
 
-  return { withCfg, finalistsFor, derive, applyOp, standings, groupTables, bracket, bracketOrder, seedsOrder, stageName, KO_STAGES, podium, rubberEvent, champion, cutoffInfo, playerStats, gameOver, need, scoreText, sideIds, r2 };
+  return { withCfg, finalistsFor, derive, applyOp, standings, groupTables, bracket, bracketOrder, seedsOrder, stageName, KO_STAGES, podium, rubberEvent, champion, cutoffInfo, playerStats, seasonRecords, rankings, RANK_POINTS, gameOver, need, scoreText, sideIds, r2 };
 });

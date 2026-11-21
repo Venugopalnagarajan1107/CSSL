@@ -178,14 +178,11 @@ test('trash restores deleted players and events (with matches); disputes; purge'
     assert.equal((await call('POST', '/api/admin/trash/' + tr[0].id + '/restore', {}, admin)).status, 200);
     let st = (await call('GET', '/api/state')).body;
     assert.ok(st.events.some((e) => e.id === ev.id) && st.matches.some((x) => x.id === m.id), 'event and its match are back');
-    // player delete (after removing the match) then restore re-enrols
+    // player profiles are permanent: delete is refused, the player stays in the event
     await call('DELETE', '/api/admin/matches/' + m.id, null, admin);
-    await call('DELETE', '/api/admin/players/' + a.id, null, admin);
-    assert.ok(!(await call('GET', '/api/state')).body.events.find((e) => e.id === ev.id).participantIds.includes(a.id));
-    tr = (await call('GET', '/api/admin/trash', null, admin)).body;
-    await call('POST', '/api/admin/trash/' + tr[0].id + '/restore', {}, admin);
+    assert.equal((await call('DELETE', '/api/admin/players/' + a.id, null, admin)).status, 403);
     st = (await call('GET', '/api/state')).body;
-    assert.ok(st.events.find((e) => e.id === ev.id).participantIds.includes(a.id), 'restored player is back in the event');
+    assert.ok(st.events.find((e) => e.id === ev.id).participantIds.includes(a.id));
     assert.equal((await call('GET', '/api/admin/players/' + a.id, null, admin)).body.phone, '555');
 
     // disputes
