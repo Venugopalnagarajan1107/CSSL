@@ -665,7 +665,7 @@ Views.player = (id) => {
       h('div', { class: 'chips' }, [p.playerNo, SEC[p.section || 'adults'], p.ageGroup, p.gender === 'F' ? 'Female' : p.gender === 'M' ? 'Male' : '', HAND[p.hand], p.affiliation].filter(Boolean).map((x) => h('span', { class: 'chip plain' }, x))),
       p.bio ? h('p', { class: 'bio' }, p.bio) : null,
       p.extHidden && !isAdmin() ? h('p', { class: 'muted small' }, 'Extended profile is private.') : null,
-      isAdmin() ? h('button', { class: 'btn ghost sm', onclick: () => playerModal(p) }, 'Edit profile') : null)),
+      isAdmin() ? h('div', { class: 'actions' }, h('button', { class: 'btn ghost sm', onclick: () => playerModal(p) }, 'Edit profile'), h('button', { class: 'btn danger sm', onclick: () => deletePlayer(p) }, '🗑 Delete')) : null)),
     h('div', { class: 'stats' }, stat(T.played, 'Matches'), stat(T.won, 'Won'), stat(T.lost, 'Lost'), stat(T.played ? Math.round((T.won / T.played) * 100) + '%' : '–', 'Win rate'),
       stat(r2(T.pf), 'Tally'), stat((T.pf - T.pa > 0 ? '+' : '') + r2(T.pf - T.pa), 'Point diff'), stat(games ? T.gw + '–' + T.gl : '–', 'Games W–L'), stat(games ? r2(T.pf / games) : '–', 'Avg pts / game'), stat(st.honours.length + manual.length, 'Honours')),
     st.form.length ? h('div', { class: 'card' }, h('b', {}, 'Recent form'), h('div', { class: 'form' }, st.form.map((x) => h('span', { class: 'res ' + x }, x))),

@@ -24,6 +24,31 @@ const STYLE_HINTS = {
   carrom: ['Striker', 'Defender', 'Queen specialist', 'Slammer'],
   chess: ['Aggressive', 'Positional', 'Tactical', 'Defensive'],
 };
+/* Delete one player (kept in Trash for 30 days). Players with matches must have those matches removed first. */
+function deletePlayer(p, after) {
+  confirmBox('Delete ' + p.name + '? They are removed from their events and teams. You can restore them from Admin → Trash for 30 days.', guard(async () => {
+    await api('DELETE', '/api/admin/players/' + p.id);
+    if (after) after();
+    toast(p.name + ' deleted');
+    if (/^#\/player\//.test(location.hash)) location.hash = '#/players';
+    await refresh();
+  }), 'Delete');
+}
+/* Delete many players at once (e.g. after a wrong import). */
+function deletePlayersModal() {
+  const list = checkList(S.players.slice().sort((a, b) => a.name.localeCompare(b.name)).map((p) => ({ id: p.id, name: p.name + ' (' + (SEC[p.section || 'adults'] || p.section) + ')' })), []);
+  modal('Delete players', h('div', {}, h('p', { class: 'muted small' }, 'Tick the players to delete. Deleted players stay in Admin → Trash for 30 days. Players who already have matches are skipped.'), list),
+    [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, { label: 'Delete selected', cls: 'danger', close: false, fn: (close) => {
+      const ids = list.values(); if (!ids.length) { toast('Nothing selected', true); return; }
+      confirmBox('Delete ' + ids.length + ' player(s)?', guard(async () => {
+        let ok = 0; const skipped = [];
+        for (const id of ids) { try { await api('DELETE', '/api/admin/players/' + id); ok++; } catch (e) { skipped.push(((byId('players', id) || {}).name || id) + ': ' + e.message); } }
+        close(); await refresh();
+        toast(ok + ' deleted' + (skipped.length ? ' • ' + skipped.length + ' skipped' : ''));
+        if (skipped.length) modal('Some players were not deleted', h('div', { class: 'small' }, skipped.map((x) => h('div', {}, x))));
+      }), 'Delete ' + ids.length);
+    } }]);
+}
 async function playerModal(p, defaultSection) {
   let priv = {};
   if (p) { try { priv = await api('GET', '/api/admin/players/' + p.id); } catch (e) { toast(e.message, true); return; } }
@@ -68,7 +93,7 @@ async function playerModal(p, defaultSection) {
     field('Guardian name', f.guardianName), field('Guardian phone', f.guardianPhone), field('Phone', f.phone), field('Email', f.email), field('Emergency contact', f.emergency), field('T-shirt size', f.tshirt), field('Private notes', f.notes),
     h('p', { class: 'muted small' }, 'Collect contact details only with the player’s (or a guardian’s) consent.'),
     h('div', { class: 'actions' }, prev, file, h('button', { type: 'button', class: 'btn ghost', onclick: () => file.click() }, '📷 Photo'))),
-  [p ? { label: 'Delete', cls: 'danger', close: false, fn: (close) => confirmBox('Delete ' + p.name + '?', async () => { await api('DELETE', '/api/admin/players/' + p.id); close(); location.hash = '#/players'; await refresh(); }, 'Delete') } : null,
+  [p ? { label: 'Delete', cls: 'danger', close: false, fn: (close) => deletePlayer(p, close) } : null,
     { label: 'Save', fn: async () => {
       const sports = {}; sportRows.forEach((r) => { sports[r.k] = { level: r.level.value, style: r.style.value, rating: r.rating ? r.rating.value : '' }; });
       const body = { name: f.name.value, section: f.section.value, ageGroup: f.ageGroup.value, gender: f.gender.value, hand: f.hand.value, affiliation: f.affiliation.value, bio: f.bio.value, sports,
@@ -405,7 +430,9 @@ const adminTabs = {
       h('div', { class: 'card' }, h('b', {}, 'Add many players'), field('Section', sec), bulk, h('div', { class: 'actions' },
         h('button', { class: 'btn', onclick: guard(async () => { const names = bulk.value.split('\n').map((x) => x.trim()).filter(Boolean); for (const name of names) await api('POST', '/api/admin/players', { name, section: sec.value }); bulk.value = ''; toast(names.length + ' added'); await refresh(); }) }, 'Add'),
         h('button', { class: 'btn ghost', onclick: () => playerModal(null, sec.value) }, '+ One with details'))),
-      groupBySection(S.players, (p) => h('div', { class: 'row', onclick: () => playerModal(p) }, avatar(p, 32), h('div', { class: 'grow' }, h('b', {}, p.name), p.ageGroup ? h('div', { class: 'muted small' }, p.ageGroup) : null), h('span', { class: 'muted' }, 'Edit'))),
+      S.players.length ? h('div', { class: 'actions' }, h('button', { class: 'btn ghost danger-text', onclick: () => deletePlayersModal() }, '🗑 Delete several…')) : null,
+      groupBySection(S.players, (p) => h('div', { class: 'row', onclick: () => playerModal(p) }, avatar(p, 32), h('div', { class: 'grow' }, h('b', {}, p.name), p.ageGroup ? h('div', { class: 'muted small' }, p.ageGroup) : null), h('span', { class: 'muted' }, 'Edit'),
+        h('button', { class: 'btn danger sm', 'aria-label': 'Delete ' + p.name, title: 'Delete player', onclick: (e) => { e.stopPropagation(); deletePlayer(p); } }, '🗑'))),
       !S.players.length ? h('p', { class: 'empty' }, 'No players yet.') : null);
   },
   teams() {
@@ -479,19 +506,61 @@ function adminsCard() {
   load2(); return box;
 }
 
-/* Excel import of players, their games and teams (shared by Registration, Players and Safety screens). */
+/* Excel import of players, their games and teams (shared by Registration, Players and Safety screens).
+   Step 1: the server inspects every sheet. Step 2: the admin picks sheets and checks the column mapping.
+   Step 3: preview (dry run). Step 4: import. */
 function importCard() {
   const imp = h('input', { type: 'file', accept: '.xlsx', hidden: true, onchange: guard(async (e) => {
     const f = e.target.files[0]; if (!f) return; const buf = await f.arrayBuffer(); e.target.value = '';
-    const post = (q) => fetch('/api/admin/import-players' + q, { method: 'POST', headers: { 'x-token': me.token, 'Content-Type': 'application/octet-stream' }, body: buf }).then(async (r) => { const j = await r.json(); if (!r.ok) throw new Error(j.error); return j; });
-    const dry = await post('?dry=1');
-    modal('Check before importing', h('div', {}, h('p', {}, h('b', {}, dry.created + ' players'), ' will be added' + (dry.flagged ? ' (' + dry.flagged + ' look like possible duplicates and will be flagged)' : '') + '.'),
-      h('p', { class: 'small' }, dry.games + ' game entries will be mapped. Players in teams: teams are created or reused by name. Team events: a player with a team enters that team; a player with no team goes on the interested list.'),
-      dry.errors.length ? h('div', { class: 'warnbox small' }, h('b', {}, dry.errors.length + ' rows will be skipped:'), dry.errors.slice(0, 15).map((x) => h('div', {}, 'Row ' + x.row + ' ' + x.name + ': ' + x.error))) : null),
-    [dry.created ? { label: 'Import ' + dry.created, fn: async () => { const r = await post(''); toast(r.created + ' players imported • ' + r.games + ' game entries' + (r.teamsMade ? ' • ' + r.teamsMade + ' new teams' : '') + (r.teamEntries ? ' • ' + r.teamEntries + ' team entries' : '') + (r.interested ? ' • ' + r.interested + ' on interested lists' : '')); await refresh(); } } : null].filter(Boolean));
+    const send = (path, q, opts) => fetch(path + (q || ''), { method: 'POST', headers: { 'x-token': me.token, 'Content-Type': 'application/octet-stream', ...(opts ? { 'x-import-options': JSON.stringify(opts) } : {}) }, body: buf })
+      .then(async (r) => { const j = await r.json(); if (!r.ok) throw new Error(j.error); return j; });
+    const info = await send('/api/admin/import-inspect');
+    chooseSheets(info, send);
   }) });
+  function chooseSheets(info, send) {
+    const evOpts = [['', '— none (use the Games column) —']].concat(S.events.map((e) => [e.id, e.name + ((e.section || 'adults') === 'kids' ? ' (kids)' : '')]));
+    const blocks = info.sheets.map((sh) => {
+      const cb = h('input', { type: 'checkbox', checked: sh.looksLikePlayers && sh.rows > 0, 'aria-label': 'Import sheet ' + sh.name });
+      const colOpts = [['', '— not in this sheet —']].concat(sh.headers.map((x) => [x.col, x.text]));
+      const maps = info.fields.map((fd) => ({ key: fd.key, label: fd.label, s: sel(colOpts, sh.map[fd.key] || '') }));
+      const ev = sel(evOpts, sh.eventId), sec = sel([['', 'From the sheet (default adults)'], ['adults', 'Adults'], ['kids', 'Kids']], sh.section);
+      const found = maps.filter((m) => sh.map[m.key]).map((m) => m.label);
+      const details = h('details', {}, h('summary', { class: 'small' }, 'Columns & options'),
+        h('p', { class: 'muted small' }, 'Pick which column of this sheet holds each detail. Header row: ' + sh.headerRow + '.'),
+        maps.map((m) => field(m.label, m.s)),
+        sh.eventCols.length ? h('p', { class: 'small' }, 'Event columns (a "Yes"/✓ enters the player): ' + sh.eventCols.map((x) => x.eventName).join(', ')) : null,
+        field('Players with no games go into', ev, sh.eventId ? 'Guessed from the sheet name.' : 'Useful when each sheet is one event, e.g. a sheet called "Chess".'),
+        field('Section when the sheet has no Section column', sec));
+      const el = h('div', { class: 'card' },
+        h('label', { class: 'chk' }, cb, h('b', {}, sh.name), h('span', { class: 'muted small' }, ' • ' + (sh.looksLikePlayers ? sh.rows + ' player rows' : (sh.reason || 'not a player list')))),
+        sh.sample.length ? h('div', { class: 'muted small' }, 'e.g. ' + sh.sample.join(', ')) : null,
+        found.length ? h('div', { class: 'muted small' }, 'Recognised: ' + found.join(', ')) : null,
+        details);
+      return { sh, cb, maps, ev, sec, el };
+    });
+    const nothing = !info.sheets.some((x) => x.looksLikePlayers);
+    modal('Which sheets should be imported?', h('div', {},
+      h('p', { class: 'small' }, 'This file has ' + info.sheets.length + ' sheet(s). Sheets that look like player lists are ticked. Open "Columns & options" to check or change how columns are read.'),
+      nothing ? h('div', { class: 'warnbox small' }, 'No sheet has a recognisable name column. Tick a sheet and choose its Name column under "Columns & options".') : null,
+      blocks.map((b) => b.el)),
+    [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, { label: 'Preview', close: false, fn: async (close) => {
+      const chosen = blocks.filter((b) => b.cb.checked);
+      if (!chosen.length) { toast('Tick at least one sheet', true); return; }
+      const opts = { sheets: chosen.map((b) => ({ index: b.sh.index, headerRow: b.sh.headerRow, eventId: b.ev.value, section: b.sec.value, map: Object.fromEntries(b.maps.filter((m) => m.s.value).map((m) => [m.key, Number(m.s.value)])) })) };
+      const dry = await send('/api/admin/import-players', '?dry=1', opts);
+      close(); preview(dry, () => send('/api/admin/import-players', '', opts));
+    } }]);
+  }
+  function preview(dry, run) {
+    modal('Check before importing', h('div', {}, h('p', {}, h('b', {}, dry.created + ' players'), ' will be added' + (dry.flagged ? ' (' + dry.flagged + ' look like possible duplicates and will be flagged)' : '') + '.'),
+      dry.sheets && dry.sheets.length ? h('div', { class: 'small' }, dry.sheets.map((x) => h('div', {}, '• ' + x.sheet + ': ' + x.added + ' new of ' + x.rows + ' rows'))) : null,
+      dry.merged ? h('p', { class: 'small' }, dry.merged + ' rows are the same person as another row (same name and phone/email/date of birth) and are merged, so that player is entered in all their events.') : null,
+      h('p', { class: 'small' }, dry.games + ' game entries will be mapped. Players in teams: teams are created or reused by name. Team events: a player with a team enters that team; a player with no team goes on the interested list.'),
+      dry.errors.length ? h('div', { class: 'warnbox small' }, h('b', {}, dry.errors.length + ' rows will be skipped:'), dry.errors.slice(0, 20).map((x) => h('div', {}, (x.sheet ? x.sheet + ' ' : '') + 'row ' + x.row + ' ' + x.name + ': ' + x.error))) : null),
+    [dry.created ? { label: 'Import ' + dry.created, fn: async () => { const r = await run(); toast(r.created + ' players imported • ' + r.games + ' game entries' + (r.teamsMade ? ' • ' + r.teamsMade + ' new teams' : '') + (r.teamEntries ? ' • ' + r.teamEntries + ' team entries' : '') + (r.interested ? ' • ' + r.interested + ' on interested lists' : '')); await refresh(); } } : null].filter(Boolean));
+  }
   return h('div', { class: 'card' }, h('b', {}, '📥 Upload players, games & teams (Excel)'),
-    h('p', { class: 'muted small' }, 'One row per player with the games they play and, optionally, a team. Games are matched by event name; teams are created if new and entered into their team events. You see a preview first, and possible duplicates are flagged rather than blocked.'),
+    h('p', { class: 'muted small' }, 'Upload any Excel file – one sheet or many. You choose which sheets to import, and columns are matched by their header (Name, Phone, Dept, Games, Team…), so your own layout works. A sheet named after an event (e.g. "Chess") puts its players in that event. You see a preview first, and possible duplicates are flagged rather than blocked.'),
     h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: guard(() => downloadWith('/api/admin/import-template.xlsx', 'players-import-template.xlsx')) }, '⬇ Template'), imp, h('button', { class: 'btn', onclick: () => imp.click() }, '⬆ Upload filled sheet')));
 }
 

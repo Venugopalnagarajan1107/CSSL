@@ -14,3 +14,6 @@ node_modules/
 # Secrets
 .env
 *.pem
+
+# Runtime file written by start.command
+.public-link.txt

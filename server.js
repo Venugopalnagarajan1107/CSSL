@@ -11,6 +11,7 @@ const webpush = require('web-push');
 const QRCode = require('qrcode');
 const Engine = require('./public/engine.js');
 const Fx = require('./lib/fixtures.js');
+const SheetImport = require('./lib/sheet-import.js');
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -914,6 +915,35 @@ function serveFile(req, res, file, cache, extra) {
   });
 }
 
+async function loadWorkbook(buf) {
+  const ExcelJS = require('exceljs'); const wb = new ExcelJS.Workbook();
+  try { await wb.xlsx.load(buf); } catch (e) { throw new HttpError(400, 'That does not look like an Excel (.xlsx) file.'); }
+  if (!wb.worksheets.length) throw new HttpError(400, 'The workbook is empty.');
+  return wb;
+}
+/* Which sheets to import and how. Header x-import-options = {"sheets":[{index, headerRow, map:{field:col}, eventId, section}]}.
+   Without it: every sheet that has a name column, with the automatic column mapping. */
+function importPlan(wb, header) {
+  let opt = null;
+  if (header) { try { opt = JSON.parse(header); } catch (e) { throw new HttpError(400, 'Bad import options'); } }
+  if (!opt || !Array.isArray(opt.sheets)) {
+    const auto = wb.worksheets.map((ws) => ({ ws, ...SheetImport.inspectSheet(ws, db.events) })).filter((x) => x.looksLikePlayers);
+    if (!auto.length) throw new HttpError(400, 'No sheet with a "Name" column was found.');
+    return auto;
+  }
+  const plan = opt.sheets.slice(0, 50).map((o) => {
+    const ws = wb.worksheets[Number(o.index)]; if (!ws) throw new HttpError(400, 'Sheet not found');
+    const auto = SheetImport.inspectSheet(ws, db.events), map = {};
+    const src = o.map && typeof o.map === 'object' ? o.map : auto.map;
+    SheetImport.FIELD_KEYS.forEach((k) => { const c = Math.floor(Number(src[k])); if (c >= 1 && c <= 60) map[k] = c; });
+    if (!map.name && !map.firstName) throw new HttpError(400, 'Sheet "' + ws.name + '": choose which column holds the player name.');
+    const headerRow = Math.max(1, Math.min(50, Math.floor(Number(o.headerRow)) || auto.headerRow));
+    const used = new Set(Object.values(map));
+    return { ws, headerRow, map, eventCols: auto.eventCols.filter((x) => !used.has(x.col)), eventId: find('events', o.eventId) ? o.eventId : '', section: ['adults', 'kids'].includes(o.section) ? o.section : '' };
+  });
+  if (!plan.length) throw new HttpError(400, 'Choose at least one sheet to import.');
+  return plan;
+}
 async function exportXlsx(admin) {
   const ExcelJS = require('exceljs');
   const wb = new ExcelJS.Workbook();
@@ -1738,44 +1768,54 @@ async function route(req, res, url) {
       res.writeHead(200, { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': 'attachment; filename="players-import-template.xlsx"' });
       return res.end(Buffer.from(await wb.xlsx.writeBuffer()));
     }
+    /* Look at every sheet of an uploaded workbook: which ones hold players, and how their columns map. */
+    if (p === '/api/admin/import-inspect' && m === 'POST') {
+      const wb = await loadWorkbook(await readBody(req, 5e6));
+      return json(res, 200, {
+        fields: SheetImport.FIELDS.map((f) => ({ key: f.key, label: f.label })),
+        sheets: wb.worksheets.map((ws, i) => ({ index: i, ...SheetImport.inspectSheet(ws, db.events) })),
+      });
+    }
     if (p === '/api/admin/import-players' && m === 'POST') {
-      const buf = await readBody(req, 5e6);
-      const ExcelJS = require('exceljs'); const wb = new ExcelJS.Workbook();
-      try { await wb.xlsx.load(buf); } catch (e) { throw new HttpError(400, 'That does not look like an Excel (.xlsx) file.'); }
-      const ws = wb.worksheets[0]; if (!ws) throw new HttpError(400, 'The workbook is empty.');
-      const cell = (r, c) => { let v = r.getCell(c).value; if (v && typeof v === 'object') { if ('result' in v) v = v.result; else if ('text' in v) v = v.text; else if (v instanceof Date) v = v.toISOString().slice(0, 10); } return v == null ? '' : String(v).trim(); };
-      let created = 0, flagged = 0; const errors = [], made = [], totals = { games: 0, interested: 0, teamEntries: 0, teamsMade: 0 };
+      const wb = await loadWorkbook(await readBody(req, 5e6));
+      const plan = importPlan(wb, req.headers['x-import-options']);
+      let created = 0, flagged = 0, merged = 0; const errors = [], made = [], totals = { games: 0, interested: 0, teamEntries: 0, teamsMade: 0 }, perSheet = [];
       const dry = url.searchParams.get('dry') === '1';
-      for (let i = 2; i <= Math.min(ws.rowCount, 1000); i++) {
-        const row = ws.getRow(i), name = cell(row, 1); if (!name) continue;
-        try {
-          if (db.players.length >= 5000) throw new Error('Player limit reached');
-          const section = /kid|child/i.test(cell(row, 2)) ? 'kids' : 'adults';
-          const dob = /^\d{4}-\d{2}-\d{2}/.test(cell(row, 6)) ? cell(row, 6).slice(0, 10) : '';
-          const evNames = cell(row, 9).split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
-          const evs = evNames.map((n) => { const e = db.events.find((x) => x.name.toLowerCase() === n && (x.section || 'adults') === section) || db.events.find((x) => x.name.toLowerCase() === n); if (!e) throw new Error('Unknown event "' + n + '"'); return e; });
-          const pl = COLS.players({ name, section, gender: cell(row, 3).toUpperCase().slice(0, 1), phone: cell(row, 4), email: cell(row, 5), dob, ageGroup: cell(row, 7), affiliation: cell(row, 8) }, null);
-          if (db.players.some((x) => x.status !== 'rejected' && x.dob && dob && x.dob === dob && x.name.toLowerCase() === name.toLowerCase() && evs.some((e) => e.participantIds.includes(x.id)))) throw new Error('Already registered for that event');
-          pl.status = 'approved'; pl.profilePublic = false; pl.dupOf = dupCandidates(pl); if (pl.dupOf.length) flagged++;
-          const tn = cell(row, 10);
-          const stat = { games: 0, interested: 0, teamEntries: 0, teamsMade: 0 };
-          if (!dry) {
-            db.players.push(pl);
-            let t = null;
-            if (tn) { t = db.teams.find((x) => x.name.toLowerCase() === tn.toLowerCase() && x.section === section); if (!t) { t = COLS.teams({ name: tn, section, memberIds: [] }, null); db.teams.push(t); stat.teamsMade++; } if (!t.memberIds.includes(pl.id)) t.memberIds.push(pl.id); }
-            evs.forEach((e) => {
-              if (e.sideType !== 'team') { if (!e.participantIds.includes(pl.id)) { e.participantIds.push(pl.id); stat.games++; } return; }
-              if (t) { if (!e.participantIds.includes(t.id)) { e.participantIds.push(t.id); stat.teamEntries++; } stat.games++; }
-              else { e.interestedIds = e.interestedIds || []; if (!e.interestedIds.includes(pl.id)) { e.interestedIds.push(pl.id); stat.interested++; stat.games++; } }
-            });
-          } else { db.players.push(pl); evs.forEach(() => { stat.games++; }); }
-          totals.games += stat.games; totals.interested += stat.interested; totals.teamEntries += stat.teamEntries; totals.teamsMade += stat.teamsMade;
-          created++; made.push(pl.id);
-        } catch (e) { errors.push({ row: i, name, error: e.message }); }
+      const seen = new Map();   // the same person on several sheets/rows becomes one player
+      const keyOf = (x) => { const n = x.name.toLowerCase().replace(/[^a-z]/g, ''); return x.section + '|' + n + '|' + (x.phone.replace(/\D/g, '').slice(-10) || x.email.toLowerCase() || x.dob); };
+      const nextNo = db.nextPlayerNo;
+      for (const sh of plan) {
+        const rows = SheetImport.readRows(sh.ws, sh, db.events); let n = 0;
+        for (const x of rows.slice(0, 2000)) {
+          try {
+            const evs = x.games.map((g) => { const e = SheetImport.eventByName(g, db.events, x.section); if (!e) throw new Error('Unknown event "' + g + '"'); return e; });
+            const key = keyOf(x); let pl = seen.get(key), isNew = false;
+            if (!pl) {
+              if (db.players.length >= 5000) throw new Error('Player limit reached');
+              if (db.players.some((q) => q.status !== 'rejected' && q.dob && x.dob && q.dob === x.dob && q.name.toLowerCase() === x.name.toLowerCase() && evs.some((e) => e.participantIds.includes(q.id)))) throw new Error('Already registered for that event');
+              pl = COLS.players({ name: x.name, section: x.section, gender: x.gender, phone: x.phone, email: x.email, dob: x.dob, ageGroup: x.ageGroup, affiliation: x.affiliation }, null);
+              pl.status = 'approved'; pl.profilePublic = false; pl.dupOf = dupCandidates(pl); if (pl.dupOf.length) flagged++;
+              db.players.push(pl); seen.set(key, pl); made.push(pl.id); isNew = true; created++;
+            } else merged++;
+            const stat = { games: 0, interested: 0, teamEntries: 0, teamsMade: 0 };
+            if (!dry) {
+              let t = null;
+              if (x.team) { t = db.teams.find((q) => q.name.toLowerCase() === x.team.toLowerCase() && q.section === x.section); if (!t) { t = COLS.teams({ name: x.team, section: x.section, memberIds: [] }, null); db.teams.push(t); stat.teamsMade++; } if (!t.memberIds.includes(pl.id)) t.memberIds.push(pl.id); }
+              evs.forEach((e) => {
+                if (e.sideType !== 'team') { if (!e.participantIds.includes(pl.id)) { e.participantIds.push(pl.id); stat.games++; } return; }
+                if (t) { if (!e.participantIds.includes(t.id)) { e.participantIds.push(t.id); stat.teamEntries++; } stat.games++; }
+                else { e.interestedIds = e.interestedIds || []; if (!e.interestedIds.includes(pl.id)) { e.interestedIds.push(pl.id); stat.interested++; stat.games++; } }
+              });
+            } else stat.games += evs.length;
+            Object.keys(totals).forEach((k) => { totals[k] += stat[k]; });
+            if (isNew) n++;
+          } catch (e) { errors.push({ sheet: sh.ws.name, row: x.row, name: x.name, error: e.message }); }
+        }
+        perSheet.push({ sheet: sh.ws.name, rows: rows.length, added: n });
       }
-      if (dry) { db.players = db.players.filter((x) => !made.includes(x.id)); db.nextPlayerNo -= made.length; }
-      else { audit(user.name, 'imported players from Excel', created + ' added, ' + errors.length + ' skipped'); save(); broadcast(); }
-      return json(res, 200, { created, flagged, errors, dryRun: dry, ...totals });
+      if (dry) { db.players = db.players.filter((q) => !made.includes(q.id)); db.nextPlayerNo = nextNo; }
+      else { audit(user.name, 'imported players from Excel', created + ' added from ' + plan.map((x) => x.ws.name).join(', ') + ', ' + errors.length + ' skipped'); save(); broadcast(); }
+      return json(res, 200, { created, flagged, merged, errors, dryRun: dry, sheets: perSheet, ...totals });
     }
     if (p === '/api/admin/players/approve-all' && m === 'POST') {
       let n = 0; db.players.filter((x) => x.status === 'pending').forEach((x) => { x.status = 'approved'; enrol(x); n++; });
