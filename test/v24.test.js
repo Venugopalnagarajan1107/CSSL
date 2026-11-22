@@ -63,5 +63,18 @@ test('cancelled matches, table tennis tie-breaks, referees in Notify, organizer 
     const pub2 = (await call('GET', '/api/state')).body;
     assert.equal(pub2.organizers.find((a) => a.id === kav).phone, '9000000301');
     assert.equal(pub2.organizers.find((a) => a.id === amb).phone, '', 'two players with that name: no guess');
+    // organizers set numbers themselves: their own, and fellow organizers of an event they run – not others
+    const o1 = (await call('POST', '/api/admin/admins', { name: 'Org One', limited: true }, admin)).body, o2 = (await call('POST', '/api/admin/admins', { name: 'Org Two', limited: true }, admin)).body;
+    const o3 = (await call('POST', '/api/admin/admins', { name: 'Org Three', limited: true }, admin)).body;
+    const t1 = (await call('GET', '/api/state', null, admin)).body.tournaments.find((t) => t.kind !== 'friendly');
+    const put = await call('PUT', '/api/staff/tournaments/' + t1.id, { organizerIds: t1.organizerIds.concat([o1.id, o2.id]), refereeIds: t1.refereeIds.length ? t1.refereeIds : [umaRef] }, admin); assert.equal(put.status, 200, JSON.stringify(put.body));
+    const tk = (await call('POST', '/api/login', { role: 'admin', pin: o1.pin })).body.token;
+    assert.equal((await call('PUT', '/api/staff/organizers/' + o1.id + '/contact', { phone: '98450 00001' }, tk)).status, 200, 'own number');
+    assert.equal((await call('PUT', '/api/staff/organizers/' + o2.id + '/contact', { phone: '98450 00002' }, tk)).status, 200, 'fellow organizer of the same event');
+    assert.equal((await call('PUT', '/api/staff/organizers/' + o3.id + '/contact', { phone: '98450 00003' }, tk)).status, 403, 'not their event');
+    assert.equal((await call('PUT', '/api/staff/organizers/' + o1.id + '/contact', { phone: 'call me' }, tk)).status, 400);
+    assert.equal((await call('PUT', '/api/staff/organizers/' + o1.id + '/contact', { phone: '1' })).status, 401);
+    const pub3 = (await call('GET', '/api/state')).body;
+    assert.equal(pub3.organizers.find((a) => a.id === o2.id).phone, '98450 00002');
   } finally { await s.stop(); }
 });

@@ -932,7 +932,7 @@ Views.season = (sub) => {
       h('div', { class: 'card' }, h('b', {}, '👔 Organizers of ' + T.name), h('p', { class: 'muted small' }, 'The person who created the event and anyone added here manage everything in it: games, teams, players, fixtures and referees.' + (T.createdBy ? ' Created by ' + T.createdBy + '.' : '')),
         h('div', { class: 'list' }, (T.organizerIds || []).map((id) => (SA.organizers || []).find((a) => a.id === id)).filter(Boolean).map((a) => h('div', { class: 'row' }, icon('players'),
           h('div', { class: 'grow' }, h('b', {}, a.name), h('div', { class: 'muted small' }, a.phone ? '📞 ' + a.phone : 'No contact number yet')),
-          isOrganizer() ? h('button', { class: 'btn ghost sm', onclick: () => orgPhoneModal(a) }, '📞 Contact number') : null))),
+          canEditOrg(a) ? h('button', { class: 'btn ghost sm', onclick: () => orgPhoneModal(a) }, '📞 ' + (a.id === me.adminId ? 'My contact number' : 'Contact number')) : null))),
         mine ? h('button', { class: 'btn ghost sm', onclick: () => tourStaffModal(T, 'organizers') }, '+ Add / change organizers') : null),
       isOrganizer() ? h('details', {}, h('summary', {}, 'All organizer accounts and PINs'), adminsCard()) : null)
     : h('div', {},
@@ -1582,17 +1582,20 @@ function renderNav(name) {
   const bar = $('#bar'); if (bar) document.documentElement.style.setProperty('--barh', bar.offsetHeight + 'px');
 }
 /* Set the contact number shown for an organizer on Contact us (main admins). Empty = use their player profile's number. */
+/* Who may change an organizer's contact number: main admins; the organizer; fellow organizers of one of their events. */
+const canEditOrg = (a) => isAdmin() && (isOrganizer() || a.id === me.adminId || realTours().some((t) => (t.organizerIds || []).includes(me.adminId) && (t.organizerIds || []).includes(a.id)));
 function orgPhoneModal(a) {
   const ph = h('input', { type: 'tel', value: a.ownPhone || '', placeholder: a.phone && !a.ownPhone ? a.phone + ' (from their player profile)' : 'e.g. 98765 43210', autocomplete: 'off', maxlength: 30 });
   modal('Contact number – ' + a.name, h('div', {}, field('Phone number shown on Contact us', ph, 'Everyone who opens Contact us can see and call this number. Leave empty to use the number in their player profile (if linked).')),
-    [{ label: 'Save', fn: async () => { await api('PUT', '/api/admin/admins/' + a.id, { phone: ph.value.trim() }); toast('Saved'); await refresh(); } }]);
+    [{ label: 'Save', fn: async () => { await api('PUT', '/api/staff/organizers/' + a.id + '/contact', { phone: ph.value.trim() }); toast('Saved'); await refresh(); } }]);
 }
 const telHref = (p) => 'tel:' + String(p).replace(/[^\d+]/g, '');
 const waHref = (p) => { let d = String(p).replace(/\D/g, ''); if (d.length === 10) d = '91' + d; else if (d.length === 11 && d[0] === '0') d = '91' + d.slice(1); return 'https://wa.me/' + d; };
 function contactRow(a) {
   return h('div', { class: 'row' }, icon('players'), h('div', { class: 'grow' }, h('b', {}, a.name), a.phone ? h('div', { class: 'muted small' }, a.phone) : h('div', { class: 'muted small' }, 'No contact number yet')),
     a.phone ? h('a', { class: 'btn ghost sm', href: telHref(a.phone), 'aria-label': 'Call ' + a.name }, '📞 Call') : null,
-    a.phone ? h('a', { class: 'btn sm wa', href: waHref(a.phone), target: '_blank', rel: 'noopener', 'aria-label': 'WhatsApp ' + a.name }, 'WhatsApp') : null);
+    a.phone ? h('a', { class: 'btn sm wa', href: waHref(a.phone), target: '_blank', rel: 'noopener', 'aria-label': 'WhatsApp ' + a.name }, 'WhatsApp') : null,
+    canEditOrg(a) ? h('button', { class: 'btn ghost sm', 'aria-label': 'Edit contact number of ' + a.name, onclick: () => orgPhoneModal(a) }, '✏️') : null);
 }
 /* Contact us: who runs each event, with their contact number (tap to call or WhatsApp). */
 Views.contact = () => {
@@ -1605,7 +1608,7 @@ Views.contact = () => {
         people.length ? h('div', { class: 'list' }, people.map(contactRow)) : h('p', { class: 'muted small' }, 'Organizers not named yet.')); })
       : h('p', { class: 'empty' }, 'No event is running right now.'),
     main.length ? h('div', { class: 'card' }, h('b', {}, 'App administrators'), h('div', { class: 'list' }, main.map(contactRow))) : null,
-    isOrganizer() ? h('p', { class: 'muted small' }, 'Organizers: set the numbers shown here in 🏆 Event → Organizers → 📞 Contact number.') : null,
+    isAdmin() ? h('p', { class: 'muted small' }, 'Organizers: tap ✏️ next to your name to set the number shown here (also in 🏆 Event → Organizers).') : null,
     h('p', { class: 'muted small' }, 'Found a wrong score? Open the match and tap ⚑ Report a score problem.'));
 };
 

@@ -1870,6 +1870,17 @@ async function route(req, res, url) {
     return json(res, 200, { ok: true });
   }
   /* ---- events: anyone signed in (organizer or referee) may create one and set its organizers and referees ---- */
+  /* Organizers set contact numbers themselves: their own, and those of fellow organizers of an event they run. Main admins: anyone. */
+  if ((mt = p.match(/^\/api\/staff\/organizers\/([\w-]+)\/contact$/)) && m === 'PUT') {
+    if (!user || user.role !== 'admin' || !user.adminId) throw new HttpError(401, 'Sign in as an organizer.');
+    const a = db.admins.find((x) => x.id === mt[1]); if (!a) throw new HttpError(404, 'Organizer not found');
+    const fellow = db.tournaments.some((t) => (t.organizerIds || []).includes(user.adminId) && (t.organizerIds || []).includes(a.id));
+    if (isLead(user) && a.id !== user.adminId && !fellow) throw new HttpError(403, 'You can set your own number, or those of organizers of events you run.');
+    const b = await readJson(req, 1000), phone = str(b.phone, 30);
+    if (phone && !/^[+\d][\d\s()-]{5,}$/.test(phone)) throw new HttpError(400, 'Enter a phone number (digits, spaces and + only).');
+    a.phone = phone; audit(user.name, 'organizer contact number', a.name + (a.id === user.adminId ? ' (own)' : '')); save(); broadcast();
+    return json(res, 200, { ok: true, phone: orgPhone(a) });
+  }
   if (p === '/api/staff/friendly' && m === 'POST') {
     if (!isStaffU(user)) throw new HttpError(401, 'Sign in to start a match.');
     const b = await readJson(req, 4000);
