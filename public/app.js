@@ -55,7 +55,7 @@ let me = store.get('me', { role: null });
 let pending = store.get('pending', []);
 let offline = false;
 const Views = {};
-let ui = { tid: store.get('tid', ''), sport: store.get('sport', ''), eventTab: {}, matchFilter: { event: '', status: '' }, adminTab: 'setup', certJob: null, section: store.get('section', 'adults'), matchView: 'list', playerSection: '', tvIdx: 0, rubber: {} };
+let ui = { pick: null, tid: store.get('tid', ''), sport: store.get('sport', ''), eventTab: {}, matchFilter: { event: '', status: '' }, adminTab: 'setup', certJob: null, section: store.get('section', 'adults'), matchView: 'list', playerSection: '', tvIdx: 0, rubber: {} };
 
 /* ------------------------------------------------------------------- api */
 async function api(method, url, body, raw) {
@@ -269,6 +269,7 @@ function delMsg(m, what) {
 }
 const plannedTxt = (m) => (m.plannedNo && m.no && m.plannedNo !== m.no ? 'planned #' + m.plannedNo : null);
 const renumbered = (m) => !!(m.notified && m.notified.no && m.no && m.notified.no !== m.no);
+const cardBtn = (icon, label, fn, cls) => h('button', { type: 'button', class: 'btn ghost sm ' + (cls || ''), 'aria-label': label, title: label, onclick: (e) => { e.preventDefault(); e.stopPropagation(); fn(); } }, h('span', { 'aria-hidden': 'true' }, icon), ' ', label);
 function ago(t) { const s = Math.max(0, (Date.now() - t) / 1000); return s < 90 ? 'just now' : s < 5400 ? Math.round(s / 60) + ' min ago' : s < 129600 ? Math.round(s / 3600) + ' h ago' : Math.round(s / 86400) + ' days ago'; }
 async function notifyModal(m) {
   const plan = await api('POST', '/api/staff/matches/' + m.id + '/notify', { base: BASE() }).catch((e) => { toast(e.message, true); return null; });
@@ -307,6 +308,22 @@ async function notifyModal(m) {
   new MutationObserver((_, ob) => { if (!box.el.isConnected) { ob.disconnect(); mark(); } }).observe(document.body, { childList: true });
 }
 
+/* Select one, several or all of the matches in a list, then delete them together (they go to Trash as one item). */
+function selectBar(list) {
+  const mine = list.filter((m) => canManage(evOf(m)));
+  if (!mine.length) { return null; }
+  if (!ui.pick) return h('div', { class: 'actions noprint' }, h('button', { class: 'btn ghost sm', onclick: () => { ui.pick = new Set(); render(); } }, '☑ Select matches'));
+  const shown = new Set(mine.map((m) => m.id)), sel = [...ui.pick].filter((id) => shown.has(id)), all = sel.length === mine.length;
+  return h('div', { class: 'selbar noprint' },
+    h('b', {}, sel.length + ' of ' + mine.length + ' selected'),
+    h('button', { class: 'btn ghost sm', onclick: () => { mine.forEach((m) => (all ? ui.pick.delete(m.id) : ui.pick.add(m.id))); render(); } }, all ? 'Select none' : 'Select all (' + mine.length + ')'),
+    h('button', { class: 'btn sm danger', disabled: !sel.length, onclick: () => {
+      const ms = sel.map((id) => byId('matches', id)).filter(Boolean), played = ms.filter((m) => E.derive(liveMatch(m), evOf(m)).status !== 'scheduled').length;
+      confirmBox('Delete ' + ms.length + ' match' + (ms.length === 1 ? '' : 'es') + '?' + (played ? ' ' + played + ' already ' + (played === 1 ? 'has' : 'have') + ' scores.' : '') + ' The match numbers after them close up. They go to Admin → Trash, where one tap restores them all (30 days).',
+        guard(async () => { const r = await api('POST', '/api/admin/matches/bulk-delete', { ids: ms.map((m) => m.id) }); ui.pick = null; toast(r.removed + ' deleted – restore from Admin → Trash'); await refresh(); }), 'Delete ' + ms.length);
+    } }, '🗑 Delete selected' + (sel.length ? ' (' + sel.length + ')' : '')),
+    h('button', { class: 'btn ghost sm', onclick: () => { ui.pick = null; render(); } }, 'Done'));
+}
 function matchCard(m, opts) {
   opts = opts || {};
   const ev = evOf(m); if (!ev) return null;
@@ -315,8 +332,10 @@ function matchCard(m, opts) {
   let mid = 'vs';
   if ((ev.scoring === 'points' || d.tie) && d.status !== 'scheduled') mid = d.gamesA + ' – ' + d.gamesB;
   if (ev.scoring === 'result' && d.status === 'completed') mid = d.draw ? '½ – ½' : d.winner === 'A' ? '1 – 0' : '0 – 1';
-  return h('a', { class: 'card match ' + d.status, href: '#/match/' + m.id },
-    h('div', { class: 'mc-top' }, chip(d.status),
+  const picking = !!ui.pick && canManage(ev), on = picking && ui.pick.has(m.id);
+  return h('a', { class: 'card match ' + d.status + (picking ? ' picking' : '') + (on ? ' picked' : ''), href: '#/match/' + m.id, 'aria-pressed': picking ? String(on) : null,
+    onclick: picking ? (e) => { e.preventDefault(); if (on) ui.pick.delete(m.id); else ui.pick.add(m.id); render(); } : null },
+    h('div', { class: 'mc-top' }, picking ? h('span', { class: 'pickbox', 'aria-hidden': 'true' }, on ? '☑' : '☐') : null, chip(d.status),
       h('span', { class: 'muted' }, [opts.event ? ev.name + (m.no ? ' #' + m.no : '') : m.no ? 'Match #' + m.no : null, plannedTxt(m) ? '(' + plannedTxt(m) + ')' : null, m.stage !== 'League' ? m.stage : (m.round ? 'Round ' + m.round + (m.totalRounds ? ' of ' + m.totalRounds : '') : null), m.court, fmtSlot(m)].filter(Boolean).join(' • '))),
     h('div', { class: 'mc-row' },
       h('div', { class: 'mc-side' + (d.winner === 'A' ? ' win' : '') }, A),
@@ -325,7 +344,10 @@ function matchCard(m, opts) {
     d.status === 'live' && ev.scoring === 'points' && d.current ? h('div', { class: 'mc-live' }, 'Game ' + (d.games.length + 1) + ': ' + d.current.a + ' – ' + d.current.b) : null,
     d.tie ? h('div', { class: 'mc-games' }, d.rubbers.filter((x) => x.status !== 'scheduled').map((x) => x.name + ' ' + (x.status === 'completed' ? (x.winner === 'A' ? '✓' : '✗') + ' ' + E.scoreText(x) : '● ' + (x.current ? x.current.a + '–' + x.current.b : ''))).join(' • ') || 'Line-ups and rubbers: tap to open') : null,
     !d.tie && (d.games.length || d.outcome) ? h('div', { class: 'mc-games' }, [d.outcome ? OUT[d.outcome].trim() : '', d.outcome === 'walkover' || d.outcome === 'dq' ? '' : E.scoreText(d)].filter(Boolean).join(' • ')) : null,
-    d.status === 'scheduled' && canNotify(ev) ? h('div', { class: 'mc-notify' }, m.notified ? h('span', { class: renumbered(m) ? 'warn small' : 'muted small' }, renumbered(m) ? '⚠ Number changed since notified (was #' + m.notified.no + ')' : '🔔 Notified ' + ago(m.notified.at)) : h('span'), notifyBtn(m, ev, d)) : null);
+    !picking && ((d.status === 'scheduled' && canNotify(ev)) || canManage(ev)) ? h('div', { class: 'mc-notify noprint' },
+      m.notified && d.status === 'scheduled' ? h('span', { class: renumbered(m) ? 'warn small' : 'muted small' }, renumbered(m) ? '⚠ Number changed since notified (was #' + m.notified.no + ')' : '🔔 Notified ' + ago(m.notified.at)) : h('span'),
+      h('span', { class: 'mc-btns' }, notifyBtn(m, ev, d), canManage(ev) ? cardBtn('✏️', 'Edit', () => fixtureModal(ev.id, m)) : null,
+        canManage(ev) ? cardBtn('🗑', 'Delete', () => confirmBox(delMsg(m, m.rubbers && m.rubbers.length ? 'tie' : 'match') + (d.status !== 'scheduled' ? ' It already has scores.' : '') + ' It goes to Trash for 30 days.', guard(async () => { await api('DELETE', '/api/admin/matches/' + m.id); toast('Deleted – restore it from Admin → Trash'); await refresh(); }), 'Delete'), 'danger-t') : null)) : null);
 }
 
 function standingsRows(ev, rows, qualText) {
@@ -457,7 +479,7 @@ Views.event = (id) => {
   const hasDraw = hasKO || (ev.groups && Object.keys(ev.groups).length) || ms.length;
   const body = tab === 'bracket' ? h('div', {}, championBanner(ev), bracketView(ev))
     : tab === 'standings' ? h('div', {}, championBanner(ev), standingsTable(ev), hasKO && fmt.type !== 'knockout' ? h('div', {}, h('h3', {}, 'Knockout'), bracketView(ev)) : null)
-    : tab === 'fixtures' ? h('div', {}, ms.length ? ms.map((x) => matchCard(x.m)) : h('p', { class: 'empty' }, 'No fixtures yet.'))
+    : tab === 'fixtures' ? h('div', {}, selectBar(ms.map((x) => x.m)), ms.length ? ms.map((x) => matchCard(x.m)) : h('p', { class: 'empty' }, 'No fixtures yet.'))
       : ev.sideType === 'team' && canManage(ev) ? teamBuilder(ev)
       : h('div', { class: 'list' }, (ev.participantIds || []).map((pid) => {
         if (ev.sideType === 'team') { const t = byId('teams', pid); return h('div', { class: 'row' }, h('b', {}, t ? t.name : '?'), h('span', { class: 'muted small' }, t ? t.memberIds.map((x) => (byId('players', x) || {}).name).join(', ') : '')); }
@@ -475,7 +497,7 @@ Views.event = (id) => {
       canManage(ev) ? h('button', { class: 'btn', onclick: () => needStaff(ev, () => fixtureModal(ev.id)) }, '+ Fixture') : null,
       canManage(ev) ? h('button', { class: 'btn ghost', onclick: () => needStaff(ev, () => generateModal(ev)) }, fmt.type === 'swiss' ? '⚡ Next Swiss round' : fmt.type === 'knockout' ? '⚡ Draw bracket' : fmt.type === 'groups' ? '⚡ Draw groups' : '⚡ Generate fixtures') : null,
       canManage(ev) && canNext ? h('button', { class: 'btn ghost', onclick: () => finalsFlow(ev) }, nextLabel) : null,
-      canManage(ev) && hasDraw ? h('button', { class: 'btn ghost', onclick: () => resetDrawFlow(ev) }, '↺ Reset draw') : null,
+      canManage(ev) && hasDraw ? h('button', { class: 'btn ghost danger-t', onclick: () => resetDrawFlow(ev) }, '🗑 Delete all fixtures') : null,
       canManage(ev) ? h('button', { class: 'btn ghost', onclick: () => participantModal(ev) }, '⇄ Withdraw / replace') : null,
       canManage(ev) ? h('button', { class: 'btn ghost', onclick: () => eventModal(ev) }, '⚙ Game settings') : null),
     body);
@@ -520,6 +542,7 @@ function eventMatches() {
     h('div', { class: 'filters' },
       h('select', { 'aria-label': 'Game', onchange: (e) => { f.event = e.target.value; render(); } }, h('option', { value: '' }, 'All games'), evs.map((e) => h('option', { value: e.id, selected: f.event === e.id }, e.name))),
       h('select', { 'aria-label': 'Status', onchange: (e) => { f.status = e.target.value; render(); } }, [['', 'Any status'], ['live', 'Live'], ['scheduled', 'Upcoming'], ['completed', 'Completed']].map(([v, l]) => h('option', { value: v, selected: f.status === v }, l)))),
+    ui.matchView === 'schedule' ? null : selectBar(rows.map((x) => x.m)),
     ui.matchView === 'schedule' ? scheduleView(rows) : (rows.length ? rows.map((x) => matchCard(x.m, { event: true })) : h('p', { class: 'empty' }, 'No matches yet.')),
     canManageTour(curT()) && curT().status !== 'closed' ? h('button', { class: 'btn', onclick: () => { const ev = byId('events', f.event) || evs[0]; if (!ev) return toast('Create a game first', true); needStaff(ev, () => fixtureModal(ev.id)); } }, '+ Fixture') : null);
 }
@@ -530,7 +553,7 @@ Views.matches = () => {
   return h('div', {}, h('h1', {}, 'Friendly matches'),
     h('p', { class: 'muted small' }, 'Quick matches between any players, outside the events. Results count in players’ profiles and all-time rankings. Event matches are under 🏆 Event → Matches.'),
     isStaff() ? h('button', { class: 'btn', onclick: () => friendlyModal() }, '+ New match') : h('p', { class: 'muted small' }, 'Organizers and referees can start a friendly match.'),
-    ms.length ? ms.map((x) => matchCard(x.m, { event: true })) : h('p', { class: 'empty' }, 'No friendly matches yet.'));
+    selectBar(ms.map((x) => x.m)), ms.length ? ms.map((x) => matchCard(x.m, { event: true })) : h('p', { class: 'empty' }, 'No friendly matches yet.'));
 };
 function friendlyModal() {
   const people = SA.players.filter((p) => p.status !== 'pending').sort((a, b) => a.name.localeCompare(b.name));
@@ -874,6 +897,9 @@ function playerRankCard(p) {
 }
 
 /* ------- referees: public list, organizer management, sign-up ------- */
+/* A referee is offered for a game only when mapped to its sport (or that game). Chief referees cover every sport. */
+const refFor = (r, ev) => !!(r && ev) && (r.kind === 'chief' || (r.sports || []).includes(ev.sport) || (r.eventIds || []).includes(ev.id));
+const refSportsTxt = (r) => (r.kind === 'chief' ? 'all sports' : (r.sports || []).filter((k) => SPORT_LABEL[k]).map((k) => SPORT_ICON[k]).join(' ') || '⚠ no sport');
 const REF_KIND_LABEL = { referee: 'Referee', chief: 'Chief referee', volunteer: 'Volunteer' };
 Views.referees = (embedded) => {
   if (embedded !== true) { location.replace('#/season/referees'); return h('p', { class: 'empty' }, 'Loading…'); }
@@ -886,7 +912,7 @@ Views.referees = (embedded) => {
     organizer ? refereesAdmin() : null,
     refs.length ? h('div', { class: 'list' }, refs.map((r) => { const c = assigned(r.id), sc = scope(r);
       return h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, r.name),
-        h('div', { class: 'muted small' }, [REF_KIND_LABEL[r.kind] || 'Referee', r.kind === 'chief' ? 'All sports' : sc.length ? sc.join(', ') : 'All sports', c.n ? c.done + ' of ' + c.n + ' assigned matches done' : ''].filter(Boolean).join(' • '))),
+        h('div', { class: 'muted small' }, [REF_KIND_LABEL[r.kind] || 'Referee', r.kind === 'chief' ? 'All sports' : sc.length ? sc.join(', ') : '⚠ No sport mapped – not offered for any game' + (organizer ? ' (tap Edit)' : ''), c.n ? c.done + ' of ' + c.n + ' assigned matches done' : ''].filter(Boolean).join(' • '))),
         organizer ? h('button', { class: 'btn ghost sm', onclick: () => refereeModal(r) }, 'Edit') : null); }))
       : h('p', { class: 'empty' }, 'No referees yet.' + (organizer ? '' : ' The organizers add them.')));
 };
@@ -1456,6 +1482,7 @@ function busy() {
   return document.querySelector('.modal') || (/^#\/(admin|login|certs|gallery|season)/.test(location.hash) && document.activeElement && document.activeElement.matches('input,select,textarea'));
 }
 
+window.addEventListener('hashchange', () => { ui.pick = null; });
 window.addEventListener('hashchange', render);
 window.addEventListener('DOMContentLoaded', async () => {
   applyTheme();
