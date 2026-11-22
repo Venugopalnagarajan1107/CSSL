@@ -40,7 +40,7 @@ test('season, rankings settings, referee limits, sign-up and approval', async ()
     assert.equal((await call('POST', '/api/admin/matches/' + m.id + '/scores', { games: [{ a: 11, b: 4 }] }, await chiefTok(s, admin))).status, 200);
     st = (await call('GET', '/api/state', null, admin)).body;
     const rows = E.rankings([E.seasonRecords(st, st.matches)], { players: st.players });
-    assert.equal(rows[0].id, a.id); assert.equal(rows[0].points, 3 + 10); assert.equal(rows[1].points, 6);
+    assert.equal(rows[0].id, a.id); assert.equal(rows[0].points, 2 + 10, 'table tennis win = 2'); assert.equal(rows[1].points, 6);
 
     // ranking points and season name are organizer settings
     assert.equal((await call('POST', '/api/admin/tournament', { rankPts: { win: 2, gold: 5 } }, admin)).status, 200);

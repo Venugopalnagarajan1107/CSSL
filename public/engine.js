@@ -48,7 +48,9 @@
   /* Derive full match state from the point log. */
   /* A fixture may override points settings (best of, points per game, win by, cap, carrom weights) for itself only. */
   function withCfg(match, event) { return match && match.cfg && Object.keys(match.cfg).length ? { ...event, config: { ...event.config, ...match.cfg } } : event; }
-  function derive(match, event) {
+  /* A cancelled match keeps whatever was recorded, but counts for nothing (standings, records, progress). */
+  function derive(match, event) { const d = deriveRaw(match, event); if (match && match.cancelled) d.status = 'cancelled'; return d; }
+  function deriveRaw(match, event) {
     event = withCfg(match, event);
     if (match.rubbers && match.rubbers.length && event.sideType === 'team') return deriveTie(match, event);
     const cfg = event.config;
@@ -178,6 +180,7 @@
     for (const m of matches) {
       if (!inScope(m)) continue;
       const d = derive(m, event);
+      if (d.status === 'cancelled') continue;
       const A = sideIds(m, 'A'), B = sideIds(m, 'B');
       // Each finished game: score is divided between the players on a side (doubles => split by 2).
       const games = d.rubbers ? d.rubbers.flatMap((x) => x.games) : d.games;
@@ -212,8 +215,11 @@
     const byTally = cfg.rankBy === 'tally';
     const swiss = fmt.type === 'swiss', rub = (event.rubbers || []).length > 0;
     const rd = (r) => (rub ? r.rw - r.rl : 0), bhk = (r) => (swiss ? r.bh : 0);
+    /* Table tennis (and any game set to it): Points -> set difference -> sets won, then point difference. */
+    const bySets = !byTally && (cfg.tiebreak ? cfg.tiebreak === 'sets' : event.sport === 'tt'), sd = (r) => r.gw - r.gl;
     list.sort((x, y) => byTally
       ? (y.pf - x.pf) || (y.pd - x.pd) || (y.mp - x.mp) || (y.won - x.won)
+      : bySets ? (y.mp - x.mp) || (bhk(y) - bhk(x)) || (sd(y) - sd(x)) || (y.gw - x.gw) || (y.pd - x.pd) || (y.pf - x.pf)
       : (y.mp - x.mp) || (bhk(y) - bhk(x)) || (rd(y) - rd(x)) || (y.pd - x.pd) || (y.pf - x.pf) || (y.won - x.won));
     /* Optional rule: a two-way tie on the main score is settled by the match between the two (before point difference). */
     if (cfg.h2hFirst && event.sideSize === 1) {
@@ -237,7 +243,7 @@
       }
     }
     // Equal on every ranking key => share a rank.
-    const key = (r) => (byTally ? [r.pf, r.pd, r.mp, r.won] : [r.mp, bhk(r), rd(r), r.pd, r.pf, r.won]).concat([r.hb || 0]).join('|');
+    const key = (r) => (byTally ? [r.pf, r.pd, r.mp, r.won] : bySets ? [r.mp, bhk(r), sd(r), r.gw, r.pd, r.pf] : [r.mp, bhk(r), rd(r), r.pd, r.pf, r.won]).concat([r.hb || 0]).join('|');
     const places = group ? (fmt.qualifiers || 0) : fmt.type === 'groups' ? 0 : finalistsFor(event);
     list.forEach((r, i) => {
       r.rank = i > 0 && key(list[i - 1]) === key(r) ? list[i - 1].rank : i + 1;
@@ -320,6 +326,7 @@
     const records = { biggestWin: null, highestGame: null };
     const expanded = [];
     for (const m0 of matches) {
+      if (m0.cancelled) continue;   /* cancelled matches count for nothing */
       const e0 = byId('events', m0.eventId);
       if (e0 && e0.sideType === 'team' && m0.rubbers && m0.rubbers.length) m0.rubbers.forEach((r) => expanded.push({ ...r, id: m0.id, eventId: m0.eventId, stage: m0.stage, startedAt: m0.startedAt, createdAt: m0.createdAt, _rev: rubberEvent(e0, r) }));
       else expanded.push(m0);
@@ -410,6 +417,7 @@
     const rec = (pid, sport) => { const p = (out[pid] = out[pid] || {}); return (p[sport] = p[sport] || { played: 0, won: 0, drawn: 0, lost: 0, pf: 0, pa: 0, gold: 0, silver: 0, bronze: 0 }); };
     const people = (ev, ids, lineup) => (ev.sideType === 'player' ? ids : ids.flatMap((t) => members(t)).filter((pid) => !lineup || !lineup.length || lineup.includes(pid)));
     for (const m0 of matches) {
+      if (m0.cancelled) continue;   /* cancelled matches count for nothing */
       const e0 = byId('events', m0.eventId); if (!e0) continue;
       const list = e0.sideType === 'team' && m0.rubbers && m0.rubbers.length ? m0.rubbers.map((r) => ({ m: r, ev: rubberEvent(e0, r) })) : [{ m: m0, ev: e0 }];
       for (const { m, ev } of list) {
@@ -437,6 +445,8 @@
   }
 
   const RANK_POINTS = { win: 3, draw: 1, loss: 0, gold: 10, silver: 6, bronze: 4 };
+  /* Sports with their own match points: a table tennis win is one match worth 2 points, however many sets it took. */
+  const RANK_SPORT = { tt: { win: 2, draw: 1, loss: 0 } };
   /* Ranking table from one or more season records (current season + past seasons for all-time).
      opts: { sport: '' for all, players: [...] to include, pts } -> rows sorted, with shared ranks on ties. */
   function rankings(recordSets, opts) {
@@ -448,13 +458,15 @@
       if (allow && !allow.has(pid)) return;
       Object.entries(sports).forEach(([sp, r]) => {
         if (opts.sport && sp !== opts.sport) return;
-        const t = (tot[pid] = tot[pid] || { id: pid, played: 0, won: 0, drawn: 0, lost: 0, pf: 0, pa: 0, gold: 0, silver: 0, bronze: 0 });
-        Object.keys(t).forEach((k) => { if (k !== 'id') t[k] += Number(r[k]) || 0; });
+        const t = (tot[pid] = tot[pid] || { id: pid, played: 0, won: 0, drawn: 0, lost: 0, pf: 0, pa: 0, gold: 0, silver: 0, bronze: 0, points: 0 });
+        Object.keys(t).forEach((k) => { if (k !== 'id' && k !== 'points') t[k] += Number(r[k]) || 0; });
+        const P = { ...pts, ...(RANK_SPORT[sp] || {}), ...((opts.ptsBySport || {})[sp] || {}) }, n = (k) => Number(r[k]) || 0;
+        t.points += n('won') * P.win + n('drawn') * P.draw + n('lost') * P.loss + n('gold') * P.gold + n('silver') * P.silver + n('bronze') * P.bronze;
       });
     }));
     const rows = Object.values(tot).filter((t) => t.played > 0 || t.gold + t.silver + t.bronze > 0).map((t) => ({
       ...t, pf: r2(t.pf), pa: r2(t.pa), winPct: t.played ? Math.round((t.won / t.played) * 100) : 0,
-      points: t.won * pts.win + t.drawn * pts.draw + t.lost * pts.loss + t.gold * pts.gold + t.silver * pts.silver + t.bronze * pts.bronze,
+      points: r2(t.points),
     }));
     rows.sort((a, b) => b.points - a.points || b.won - a.won || b.winPct - a.winPct || (b.pf - b.pa) - (a.pf - a.pa) || a.played - b.played);
     rows.forEach((r, i) => {
@@ -473,5 +485,5 @@
 
   const scoreText = (d) => (d.tie ? d.gamesA + '-' + d.gamesB + ' rubbers' : d.games.map((g) => g.a + '-' + g.b).join(', '));
 
-  return { withCfg, finalistsFor, derive, applyOp, standings, groupTables, bracket, bracketOrder, seedsOrder, stageName, KO_STAGES, podium, rubberEvent, champion, cutoffInfo, playerStats, seasonRecords, rankings, RANK_POINTS, gameOver, need, scoreText, sideIds, r2 };
+  return { withCfg, finalistsFor, derive, applyOp, standings, groupTables, bracket, bracketOrder, seedsOrder, stageName, KO_STAGES, podium, rubberEvent, champion, cutoffInfo, playerStats, seasonRecords, rankings, RANK_POINTS, RANK_SPORT, gameOver, need, scoreText, sideIds, r2 };
 });

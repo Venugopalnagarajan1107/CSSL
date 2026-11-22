@@ -263,7 +263,7 @@ function numberMatches() {
     let top = Math.max(0, ...ms.map((m) => m.plannedNo || 0));
     ms.filter((m) => !m.plannedNo).sort(byCreated).forEach((m) => { m.plannedNo = ++top; });
     /* lock the start order the first time a match is seen started; a reset match goes back to the queue */
-    const started = (m) => !!(m.log && m.log.length) || !!m.result || !!m.walkover || !!m.retired || !!m.paper || (!!ev && Engine.derive(m, ev).status !== 'scheduled');
+    const started = (m) => !m.cancelled && (!!(m.log && m.log.length) || !!m.result || !!m.walkover || !!m.retired || !!m.paper || (!!ev && Engine.derive(m, ev).status !== 'scheduled'));
     const st = [], q = [];
     ms.forEach((m) => (started(m) ? st : q).push(m));
     q.forEach((m) => { delete m.startSeq; });
@@ -515,7 +515,7 @@ function publicState(mode) {
     teams: db.teams.map(({ captainHash, ...t }) => ({ ...t, hasCode: !!captainHash })), referees: db.referees.filter((r) => isAdmin || r.status !== 'pending').map((r) => ({ id: r.id, name: mode === 'public' ? refDisplay(r) : r.name, kind: r.kind, sports: r.sports, eventIds: r.eventIds, status: r.status, playerId: r.playerId || '', ...(isAdmin ? { phone: r.phone, note: r.note, signedUpAt: r.signedUpAt } : {}) })),
     seasons: db.seasons.map((x) => seasonPublic(x, mode)),
     tournaments: db.tournaments.map((T) => ({ id: T.id, kind: T.kind || '', name: T.name, dates: T.dates, venue: T.venue, status: T.status, createdAt: T.createdAt, createdBy: isAdmin ? T.createdBy : '', organizerIds: T.organizerIds, refereeIds: T.refereeIds, playerIds: T.playerIds })),
-    organizers: db.admins.map((a) => (isAdmin ? { id: a.id, name: a.name, sports: a.sports || [], limited: !!a.limited, playerId: a.playerId || '' } : { id: a.id, name: a.name, main: !a.limited && !(a.sports || []).length })),   /* organizers are named in full on Contact us */ events: db.events,
+    organizers: db.admins.map((a) => (isAdmin ? { id: a.id, name: a.name, sports: a.sports || [], limited: !!a.limited, playerId: a.playerId || '', phone: orgPhone(a), ownPhone: a.phone || '' } : { id: a.id, name: a.name, main: !a.limited && !(a.sports || []).length, phone: orgPhone(a) })),   /* organizers are named in full, with their contact number, on Contact us */ events: db.events,
     matches: db.matches.map(({ cids, lock, ...m00 }) => { const m0 = mode === 'public' ? (panic().hideScoreboard ? blankScores(m00) : paperPublic(m00)) : m00; const m = mode === 'public' && !tieRevealed(m0) ? hideLineups(m0) : m0; const o = flaggedSet.has(m.id) ? { ...m, flagged: true } : m; return m.rubbers ? { ...o, rubbers: m.rubbers.map(({ cids: c2, ...r }) => r) } : o; }),
     sponsors: db.sponsors, gallery: (mode === 'public' ? db.gallery.filter((g) => g.consent !== false && (!g.minors || db.tournament.showKidsPhotos)) : db.gallery.filter((g) => isAdmin || !g.minors || db.tournament.showKidsPhotos)).map(({ delHash, ...g }) => g),
     feed: (db.feed || []).slice(-60).reverse(),
@@ -602,6 +602,8 @@ async function notify(m, title, body) {
   await pushTo((s) => !s.approvalOnly && (!(s.follow && s.follow.length) || s.follow.some((f) => ids.has(f))), title, body, '/#/match/' + m.id);
 }
 
+/* An organizer's contact number: the one set for them, else their player profile's. Shown on Contact us. */
+const orgPhone = (a) => (a && (a.phone || ((a.playerId && find('players', a.playerId)) || {}).phone)) || '';
 /* ---------------------------------------------------------- WhatsApp notify */
 const WA = { token: process.env.WHATSAPP_TOKEN || '', phoneId: process.env.WHATSAPP_PHONE_ID || '', template: process.env.WHATSAPP_TEMPLATE || '', lang: process.env.WHATSAPP_LANG || 'en', cc: String(process.env.PHONE_COUNTRY_CODE || '91').replace(/\D/g, '') || '91' };
 WA.on = !!(WA.token && WA.phoneId);
@@ -628,7 +630,7 @@ function matchPeople(m, ev) {
   const pids = ev.sideType === 'team' ? ids.flatMap((t) => (find('teams', t) || {}).memberIds || []) : ids;
   return [...new Set(pids)].map((id) => find('players', id)).filter(Boolean);
 }
-function notifyPlan(m, ev, base, custom) {
+function notifyPlan(m, ev, base, custom, customRef) {
   const T = tour(ev.tid), title = ev.name + (m.no ? ' – Match #' + m.no : '');
   const vs = sideName(ev, m.sideA) + ' vs ' + sideName(ev, m.sideB);
   const refs = (m.refereeIds || []).map((id) => (find('referees', id) || {}).name).filter(Boolean);
@@ -637,15 +639,27 @@ function notifyPlan(m, ev, base, custom) {
   const def = 'Hi {name}, your ' + (T && T.kind !== 'friendly' ? T.name + ' ' : '') + 'match is coming up.\n' +
     '🏅 ' + title + '\n' + vs + (when ? '\n🕒 ' + when : '') + (m.court ? '\n📍 ' + m.court : '') + (refs.length ? '\nReferee: ' + refs.join(', ') : '') +
     '\nPlease report on time. Live score: {link}';
-  const template = str(custom, 1500) || def;
+  const refDef = 'Hi {name}, you are the referee for this ' + (T && T.kind !== 'friendly' ? T.name + ' ' : '') + 'match.\n' +
+    '🏅 ' + title + '\n' + vs + (when ? '\n🕒 ' + when : '') + (m.court ? '\n📍 ' + m.court : '') + '\nPlease be there a few minutes early and score it in the app: {link}';
+  const template = str(custom, 1500) || def, refTemplate = str(customRef, 1500) || refDef;
   const recipients = [], missing = [];
+  const fill = (t, first) => t.replace(/\{name\}/g, first).replace(/\{link\}/g, link);
   for (const pl of matchPeople(m, ev)) {
     const phone = waPhone(pl.phone) || waPhone(pl.guardianPhone);
     const first = String(pl.name || '').split(' ')[0] || 'there';
     if (!phone) { missing.push(pl.name); continue; }
-    recipients.push({ id: pl.id, name: pl.name, first, phone, text: template.replace(/\{name\}/g, first).replace(/\{link\}/g, link) });
+    recipients.push({ id: pl.id, name: pl.name, first, phone, role: 'player', text: fill(template, first) });
   }
-  return { template, recipients, missing, line, link, title };
+  /* the match's referees too – their own number, else their player profile's */
+  for (const r of (m.refereeIds || []).map((id) => find('referees', id)).filter(Boolean)) {
+    const pl = r.playerId ? find('players', r.playerId) : null;
+    const phone = waPhone(r.phone) || waPhone(pl && pl.phone);
+    const first = String(r.name || '').split(' ')[0] || 'there';
+    if (!phone) { missing.push(r.name + ' (referee)'); continue; }
+    if (recipients.some((x) => x.phone === phone)) continue;
+    recipients.push({ id: 'ref:' + r.id, name: r.name, first, phone, role: 'referee', text: fill(refTemplate, first) });
+  }
+  return { template, refTemplate, recipients, missing, line, link, title };
 }
 /* WhatsApp Cloud API (Meta). Messages a player did not start need an approved template:
    set WHATSAPP_TEMPLATE to its name; its body gets {{1}} = first name, {{2}} = match line, {{3}} = link. */
@@ -844,6 +858,7 @@ function normMatch(b, prev) {
     ...(prev.notified ? { notified: prev.notified } : {}),
     ...(prev.eventId === ev.id ? { ...(prev.no ? { no: prev.no } : {}), ...(prev.plannedNo ? { plannedNo: prev.plannedNo } : {}), ...(prev.startSeq ? { startSeq: prev.startSeq } : {}) } : {}),
     ...(prev.paper ? { paper: prev.paper } : {}),
+    ...(prev.cancelled ? { cancelled: prev.cancelled } : {}),
   };
 }
 
@@ -1097,6 +1112,7 @@ function writeGames(match, b, who, tag) {
 /* ---------------------------------------------------- panic controls */
 const panic = () => (db.tournament.panic = db.tournament.panic || { freezeScoring: false, lockedEvents: [], hideScoreboard: false });
 function assertOpen(match) {
+  if (match && match.cancelled) throw new HttpError(409, 'This match is cancelled. Restore it first to record scores.');
   const T = match && tour((find('events', match.eventId) || {}).tid);
   if (T && T.status === 'closed') throw new HttpError(423, T.name + ' is closed – scores can no longer change.');
   const pc = panic();
@@ -1883,7 +1899,7 @@ async function route(req, res, url) {
     if (Engine.derive(match, ev).status !== 'scheduled') throw new HttpError(409, 'This match has already started or finished.');
     const b = await readJson(req, 6000);
     const given = String(b.base || '').replace(/\/+$/, ''), base = db.registration.publicUrl || (/^https?:\/\/[\w.-]+(:\d+)?$/.test(given) ? given : 'https://' + String(req.headers.host || 'localhost').replace(/[^\w.:-]/g, ''));
-    const out = notifyPlan(match, ev, base, b.message);
+    const out = notifyPlan(match, ev, base, b.message, b.refMessage);
     if (b.send) {
       if (!WA.on) throw new HttpError(400, 'Automatic WhatsApp sending is not set up on this server – use the WhatsApp buttons.');
       for (const r of out.recipients) {
@@ -2083,6 +2099,7 @@ async function route(req, res, url) {
       if (b.enforceReferee != null) t.enforceReferee = !!b.enforceReferee;
       if (b.refSignupOpen != null) t.refSignupOpen = !!b.refSignupOpen;
       if (b.seasonName != null && str(b.seasonName, 80).trim()) t.seasonName = str(b.seasonName, 80).trim();
+      if (b.rankPtsSport && typeof b.rankPtsSport === 'object') { t.rankPtsSport = t.rankPtsSport || {}; Object.keys(Engine.RANK_SPORT).forEach((sp) => { const x = b.rankPtsSport[sp]; if (x && typeof x === 'object') t.rankPtsSport[sp] = Object.fromEntries(['win', 'draw', 'loss'].map((k) => [k, Math.max(0, Math.min(100, Math.round(num(x[k], Engine.RANK_SPORT[sp][k]))))])); }); }
       if (b.rankPts && typeof b.rankPts === 'object') { t.rankPts = {}; Object.keys(Engine.RANK_POINTS).forEach((k) => { t.rankPts[k] = Math.max(0, Math.min(100, Math.round(num(b.rankPts[k], Engine.RANK_POINTS[k])))); }); }
       if (b.tz != null) { try { new Intl.DateTimeFormat('en-GB', { timeZone: String(b.tz) }); t.tz = String(b.tz); } catch (e) { throw new HttpError(400, 'Unknown time zone (use a name like Asia/Kolkata)'); } }
       if (b.sponsorSeconds != null) t.sponsorSeconds = Math.max(3, Math.min(60, Math.round(num(b.sponsorSeconds, 8))));
@@ -2098,7 +2115,7 @@ async function route(req, res, url) {
       Object.keys(db.sessions).forEach((t) => { const x = db.sessions[t]; if (x.role === 'admin' && (x.adminId || me().id) === me().id && t !== user.token) delete db.sessions[t]; });
       audit(user.name, 'pin changed'); save(); return json(res, 200, { ok: true });
     }
-    if (p === '/api/admin/admins' && m === 'GET') return json(res, 200, db.admins.map((a) => ({ id: a.id, name: a.name, sports: a.sports || [], limited: !!a.limited, games: db.events.filter((e) => (e.organizerIds || []).includes(a.id)).map((e) => e.name), me: a.id === me().id })));
+    if (p === '/api/admin/admins' && m === 'GET') return json(res, 200, db.admins.map((a) => ({ id: a.id, name: a.name, phone: orgPhone(a), sports: a.sports || [], limited: !!a.limited, games: db.events.filter((e) => (e.organizerIds || []).includes(a.id)).map((e) => e.name), me: a.id === me().id })));
     if (p === '/api/admin/admins' && m === 'POST') {
       const b = await readJson(req, 2000); const name = str(b.name, 40);
       if (!name) throw new HttpError(400, 'Enter a name for the new admin');
@@ -2112,6 +2129,7 @@ async function route(req, res, url) {
       if (m === 'PUT') {
         const b = await readJson(req, 2000); let pin = null;
         if (b.name) a.name = str(b.name, 40);
+        if (b.phone != null) a.phone = str(b.phone, 30);
         if (Array.isArray(b.sports)) { a.sports = normSports(b.sports); Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].adminId === a.id) db.sessions[t].sports = a.sports; }); }
         if (b.resetPin) { do { pin = pinN(8); } while (db.admins.some((x) => checkPin(pin, x.pinHash))); a.pinHash = hashPin(pin); Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].adminId === a.id && t !== user.token) delete db.sessions[t]; }); }
         audit(user.name, b.resetPin ? 'reset admin PIN' : 'renamed admin', a.name); save();
@@ -2779,8 +2797,22 @@ async function route(req, res, url) {
       (match.rubbers || []).forEach((r) => { r.log = []; r.cids = []; r.result = null; r.walkover = null; r.outcome = ''; });
       audit(user.name, 'reset scores', '', match.id); save(); broadcast(); return json(res, 200, { ok: true });
     }
+    /* Cancel a match (it stays visible, greyed, and counts for nothing) – or restore it. */
+    if ((mm = p.match(/^\/api\/admin\/matches\/([\w-]+)\/(cancel|uncancel)$/)) && m === 'POST') {
+      const match = find('matches', mm[1]); if (!match) throw new HttpError(404, 'Match not found');
+      const ev = find('events', match.eventId), T = ev && tour(ev.tid);
+      if (T && T.status === 'closed') throw new HttpError(409, T.name + ' is closed.');
+      if (mm[2] === 'cancel') {
+        if (Engine.derive(match, ev).status === 'completed') throw new HttpError(409, 'This match is already completed. Reset its scores first if it should not count.');
+        const b = await readJson(req, 2000);
+        match.cancelled = { at: Date.now(), by: user.name, reason: str(b.reason, 120) };
+        audit(user.name, 'cancelled match', match.cancelled.reason, match.id);
+      } else { delete match.cancelled; audit(user.name, 'restored match', '', match.id); }
+      save(); broadcast(); return json(res, 200, { ok: true });
+    }
     if ((mm = p.match(/^\/api\/admin\/matches\/([\w-]+)\/scores$/)) && m === 'POST') {
       const match = find('matches', mm[1]); if (!match) throw new HttpError(404, 'Match not found');
+      if (match.cancelled) throw new HttpError(409, 'This match is cancelled. Restore it first to record scores.');
       const b = await readJson(req);
       const games = writeGames(match, b, user.name, 'admin-edit');
       delete match.paper;

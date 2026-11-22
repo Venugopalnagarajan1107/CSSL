@@ -55,7 +55,7 @@ let me = store.get('me', { role: null });
 let pending = store.get('pending', []);
 let offline = false;
 const Views = {};
-let ui = { pick: null, pickP: null, tid: store.get('tid', ''), sport: store.get('sport', ''), eventTab: {}, matchFilter: { event: '', status: '' }, adminTab: 'setup', certJob: null, section: store.get('section', 'adults'), matchView: 'list', playerSection: '', tvIdx: 0, rubber: {} };
+let ui = { dash: {}, pick: null, pickP: null, tid: store.get('tid', ''), sport: store.get('sport', ''), eventTab: {}, matchFilter: { event: '', status: '' }, adminTab: 'setup', certJob: null, section: store.get('section', 'adults'), matchView: 'list', playerSection: '', tvIdx: 0, rubber: {} };
 
 /* ------------------------------------------------------------------- api */
 async function api(method, url, body, raw) {
@@ -252,7 +252,7 @@ const field = (label, input, hint) => h('label', { class: 'field' }, h('span', {
 const OUT = { walkover: ' (walkover)', retired: ' (retired)', dq: ' (disqualified)', suspended: ' (suspension)' };
 const BUB = { green: '#16a34a', yellow: '#eab308', red: '#dc2626' };
 const bubble = (pid) => { const p = byId('players', pid), c = p && p.card; return h('span', { class: 'bubble', title: c ? (c.bubble === 'red' ? 'Suspended: ' + c.left + ' game(s) left' : c.bubble === 'yellow' ? 'Warning on record' : 'Clean record') : '', style: 'background:' + (BUB[(c || {}).bubble] || BUB.green) }); };
-const chip = (status) => h('span', { class: 'chip ' + status }, { live: '● LIVE', completed: 'Full time', scheduled: 'Upcoming' }[status]);
+const chip = (status) => h('span', { class: 'chip ' + status }, { live: '● LIVE', completed: 'Full time', scheduled: 'Upcoming', cancelled: '✕ Cancelled' }[status]);
 
 /* 🔔 Notify – WhatsApp the players of a match that is still to be played (organizers and referees). */
 const canNotify = (ev) => !!ev && isStaff() && (!!me.refId || canManage(ev) || isFriendlyEv(ev));
@@ -263,6 +263,15 @@ function notifyBtn(m, ev, d, cls) {
     onclick: (e) => { e.preventDefault(); e.stopPropagation(); notifyModal(m); } }, h('span', { 'aria-hidden': 'true' }, n ? '🔔✓' : '🔔'), ' Notify');
 }
 /* "Delete this match?" plus what happens to the numbers after it. */
+/* Cancel a match that will not be played (it stays, greyed, and counts for nothing) – or restore it. */
+function cancelBtn(m, d) {
+  const ev = evOf(m); if (!canManage(ev)) return null;
+  if (m.cancelled) return h('button', { class: 'btn ghost', onclick: guard(async () => { await api('POST', '/api/admin/matches/' + m.id + '/uncancel'); toast('Match restored'); await refresh(); }) }, '↺ Restore match');
+  if (d.status === 'completed') return null;
+  return h('button', { class: 'btn ghost danger-t', onclick: () => { const why = h('input', { placeholder: 'Reason (optional), e.g. player unavailable', maxlength: 120 });
+    modal('Cancel this match?', h('div', {}, h('p', { class: 'small' }, 'It stays in the list as “Cancelled”, does not count in standings or progress, and can be restored later.'), field('Reason', why)),
+      [{ label: 'Keep it', cls: 'ghost', fn: () => {} }, { label: 'Cancel match', cls: 'danger', fn: async () => { await api('POST', '/api/admin/matches/' + m.id + '/cancel', { reason: why.value }); toast('Match cancelled'); await refresh(); } }]); } }, '✕ Cancel match');
+}
 function delMsg(m, what) {
   const later = SA.matches.filter((x) => x.eventId === m.eventId && x.no > (m.no || 0)).map((x) => x.no), top = later.length ? Math.max(...later) : 0;
   return 'Delete ' + what + (m.no ? ' #' + m.no : '') + '?' + (m.no && top ? ' Match' + (top > m.no + 1 ? 'es #' + (m.no + 1) + '–#' + top + ' will become #' + m.no + '–#' + (top - 1) : ' #' + top + ' will become #' + m.no) + '.' : '');
@@ -275,30 +284,35 @@ async function notifyModal(m) {
   const plan = await api('POST', '/api/staff/matches/' + m.id + '/notify', { base: BASE() }).catch((e) => { toast(e.message, true); return null; });
   if (!plan) return;
   const sent = new Set();
-  const msg = h('textarea', { rows: 8, 'aria-label': 'Message', oninput: () => draw() }, plan.message);
-  const textFor = (r) => msg.value.replace(/\{name\}/g, r.first).replace(/\{link\}/g, plan.link);
-  const list = h('div', { class: 'list' });
+  const msg = h('textarea', { rows: 8, 'aria-label': 'Message to players', oninput: () => draw() }, plan.message);
+  const refMsg = h('textarea', { rows: 6, 'aria-label': 'Message to referees', oninput: () => draw() }, plan.refTemplate || '');
+  const textFor = (r) => (r.role === 'referee' ? refMsg : msg).value.replace(/\{name\}/g, r.first).replace(/\{link\}/g, plan.link);
+  const list = h('div', { class: 'list' }), refList = h('div', { class: 'list' });
+  const players = plan.recipients.filter((r) => r.role !== 'referee'), refs = plan.recipients.filter((r) => r.role === 'referee');
   const draw = () => {
-    list.replaceChildren(...plan.recipients.map((r) => h('div', { class: 'row' },
-      h('div', { class: 'grow' }, h('b', {}, r.name), h('div', { class: 'muted small' }, maskPhone(r.phone) + (r.error ? ' • ⚠ ' + r.error : ''))),
+    const row = (r) => h('div', { class: 'row' },
+      h('div', { class: 'grow' }, h('b', {}, r.name, r.role === 'referee' ? h('span', { class: 'muted small' }, ' 🧑‍⚖️ referee') : null), h('div', { class: 'muted small' }, maskPhone(r.phone) + (r.error ? ' • ⚠ ' + r.error : ''))),
       r.sent ? h('span', { class: 'chip completed' }, '✓ Sent') :
         h('a', { class: 'btn sm ' + (sent.has(r.id) ? 'ghost' : 'wa'), href: 'https://wa.me/' + r.phone + '?text=' + encodeURIComponent(textFor(r)), target: '_blank', rel: 'noopener',
-          onclick: () => { sent.add(r.id); setTimeout(draw, 50); } }, sent.has(r.id) ? '✓ Opened' : 'WhatsApp'))));
+          onclick: () => { sent.add(r.id); setTimeout(draw, 50); } }, sent.has(r.id) ? '✓ Opened' : 'WhatsApp'));
+    plan.recipients = players.concat(refs);
+    list.replaceChildren(...players.map(row)); refList.replaceChildren(...refs.map(row));
   };
   draw();
   const n = plan.recipients.length, last = m.notified;
-  const box = modal('🔔 Notify players', h('div', {},
+  const box = modal('🔔 Notify players & referees', h('div', {},
     h('p', { class: 'small' }, h('b', {}, plan.title), h('br'), plan.line.split(' • ').slice(1).join(' • ')),
     last ? h('div', { class: (renumbered(m) ? 'warnbox' : 'tip card') + ' small' }, 'Already notified ' + ago(last.at) + ' by ' + last.by + ' (' + last.n + ' player' + (last.n === 1 ? '' : 's') + ').' + (renumbered(m) ? ' The match number has changed since then (was #' + last.no + ', now #' + m.no + ') – send again so players have the new number.' : '')) : null,
-    field('Message', msg, '{name} becomes each player’s first name, {link} the live-score link.'),
-    n ? h('div', {}, h('b', {}, n + ' player' + (n === 1 ? '' : 's') + ' with a phone number'),
-      h('p', { class: 'muted small' }, plan.auto ? 'Send them all at once, or one by one.' : 'Tap each WhatsApp button – WhatsApp opens with the message ready; press send there, then come back for the next player.'), list)
-      : h('div', { class: 'warnbox small' }, 'None of the players in this match has a phone number saved.'),
+    field('Message to players', msg, '{name} becomes each person’s first name, {link} the live-score link.'),
+    h('p', { class: 'muted small' }, plan.auto ? 'Send them all at once, or one by one.' : 'Tap each WhatsApp button – WhatsApp opens with the message ready; press send there, then come back for the next one.'),
+    players.length ? h('div', {}, h('b', {}, '🏓 Players (' + players.length + ')'), list) : h('div', { class: 'warnbox small' }, 'None of the players in this match has a phone number saved.'),
+    refs.length ? h('div', {}, h('b', {}, '🧑‍⚖️ Referees (' + refs.length + ')'), field('Message to referees', refMsg), refList)
+      : h('p', { class: 'muted small' }, (m.refereeIds || []).length ? '' : 'No referee is assigned to this match yet – assign one in Edit fixture to notify them too.'),
     plan.missing.length ? h('div', { class: 'warnbox small' }, 'No phone number: ' + plan.missing.join(', ') + '. Add it in their profile, or tell them in person.') : null,
     h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: guard(async () => { await navigator.clipboard.writeText(msg.value.replace(/\{link\}/g, plan.link)); toast('Copied'); }) }, 'Copy message'),
       h('a', { class: 'btn ghost', href: '#', onclick: (e) => { e.preventDefault(); window.open('https://wa.me/?text=' + encodeURIComponent(msg.value.replace(/\{name\}/g, 'everyone').replace(/\{link\}/g, plan.link)), '_blank', 'noopener'); } }, 'Send to a WhatsApp group'))),
     plan.auto && n ? [{ label: 'Close', cls: 'ghost', fn: () => {} }, { label: 'Send to all ' + n, fn: async () => {
-      const r = await api('POST', '/api/staff/matches/' + m.id + '/notify', { send: true, message: msg.value, base: BASE() });
+      const r = await api('POST', '/api/staff/matches/' + m.id + '/notify', { send: true, message: msg.value, refMessage: refMsg.value, base: BASE() });
       const ok = r.recipients.filter((x) => x.sent).length;
       plan.recipients = r.recipients; draw(); toast(ok + ' of ' + n + ' sent on WhatsApp', ok < n); await refresh();
       return ok < n ? false : undefined;
@@ -447,15 +461,23 @@ Views.home = () => {
 
 const sponsorStep = () => Math.max(3, Number((S && S.tournament.sponsorSeconds) || 8));
 const sponsorPage = (pages) => Math.floor(Date.now() / (sponsorStep() * 1000)) % Math.max(1, pages);
+/* Sponsors roll past continuously (any number of them). Organizers add one with the + tile. */
 function sponsorStrip() {
-  if (!S.sponsors.length && !isAdmin()) return null;
-  const all = S.sponsors.length ? S.sponsors : [{ name: 'Your sponsor here' }, { name: 'Your sponsor here' }, { name: 'Your sponsor here' }];
-  const pages = Math.ceil(all.length / 3), pg = sponsorPage(pages);
-  const tiles = all.slice(pg * 3, pg * 3 + 3);
-  return h('div', { class: 'sponsors', 'data-pages': pages, 'data-page': pg }, tiles.map((sp) => {
-    const inner = sp.image ? h('img', { src: sp.image, alt: sp.name, loading: 'lazy' }) : h('span', {}, sp.name);
-    return sp.url ? h('a', { href: sp.url, target: '_blank', rel: 'noopener', class: 'sp' }, inner) : h('div', { class: 'sp' + (sp.image ? '' : ' ph') }, inner);
-  }));
+  const can = isOrganizer(), list = S.sponsors || [];
+  if (!list.length && !can) return null;
+  const tile = (sp, dup) => {
+    const inner = sp.image ? h('img', { src: sp.image, alt: dup ? '' : sp.name, loading: 'lazy' }) : h('span', {}, sp.name || 'Sponsor');
+    const a = { class: 'spn' + (sp.image ? '' : ' txt'), ...(dup ? { 'aria-hidden': 'true', tabindex: '-1' } : {}) };
+    return sp.url ? h('a', { href: sp.url, target: '_blank', rel: 'noopener', ...a }, inner) : h('div', a, inner);
+  };
+  const add = can ? h('button', { type: 'button', class: 'spn add', 'aria-label': 'Add a sponsor', onclick: () => sponsorModal(null) }, h('span', { class: 'plus' }, '+'), h('small', {}, list.length ? 'Add' : 'Add your first sponsor')) : null;
+  if (!list.length) return h('div', { class: 'spbox' }, h('div', { class: 'sptrack still' }, add));
+  /* the track holds the logos twice so the loop is seamless; the speed follows "seconds per sponsor" */
+  const rep = Math.max(1, Math.ceil(6 / list.length)), half = Array(rep).fill(list).flat();   /* enough logos to fill a wide screen */
+  const secs = Math.max(6, half.length * sponsorStep());
+  return h('div', { class: 'spbox' },
+    h('div', { class: 'spview', 'aria-label': 'Our sponsors' }, h('div', { class: 'sptrack', style: '--spd:' + secs + 's;animation-delay:-' + ((Date.now() / 1000) % secs).toFixed(2) + 's' }, half.map((x, i) => tile(x, i >= list.length)), half.map((x) => tile(x, true)))),
+    add);
 }
 /* rotate sponsors (home strip and big-screen footer) every "sponsorSeconds" */
 setInterval(() => {
@@ -466,12 +488,84 @@ setInterval(() => {
   if (foot && Number(foot.dataset.n) > 1 && Number(foot.dataset.i) !== sponsorPage(Number(foot.dataset.n))) render();
 }, 1000);
 
+/* ---- Round-robin dashboard: progress, standings, head-to-head grid, who still has to play whom, and a filtered match log ---- */
+/* completed / live / scheduled (date or time set) / pending (no time yet) / cancelled */
+function mStatus(m, d) { return d.status === 'cancelled' ? 'cancelled' : d.status === 'completed' ? 'completed' : d.status === 'live' ? 'live' : (m.startsAt || m.time) ? 'scheduled' : 'pending'; }
+const ST_LABEL = { completed: '✅ Completed', live: '● Live', scheduled: '🗓 Scheduled', pending: '⏳ Pending', cancelled: '✕ Cancelled' };
+function gameDashboard(ev, ms) {
+  const f = (ui.dash[ev.id] = ui.dash[ev.id] || { player: '', status: '', sort: 'status' });
+  const rows = ms.map((x) => ({ ...x, st: mStatus(x.m, x.d) }));
+  const count = (k) => rows.filter((x) => x.st === k).length, live = rows.filter((x) => x.st !== 'cancelled').length, done = count('completed');
+  const set = (k, v) => { f[k] = v; render(); };
+  const ids = ev.participantIds || [], single = ev.sideType === 'team' || ev.sideSize === 1;
+  const nm = (id) => nameOf(ev, id), short = (id) => { const n = nm(id); return ev.sideType === 'team' ? n : n.split(' ')[0]; };
+  const sideOf = (m, id) => (m.sideA.includes(id) ? 'A' : m.sideB.includes(id) ? 'B' : '');
+  const setsText = (d, persp) => d.games.map((g) => (persp === 'B' ? g.b + '-' + g.a : g.a + '-' + g.b)).join(', ');
+  /* 1. summary */
+  const pct = live ? Math.round((done / live) * 100) : 0;
+  const summary = h('div', { class: 'card dash-sum' },
+    h('div', { class: 'dash-prog' }, h('b', {}, done + ' / ' + live + ' matches played (' + pct + '%)'), h('div', { class: 'track' }, h('div', { class: 'fill', style: 'width:' + pct + '%' }))),
+    h('div', { class: 'chips' }, ['completed', 'live', 'scheduled', 'pending', 'cancelled'].filter((k) => k !== 'live' || count('live')).map((k) =>
+      h('button', { type: 'button', class: 'chip st-' + k + (f.status === k ? ' on' : ''), onclick: () => set('status', f.status === k ? '' : k), 'aria-pressed': String(f.status === k) }, ST_LABEL[k] + ' ' + count(k)))));
+  /* 2. standings */
+  const st = E.standings(ev, ms.map((x) => x.m));
+  const pts = ev.scoring === 'points';
+  const table = h('div', { class: 'card' }, h('div', { class: 'card-h' }, h('b', {}, '🏆 Standings'), h('span', { class: 'muted small' }, (ev.config.pointsWin || 2) + ' pts per win • ties: ' + (ev.sport === 'tt' || ev.config.tiebreak === 'sets' ? 'points → set difference → sets won' : 'points → point difference'))),
+    h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl' }, h('thead', {}, h('tr', {}, ['#', ev.sideType === 'team' ? 'Team' : 'Player', 'P', 'W', 'L'].concat(pts ? ['Sets', 'Diff'] : ['D'], ['Pts']).map((x, i) => h('th', { class: i === 1 ? 'l' : '' }, x)))),
+      h('tbody', {}, st.map((r) => h('tr', {}, [r.rank, ev.sideType === 'player' ? h('a', { href: '#/player/' + r.id }, nm(r.id)) : nm(r.id), r.played, r.won, r.lost].concat(pts ? [r.gw + '–' + r.gl, (r.gw - r.gl > 0 ? '+' : '') + (r.gw - r.gl)] : [r.drawn], [h('b', {}, r.mp)]).map((c, i) => h('td', { class: i === 1 ? 'l' : '' }, c))))))));
+  /* 3. head-to-head grid (updates live as results come in) */
+  const order = st.map((r) => r.id).filter((id) => ids.includes(id)).concat(ids.filter((id) => !st.some((r) => r.id === id)));
+  const cell = (a, b) => {
+    if (a === b) return h('td', { class: 'mx-self' }, '—');
+    const hits = rows.filter((x) => (x.m.sideA.includes(a) && x.m.sideB.includes(b)) || (x.m.sideA.includes(b) && x.m.sideB.includes(a)));
+    const x = hits.find((y) => y.st === 'completed') || hits.find((y) => y.st === 'live') || hits.find((y) => y.st === 'scheduled' || y.st === 'pending') || hits[0];
+    if (!x) return h('td', { class: 'mx-none', title: 'No fixture' }, '');
+    const s = sideOf(x.m, a), go = () => { location.hash = '#/match/' + x.m.id; };
+    if (x.st === 'completed') { const my = s === 'A' ? x.d.gamesA : x.d.gamesB, op = s === 'A' ? x.d.gamesB : x.d.gamesA, win = x.d.winner === s;
+      return h('td', { class: x.d.draw ? 'mx-draw' : win ? 'mx-win' : 'mx-loss', title: nm(a) + ' v ' + nm(b) + ': ' + (pts ? setsText(x.d, s) : win ? 'won' : 'lost'), onclick: go }, pts ? my + '-' + op : x.d.draw ? '½' : win ? 'W' : 'L'); }
+    return h('td', { class: 'mx-' + x.st, title: nm(a) + ' v ' + nm(b) + ': ' + ST_LABEL[x.st].replace(/^\S+ /, ''), onclick: go }, { live: '●', scheduled: '🗓', pending: '·', cancelled: '✕' }[x.st]);
+  };
+  const matrix = single && order.length > 1 ? h('div', { class: 'card' }, h('div', { class: 'card-h' }, h('b', {}, '📊 Head-to-head'), h('span', { class: 'muted small' }, 'Row player against column player • tap a box to open the match')),
+    h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl mx' }, h('thead', {}, h('tr', {}, h('th', { class: 'l' }, ''), order.map((id) => h('th', { title: nm(id) }, short(id))))),
+      h('tbody', {}, order.map((a) => h('tr', {}, h('th', { class: 'l' }, nm(a)), order.map((b) => cell(a, b))))))),
+    h('div', { class: 'muted small mx-key' }, h('span', { class: 'mx-win' }, '2-1'), ' won  ', h('span', { class: 'mx-loss' }, '1-2'), ' lost  ● live  🗓 scheduled  · pending  ✕ cancelled')) : null;
+  /* 4. who still has to play */
+  const left = order.map((id) => ({ id, ms: rows.filter((x) => ['live', 'scheduled', 'pending'].includes(x.st) && sideOf(x.m, id)) })).filter((x) => x.ms.length).sort((a, b) => b.ms.length - a.ms.length || nm(a.id).localeCompare(nm(b.id)));
+  const remaining = single && left.length ? h('div', { class: 'card' }, h('div', { class: 'card-h' }, h('b', {}, '⏳ Still to play, by player'), h('span', { class: 'muted small' }, 'Tap a name to see only their matches')),
+    h('div', { class: 'list' }, left.map((x) => h('div', { class: 'row', onclick: () => { f.player = x.id; f.status = 'open'; render(); setTimeout(() => { const el = document.getElementById('dash-log'); if (el) el.scrollIntoView({ behavior: 'smooth' }); }, 50); } },
+      h('div', { class: 'grow' }, h('b', {}, nm(x.id) + ' – ' + x.ms.length + ' left'), h('div', { class: 'muted small' }, x.ms.map((y) => { const o = sideOf(y.m, x.id) === 'A' ? y.m.sideB : y.m.sideA; return sideLabel(ev, o) + (y.st === 'scheduled' ? ' (' + fmtSlot(y.m) + ')' : y.st === 'live' ? ' (live)' : ''); }).join(', ')))))) ) : null;
+  /* 5. match log with filters */
+  const pass = (x) => (!f.player || sideOf(x.m, f.player)) && (!f.status || (f.status === 'open' ? ['live', 'scheduled', 'pending'].includes(x.st) : x.st === f.status));
+  const SORD = { live: 0, completed: 1, scheduled: 2, pending: 3, cancelled: 4 };
+  const pn = (x) => (f.player ? sideLabel(ev, sideOf(x.m, f.player) === 'A' ? x.m.sideB : x.m.sideA) : sideLabel(ev, x.m.sideA));
+  const log = rows.filter(pass).sort((a, b) => f.sort === 'player' ? pn(a).localeCompare(pn(b)) || a.m.no - b.m.no : f.sort === 'no' ? (a.m.no || 0) - (b.m.no || 0) : SORD[a.st] - SORD[b.st] || (a.m.no || 0) - (b.m.no || 0));
+  const selx = (label, val, opts, k) => h('select', { 'aria-label': label, onchange: (e) => set(k, e.target.value) }, opts.map(([v, l]) => h('option', { value: v, selected: val === v }, l)));
+  const logCard = h('div', { class: 'card', id: 'dash-log' }, h('div', { class: 'card-h' }, h('b', {}, '📋 Matches'), h('span', { class: 'muted small' }, log.length + ' shown')),
+    h('div', { class: 'filters' },
+      selx('Player', f.player, [['', 'All players']].concat(order.map((id) => [id, nm(id)])), 'player'),
+      selx('Status', f.status, [['', 'All matches'], ['completed', 'Completed'], ['open', 'Not played yet (all)'], ['pending', 'Pending (no time yet)'], ['scheduled', 'Scheduled'], ['live', 'Live'], ['cancelled', 'Cancelled']], 'status'),
+      selx('Sort', f.sort, [['status', 'Sort: completed first'], ['no', 'Sort: match #'], ['player', 'Sort: player']], 'sort')),
+    log.length ? h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl log' }, h('thead', {}, h('tr', {}, ['#', 'Player A', 'Player B', pts ? 'Score' : 'Result', 'Winner', 'Status'].map((x, i) => h('th', { class: i === 1 || i === 2 ? 'l' : '' }, x)))),
+      h('tbody', {}, log.map((x) => h('tr', { class: 'st-row-' + x.st, onclick: () => { location.hash = '#/match/' + x.m.id; } },
+        h('td', {}, x.m.no ? '#' + x.m.no : ''), h('td', { class: 'l' + (x.d.winner === 'A' ? ' w' : '') }, sideLabel(ev, x.m.sideA)), h('td', { class: 'l' + (x.d.winner === 'B' ? ' w' : '') }, sideLabel(ev, x.m.sideB)),
+        h('td', {}, x.st === 'completed' ? (pts && x.d.games.length ? setsText(x.d, 'A') : x.d.draw ? '½–½' : x.d.winner === 'A' ? '1–0' : '0–1') + (x.d.outcome ? ' (' + x.d.outcome + ')' : '') : x.st === 'live' && x.d.current ? x.d.current.a + '–' + x.d.current.b : x.st === 'scheduled' ? [fmtSlot(x.m), x.m.court].filter(Boolean).join(' • ') : x.m.court || ''),
+        h('td', { class: 'l' }, x.st === 'completed' ? (x.d.draw ? 'Draw' : sideLabel(ev, x.d.winner === 'A' ? x.m.sideA : x.m.sideB)) : '—'),
+        h('td', {}, h('span', { class: 'chip st-' + x.st }, ST_LABEL[x.st]))))))) : h('p', { class: 'empty' }, 'No matches for this filter.'),
+    h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: () => shareText(dashText(ev, st, left, done, live)) }, '📲 Share on WhatsApp')));
+  return h('div', { class: 'dash' }, summary, table, matrix, remaining, logCard);
+}
+function dashText(ev, st, left, done, live) {
+  const nm = (id) => nameOf(ev, id);
+  return '🏆 ' + ev.name + ' – ' + done + '/' + live + ' matches played\n\n' + st.map((r, i) => (i + 1) + '. *' + nm(r.id) + '* – ' + r.mp + ' pts (' + r.won + 'W-' + r.lost + 'L' + (ev.scoring === 'points' ? ', sets ' + r.gw + '-' + r.gl : '') + ')').join('\n') +
+    (left.length ? '\n\n⏳ Still to play: ' + left.map((x) => nm(x.id) + ' ' + x.ms.length).join(', ') : '') + '\n\nLive: ' + BASE() + '/#/event/' + ev.id;
+}
 Views.event = (id) => {
   const ev = byId('events', id); if (!ev) return notFound();
-  const tab = ui.eventTab[id] || ((ev.format || {}).type === 'knockout' ? 'bracket' : 'standings');
+  const ft = (ev.format || {}).type, rr = !ft || ft === 'roundrobin';   /* round robin: the dashboard opens first */
+  const tab = ui.eventTab[id] || ((ev.format || {}).type === 'knockout' ? 'bracket' : rr ? 'dashboard' : 'standings');
   const setTab = (t) => { ui.eventTab[id] = t; render(); };
   const ms = S.matches.filter((m) => m.eventId === id).map((m) => ({ m, d: E.derive(liveMatch(m), ev) }));
-  const order = { live: 0, scheduled: 1, completed: 2 };
+  const order = { live: 0, scheduled: 1, completed: 2, cancelled: 3 };
   ms.sort((a, b) => order[a.d.status] - order[b.d.status] || (a.d.status === 'completed' ? b.m.createdAt - a.m.createdAt : a.m.createdAt - b.m.createdAt));
   const fmt = ev.format || {}, hasKO = !!ev.bracket;
   const nextLabel = hasKO ? '🏁 Next round' : fmt.type === 'groups' ? '🏁 Create knockout' : '🏁 Create finals';
@@ -479,6 +573,7 @@ Views.event = (id) => {
   const hasDraw = hasKO || (ev.groups && Object.keys(ev.groups).length) || ms.length;
   const body = tab === 'bracket' ? h('div', {}, championBanner(ev), bracketView(ev))
     : tab === 'standings' ? h('div', {}, championBanner(ev), standingsTable(ev), hasKO && fmt.type !== 'knockout' ? h('div', {}, h('h3', {}, 'Knockout'), bracketView(ev)) : null)
+    : tab === 'dashboard' ? gameDashboard(ev, ms)
     : tab === 'fixtures' ? h('div', {}, selectBar(ms.map((x) => x.m)), ms.length ? ms.map((x) => matchCard(x.m)) : h('p', { class: 'empty' }, 'No fixtures yet.'))
       : ev.sideType === 'team' && canManage(ev) ? teamBuilder(ev)
       : h('div', { class: 'list' }, (ev.participantIds || []).map((pid) => {
@@ -490,7 +585,7 @@ Views.event = (id) => {
     ev.note ? h('p', { class: 'muted small' }, ev.note) : null,
     h('p', { class: 'muted small' }, formatSummary(ev)),
     staffLine(ev),
-    h('div', { class: 'seg' }, [(fmt.type === 'knockout' ? ['bracket', 'Bracket'] : null), ['standings', fmt.type === 'knockout' ? 'Table' : 'Standings'], ['fixtures', 'Fixtures (' + ms.length + ')'], ['people', ev.sideType === 'team' ? 'Teams' : 'Players']].filter(Boolean).map(([k, l]) => h('button', { class: tab === k || (!ui.eventTab[id] && k === 'bracket') ? 'on' : '', onclick: () => setTab(k) }, l))),
+    h('div', { class: 'seg' }, [(fmt.type === 'knockout' ? ['bracket', 'Bracket'] : null), (rr ? ['dashboard', 'Dashboard'] : null), ['standings', fmt.type === 'knockout' ? 'Table' : 'Standings'], ['fixtures', 'Fixtures (' + ms.length + ')'], ['people', ev.sideType === 'team' ? 'Teams' : 'Players']].filter(Boolean).map(([k, l]) => h('button', { class: tab === k || (!ui.eventTab[id] && k === 'bracket') ? 'on' : '', onclick: () => setTab(k) }, l))),
     h('div', { class: 'actions noprint' },
       isStaff() ? h('button', { class: 'btn ghost', onclick: () => window.print() }, '🖨 Print / PDF') : null,
       h('button', { class: 'btn ghost', onclick: () => shareText(standingsText(ev)) }, '↗ Share'),
@@ -534,7 +629,7 @@ function eventMatches() {
   const f = ui.matchFilter, evs = eventsOf(ui.section).filter(sportPass);
   if (f.event && !evs.some((e) => e.id === f.event)) f.event = '';
   const rows = S.matches.map((m) => ({ m, ev: evOf(m), d: E.derive(liveMatch(m), evOf(m)) })).filter((x) => x.ev && secOf(x.ev) === ui.section && sportPass(x.ev) && (!f.event || x.m.eventId === f.event) && (!f.status || x.d.status === f.status));
-  const order = { live: 0, scheduled: 1, completed: 2 };
+  const order = { live: 0, scheduled: 1, completed: 2, cancelled: 3 };
   rows.sort((a, b) => order[a.d.status] - order[b.d.status] || b.m.createdAt - a.m.createdAt);
   return h('div', {},
     sectionTabs(), sportChips(),
@@ -549,7 +644,7 @@ function eventMatches() {
 /* Top-level Matches: friendly ("raw") matches between any players, outside every event. */
 Views.matches = () => {
   const ms = SA.matches.filter((m) => isFriendlyEv(byId('events', m.eventId))).map((m) => ({ m, d: E.derive(liveMatch(m), byId('events', m.eventId)) }));
-  const order = { live: 0, scheduled: 1, completed: 2 }; ms.sort((a, b) => order[a.d.status] - order[b.d.status] || b.m.createdAt - a.m.createdAt);
+  const order = { live: 0, scheduled: 1, completed: 2, cancelled: 3 }; ms.sort((a, b) => order[a.d.status] - order[b.d.status] || b.m.createdAt - a.m.createdAt);
   return h('div', {}, h('h1', {}, 'Friendly matches'),
     h('p', { class: 'muted small' }, 'Quick matches between any players, outside the events. Results count in players’ profiles and all-time rankings. Event matches are under 🏆 Event → Matches.'),
     isStaff() ? h('button', { class: 'btn', onclick: () => friendlyModal() }, '+ New match') : h('p', { class: 'muted small' }, 'Organizers and referees can start a friendly match.'),
@@ -574,7 +669,7 @@ Views.match = (id) => {
   if (m.rubbers && m.rubbers.length && evOf(m) && evOf(m).sideType === 'team') return tieView(m);
   const ev = evOf(m), lm = liveMatch(m), d = E.derive(lm, ev);
   const staff = canScore(), A = sideLabel(ev, m.sideA), B = sideLabel(ev, m.sideB);
-  const can = staff && d.status !== 'completed';
+  const can = staff && d.status !== 'completed' && !m.cancelled;
   const ref = refsOf(m);
   const side = (s, name) => {
     const gw = s === 'A' ? d.gamesA : d.gamesB, cur = d.current ? (s === 'A' ? d.current.a : d.current.b) : null;
@@ -593,6 +688,7 @@ Views.match = (id) => {
     h('div', { class: 'page-h' }, h('a', { class: 'back', href: isFriendlyEv(ev) ? '#/matches' : '#/event/' + ev.id }, '‹'), h('h1', {}, ev.name + (m.no ? ' #' + m.no : ''))),
     h('div', { class: 'muted small center' }, [plannedTxt(m) ? 'Planned as #' + m.plannedNo : null, m.stage === 'League' && m.round ? 'Round ' + m.round + (m.totalRounds ? ' of ' + m.totalRounds : '') : m.stage, m.court, m.time, ref ? 'Referee: ' + ref.name : null].filter(Boolean).join(' • ')),
     h('div', { class: 'center' }, chip(d.status)),
+    m.cancelled ? h('div', { class: 'warnbox small center' }, '✕ Cancelled' + (m.cancelled.by ? ' by ' + m.cancelled.by : '') + (m.cancelled.reason ? ' – ' + m.cancelled.reason : '') + '. It does not count in standings.') : null,
     d.status === 'scheduled' && canNotify(ev) ? h('div', { class: 'actions center' }, notifyBtn(m, ev, d, 'ghost')) : null,
     h('div', { class: 'scoreboard' }, side('A', A), h('div', { class: 'sb-vs' }, 'VS'), side('B', B)),
     staff || isAdmin() ? playersChips(m, ev) : null,
@@ -611,6 +707,7 @@ Views.match = (id) => {
     me.kind === 'chief' && d.status !== 'scheduled' ? h('div', { class: 'actions' }, ev.scoring === 'points' ? h('button', { class: 'btn ghost', onclick: () => scoresModal(m, ev, d) }, '✏ Correct scores') : null, h('button', { class: 'btn ghost', onclick: () => confirmBox('Reset all scores for this match?', guard(async () => { await api('POST', '/api/admin/matches/' + m.id + '/reset'); await refresh(); }), 'Reset') }, 'Reset scores')) : null,
     isAdmin() ? h('div', { class: 'actions' },
       h('button', { class: 'btn ghost', onclick: () => fixtureModal(ev.id, m) }, 'Edit fixture'),
+      cancelBtn(m, d),
       h('button', { class: 'btn ghost', onclick: guard(async () => { await api('POST', '/api/admin/announce', { matchId: m.id }); toast('“Up next” notification sent'); }) }, '🔔 Call to court'),
       h('button', { class: 'btn danger', onclick: () => confirmBox(delMsg(m, 'match'), guard(async () => { await api('DELETE', '/api/admin/matches/' + m.id); location.hash = '#/event/' + ev.id; await refresh(); }), 'Delete') }, 'Delete')) : null,
     isAdmin() ? activityBox(m) : null);
@@ -662,7 +759,7 @@ function lineupModal(m, ev) {
 function tieView(m) {
   const ev = evOf(m), lm = liveMatch(m), d = E.derive(lm, ev);
   const staff = canScore(), A = sideLabel(ev, m.sideA), B = sideLabel(ev, m.sideB);
-  const can = staff && d.status !== 'completed';
+  const can = staff && d.status !== 'completed' && !m.cancelled;
   const ref = refsOf(m), np = pendingFor(m.id);
   const total = d.rubbers.length, needW = Math.floor(total / 2) + 1, clinch = (ev.rubberRules || {}).clinch !== false;
   const selId = ui.rubber[m.id], selR = lm.rubbers.find((r) => r.id === selId);
@@ -683,6 +780,7 @@ function tieView(m) {
     h('div', { class: 'page-h' }, h('a', { class: 'back', href: isFriendlyEv(ev) ? '#/matches' : '#/event/' + ev.id }, '‹'), h('h1', {}, ev.name + (m.no ? ' #' + m.no : ''))),
     h('div', { class: 'muted small center' }, [plannedTxt(m) ? 'Planned as #' + m.plannedNo : null, m.stage, m.court, fmtSlot(m), ref ? 'Referee: ' + ref.name : null].filter(Boolean).join(' • ')),
     h('div', { class: 'center' }, chip(d.status)),
+    m.cancelled ? h('div', { class: 'warnbox small center' }, '✕ Cancelled' + (m.cancelled.by ? ' by ' + m.cancelled.by : '') + (m.cancelled.reason ? ' – ' + m.cancelled.reason : '') + '. It does not count in standings.') : null,
     d.status === 'scheduled' && canNotify(ev) ? h('div', { class: 'actions center' }, notifyBtn(m, ev, d, 'ghost')) : null,
     h('div', { class: 'scoreboard' },
       h('div', { class: 'sb-side' + (d.winner === 'A' ? ' win' : '') }, h('div', { class: 'sb-name' }, A), h('div', { class: 'sb-pts' }, d.gamesA), h('div', { class: 'sb-games' }, 'rubbers won')),
@@ -701,6 +799,7 @@ function tieView(m) {
     me.kind === 'chief' && d.status !== 'scheduled' ? h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: () => confirmBox('Reset all scores for this tie?', guard(async () => { await api('POST', '/api/admin/matches/' + m.id + '/reset'); await refresh(); }), 'Reset') }, 'Reset scores')) : null,
     isAdmin() ? h('div', { class: 'actions' },
       h('button', { class: 'btn ghost', onclick: () => fixtureModal(ev.id, m) }, 'Edit fixture'),
+      cancelBtn(m, d),
       h('button', { class: 'btn ghost', onclick: guard(async () => { await api('POST', '/api/admin/announce', { matchId: m.id }); toast('“Up next” notification sent'); }) }, '🔔 Call to court'),
       h('button', { class: 'btn danger', onclick: () => confirmBox(delMsg(m, 'tie'), guard(async () => { await api('DELETE', '/api/admin/matches/' + m.id); location.hash = '#/event/' + ev.id; await refresh(); }), 'Delete') }, 'Delete')) : null,
     isAdmin() ? activityBox(m) : null);
@@ -831,7 +930,9 @@ Views.season = (sub) => {
       isOrganizer() ? h('details', {}, h('summary', {}, 'All referee accounts, PINs and referee sign-up'), Views.referees(true)) : null)
     : tab === 'organizers' ? h('div', {},
       h('div', { class: 'card' }, h('b', {}, '👔 Organizers of ' + T.name), h('p', { class: 'muted small' }, 'The person who created the event and anyone added here manage everything in it: games, teams, players, fixtures and referees.' + (T.createdBy ? ' Created by ' + T.createdBy + '.' : '')),
-        h('div', { class: 'chips' }, names(T.organizerIds, orgName).map((n) => h('span', { class: 'chip plain' }, n))),
+        h('div', { class: 'list' }, (T.organizerIds || []).map((id) => (SA.organizers || []).find((a) => a.id === id)).filter(Boolean).map((a) => h('div', { class: 'row' }, icon('players'),
+          h('div', { class: 'grow' }, h('b', {}, a.name), h('div', { class: 'muted small' }, a.phone ? '📞 ' + a.phone : 'No contact number yet')),
+          isOrganizer() ? h('button', { class: 'btn ghost sm', onclick: () => orgPhoneModal(a) }, '📞 Contact number') : null))),
         mine ? h('button', { class: 'btn ghost sm', onclick: () => tourStaffModal(T, 'organizers') }, '+ Add / change organizers') : null),
       isOrganizer() ? h('details', {}, h('summary', {}, 'All organizer accounts and PINs'), adminsCard()) : null)
     : h('div', {},
@@ -863,9 +964,10 @@ function seasonRec() {
 let allCache = {};
 function allRec() { if (allCache.S !== SA || allCache.p !== pending.length) allCache = { S: SA, p: pending.length, rec: E.seasonRecords(SA, SA.matches.map(liveMatch)) }; return allCache.rec; }
 const rankPts = () => ({ ...E.RANK_POINTS, ...(S.tournament.rankPts || {}) });
+const rankPtsSport = () => { const o = {}; Object.keys(E.RANK_SPORT).forEach((k) => { o[k] = { ...E.RANK_SPORT[k], ...((S.tournament.rankPtsSport || {})[k] || {}) }; }); return o; };
 function rankRows(section, sport, period) {
   const sets = period === 'all' ? [allRec()].concat((SA.seasons || []).map((x) => x.records)) : [seasonRec()];
-  return E.rankings(sets, { sport, players: S.players.filter((p) => (p.section || 'adults') === section), pts: rankPts() });
+  return E.rankings(sets, { sport, players: S.players.filter((p) => (p.section || 'adults') === section), pts: rankPts(), ptsBySport: rankPtsSport() });
 }
 const medalText = (x) => [x.gold ? '🥇' + (x.gold > 1 ? x.gold : '') : '', x.silver ? '🥈' + (x.silver > 1 ? x.silver : '') : '', x.bronze ? '🥉' + (x.bronze > 1 ? x.bronze : '') : ''].filter(Boolean).join(' ');
 Views.rankings = () => {
@@ -883,7 +985,7 @@ Views.rankings = () => {
       h('tbody', {}, rows.map((x) => h('tr', {}, h('td', {}, x.rank <= 3 ? ['🥇', '🥈', '🥉'][x.rank - 1] : String(x.rank)), h('td', { class: 'l' }, h('a', { href: '#/player/' + x.id }, (byId('players', x.id) || { name: '?' }).name)),
         h('td', {}, x.played), h('td', {}, x.won), h('td', {}, x.drawn), h('td', {}, x.lost), h('td', {}, x.winPct + '%'), h('td', {}, medalText(x) || '–'), h('td', {}, h('b', {}, x.points)))))))
       : h('p', { class: 'empty' }, 'No completed matches yet' + (r.sport ? ' in ' + SPORT_LABEL[r.sport] : '') + '. Rankings appear as soon as referees finish matches.'),
-    h('p', { class: 'muted small' }, 'Points: win ' + P.win + ' • draw ' + P.draw + (P.loss ? ' • loss ' + P.loss : '') + ' • champion +' + P.gold + ' • runner-up +' + P.silver + ' • third place +' + P.bronze + '. Ties: more wins, then win %, then point difference. Team events count for the players in the line-up.'),
+    h('p', { class: 'muted small' }, (r.sport === 'tt' ? 'Table tennis: a match win counts as one game, whatever the number of sets – win ' + rankPtsSport().tt.win + (rankPtsSport().tt.loss ? ' • loss ' + rankPtsSport().tt.loss : '') + '. ' : '') + 'Points: win ' + (r.sport === 'tt' ? rankPtsSport().tt.win : P.win) + (r.sport ? '' : ' (table tennis ' + rankPtsSport().tt.win + ')') + ' • draw ' + P.draw + (P.loss ? ' • loss ' + P.loss : '') + ' • champion +' + P.gold + ' • runner-up +' + P.silver + ' • third place +' + P.bronze + '. Ties: more wins, then win %, then point difference. Team events count for the players in the line-up.'),
     isOrganizer() ? h('button', { class: 'btn ghost sm', onclick: () => rankPtsModal() }, '⚙ Change points') : null);
 };
 function playerRankCard(p) {
@@ -1479,17 +1581,31 @@ function renderNav(name) {
   $('#nav').replaceChildren(...items.map(([r, i, l]) => h('a', { href: '#/' + r, class: key === r ? 'on' : '', 'aria-current': key === r ? 'page' : null }, icon(i), h('span', { class: 'lbl' }, l))));
   const bar = $('#bar'); if (bar) document.documentElement.style.setProperty('--barh', bar.offsetHeight + 'px');
 }
-/* Contact us: who runs each event (names only – no phone numbers are shown publicly). */
+/* Set the contact number shown for an organizer on Contact us (main admins). Empty = use their player profile's number. */
+function orgPhoneModal(a) {
+  const ph = h('input', { type: 'tel', value: a.ownPhone || '', placeholder: a.phone && !a.ownPhone ? a.phone + ' (from their player profile)' : 'e.g. 98765 43210', autocomplete: 'off', maxlength: 30 });
+  modal('Contact number – ' + a.name, h('div', {}, field('Phone number shown on Contact us', ph, 'Everyone who opens Contact us can see and call this number. Leave empty to use the number in their player profile (if linked).')),
+    [{ label: 'Save', fn: async () => { await api('PUT', '/api/admin/admins/' + a.id, { phone: ph.value.trim() }); toast('Saved'); await refresh(); } }]);
+}
+const telHref = (p) => 'tel:' + String(p).replace(/[^\d+]/g, '');
+const waHref = (p) => { let d = String(p).replace(/\D/g, ''); if (d.length === 10) d = '91' + d; else if (d.length === 11 && d[0] === '0') d = '91' + d.slice(1); return 'https://wa.me/' + d; };
+function contactRow(a) {
+  return h('div', { class: 'row' }, icon('players'), h('div', { class: 'grow' }, h('b', {}, a.name), a.phone ? h('div', { class: 'muted small' }, a.phone) : h('div', { class: 'muted small' }, 'No contact number yet')),
+    a.phone ? h('a', { class: 'btn ghost sm', href: telHref(a.phone), 'aria-label': 'Call ' + a.name }, '📞 Call') : null,
+    a.phone ? h('a', { class: 'btn sm wa', href: waHref(a.phone), target: '_blank', rel: 'noopener', 'aria-label': 'WhatsApp ' + a.name }, 'WhatsApp') : null);
+}
+/* Contact us: who runs each event, with their contact number (tap to call or WhatsApp). */
 Views.contact = () => {
-  const orgs = SA.organizers || [], nm = (id) => (orgs.find((a) => a.id === id) || {}).name;
+  const orgs = SA.organizers || [], byIdO = (id) => orgs.find((a) => a.id === id);
   const open = realTours().filter((t) => t.status !== 'closed'), main = orgs.filter((a) => a.main || (!a.limited && !(a.sports || []).length));
   return h('div', {}, h('h1', {}, 'Contact us'),
     h('p', { class: 'muted small' }, 'For questions about an event – registration, fixtures, timings or scores – speak to its organizers.'),
-    open.length ? open.map((t) => { const names = (t.organizerIds || []).map(nm).filter(Boolean);
+    open.length ? open.map((t) => { const people = (t.organizerIds || []).map(byIdO).filter(Boolean);
       return h('div', { class: 'card' }, h('b', {}, '🏆 ' + t.name), t.dates || t.venue ? h('div', { class: 'muted small' }, [t.dates, t.venue].filter(Boolean).join(' • ')) : null,
-        names.length ? h('div', { class: 'list' }, names.map((n) => h('div', { class: 'row' }, icon('players'), h('b', { class: 'grow' }, n)))) : h('p', { class: 'muted small' }, 'Organizers not named yet.')); })
+        people.length ? h('div', { class: 'list' }, people.map(contactRow)) : h('p', { class: 'muted small' }, 'Organizers not named yet.')); })
       : h('p', { class: 'empty' }, 'No event is running right now.'),
-    main.length ? h('div', { class: 'card' }, h('b', {}, 'App administrators'), h('div', { class: 'list' }, main.map((a) => h('div', { class: 'row' }, icon('players'), h('b', { class: 'grow' }, a.name))))) : null,
+    main.length ? h('div', { class: 'card' }, h('b', {}, 'App administrators'), h('div', { class: 'list' }, main.map(contactRow))) : null,
+    isOrganizer() ? h('p', { class: 'muted small' }, 'Organizers: set the numbers shown here in 🏆 Event → Organizers → 📞 Contact number.') : null,
     h('p', { class: 'muted small' }, 'Found a wrong score? Open the match and tap ⚑ Report a score problem.'));
 };
 
