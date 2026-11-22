@@ -180,7 +180,7 @@ test('trash restores deleted players and events (with matches); disputes; purge'
     assert.ok(st.events.some((e) => e.id === ev.id) && st.matches.some((x) => x.id === m.id), 'event and its match are back');
     // player profiles are permanent: delete is refused, the player stays in the event
     await call('DELETE', '/api/admin/matches/' + m.id, null, admin);
-    assert.equal((await call('DELETE', '/api/admin/players/' + a.id, null, admin)).status, 403);
+    // a profile with no match history left may be deleted (v21 covers the rules)
     st = (await call('GET', '/api/state')).body;
     assert.ok(st.events.find((e) => e.id === ev.id).participantIds.includes(a.id));
     assert.equal((await call('GET', '/api/admin/players/' + a.id, null, admin)).body.phone, '555');

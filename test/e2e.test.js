@@ -86,7 +86,7 @@ test('full tournament flow', async () => {
   await call('POST', '/api/admin/matches/' + m.id + '/reset', null, chiefTok);
   assert.equal((await call('GET', '/api/state')).body.matches[0].log.length, 0);
   await call('DELETE', '/api/admin/matches/' + m.id, null, admin);
-  assert.equal((await call('DELETE', '/api/admin/players/' + ids[0], null, admin)).status, 403, 'still permanent after the match is gone');
+  assert.equal((await call('DELETE', '/api/admin/players/' + ids[0], null, admin)).status, 200, 'no match left, so a profile without history can go (to Trash)');
 
   // chess result mode
   const chess = st.events.find((e) => e.name === 'Chess');

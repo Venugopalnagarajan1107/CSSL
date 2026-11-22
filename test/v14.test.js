@@ -38,9 +38,9 @@ test('games need an organizer and a referee; game organizers manage only their g
     const rt = (await call('POST', '/api/login', { role: 'referee', refereeId: ref.id, pin: g.body.pins[1].pin })).body.token;
     assert.notEqual((await call('POST', '/api/matches/' + m.id + '/paper', {}, rt)).status, 403);
 
-    // organizer names are public (first name only), PINs never
+    // organizer names are public in full (for Contact us), PINs and links to players never
     const pub = (await call('GET', '/api/state')).body;
-    assert.ok(pub.organizers.some((a) => a.name === 'Priya')); assert.ok(!JSON.stringify(pub.organizers).includes('pinHash'));
+    assert.ok(pub.organizers.some((a) => a.name === 'Priya Lead')); assert.ok(!JSON.stringify(pub.organizers).includes('playerId')); assert.ok(!JSON.stringify(pub.organizers).includes('pinHash'));
   } finally { await s.stop(); }
 });
 

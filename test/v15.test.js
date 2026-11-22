@@ -70,6 +70,6 @@ test('events side by side: create with structure, roster-only entries, teams, ma
     // closing an event freezes it
     assert.equal((await call('PUT', '/api/staff/tournaments/' + cup.id, { status: 'closed' }, org)).status, 200);
     assert.equal((await call('POST', '/api/admin/matches', { eventId: wd.id, sideA: ids.slice(0, 2), sideB: ids.slice(2) }, org)).status, 409);
-    assert.equal((await call('PUT', '/api/staff/tournaments/' + season.id, { status: 'closed' }, admin)).status, 400, 'one event must stay open');
+    assert.equal((await call('PUT', '/api/staff/tournaments/' + season.id, { status: 'closed' }, admin)).status, 200, 'every event may be closed – none has to stay open');
   } finally { await s.stop(); }
 });

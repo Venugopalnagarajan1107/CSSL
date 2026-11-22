@@ -515,7 +515,7 @@ function publicState(mode) {
     teams: db.teams.map(({ captainHash, ...t }) => ({ ...t, hasCode: !!captainHash })), referees: db.referees.filter((r) => isAdmin || r.status !== 'pending').map((r) => ({ id: r.id, name: mode === 'public' ? refDisplay(r) : r.name, kind: r.kind, sports: r.sports, eventIds: r.eventIds, status: r.status, playerId: r.playerId || '', ...(isAdmin ? { phone: r.phone, note: r.note, signedUpAt: r.signedUpAt } : {}) })),
     seasons: db.seasons.map((x) => seasonPublic(x, mode)),
     tournaments: db.tournaments.map((T) => ({ id: T.id, kind: T.kind || '', name: T.name, dates: T.dates, venue: T.venue, status: T.status, createdAt: T.createdAt, createdBy: isAdmin ? T.createdBy : '', organizerIds: T.organizerIds, refereeIds: T.refereeIds, playerIds: T.playerIds })),
-    organizers: db.admins.map((a) => (isAdmin ? { id: a.id, name: a.name, sports: a.sports || [], limited: !!a.limited } : { id: a.id, name: mode === 'public' ? firstOf(a.name) : a.name })), events: db.events,
+    organizers: db.admins.map((a) => (isAdmin ? { id: a.id, name: a.name, sports: a.sports || [], limited: !!a.limited, playerId: a.playerId || '' } : { id: a.id, name: a.name, main: !a.limited && !(a.sports || []).length })),   /* organizers are named in full on Contact us */ events: db.events,
     matches: db.matches.map(({ cids, lock, ...m00 }) => { const m0 = mode === 'public' ? (panic().hideScoreboard ? blankScores(m00) : paperPublic(m00)) : m00; const m = mode === 'public' && !tieRevealed(m0) ? hideLineups(m0) : m0; const o = flaggedSet.has(m.id) ? { ...m, flagged: true } : m; return m.rubbers ? { ...o, rubbers: m.rubbers.map(({ cids: c2, ...r }) => r) } : o; }),
     sponsors: db.sponsors, gallery: (mode === 'public' ? db.gallery.filter((g) => g.consent !== false && (!g.minors || db.tournament.showKidsPhotos)) : db.gallery.filter((g) => isAdmin || !g.minors || db.tournament.showKidsPhotos)).map(({ delHash, ...g }) => g),
     feed: (db.feed || []).slice(-60).reverse(),
@@ -941,6 +941,12 @@ const COLS = {
   sponsors: (b, p) => ({ id: (p && p.id) || uid(), name: str(b.name != null ? b.name : (p && p.name) || '', 80), image: str(b.image != null ? b.image : (p && p.image) || '', 200), url: str(b.url != null ? b.url : (p && p.url) || '', 200) }),
 };
 
+/* Has this person ever played? Any match (themselves, in a line-up, or through a team), or results kept from a past season. */
+function hasHistory(pid) {
+  const inLineup = (m) => [m.lineupA, m.lineupB].some((l) => JSON.stringify(l || '').includes('"' + pid + '"')) || (m.rubbers || []).some((r) => [...(r.sideA || []), ...(r.sideB || [])].includes(pid));
+  return db.matches.some((m) => inMatch(pid, m) || inLineup(m)) || (db.seasons || []).some((x) => x.records && x.records[pid]);
+}
+const hasRole = (pid) => db.admins.some((a) => a.playerId === pid) || db.referees.some((r) => r.playerId === pid);
 function cascadeDelete(col, id) {
   const used = (type) => db.matches.some((m) => [...m.sideA, ...m.sideB].includes(id) && (find('events', m.eventId) || {}).sideType === type);
   if (col === 'players') {
@@ -965,7 +971,7 @@ const clone = (x) => JSON.parse(JSON.stringify(x));
 function snapshot(col, id) {
   const item = clone(find(col, id));
   const s = { id: uid(), col, item, at: Date.now(), links: { teams: [], events: [], matches: [] }, matches: [], name: item.name || '' };
-  if (col === 'players') { db.teams.forEach((t) => t.memberIds.includes(id) && s.links.teams.push(t.id)); db.events.forEach((e) => e.participantIds.includes(id) && s.links.events.push(e.id)); }
+  if (col === 'players') { db.teams.forEach((t) => t.memberIds.includes(id) && s.links.teams.push(t.id)); db.events.forEach((e) => e.participantIds.includes(id) && s.links.events.push(e.id)); s.links.tours = db.tournaments.filter((t) => (t.playerIds || []).includes(id)).map((t) => t.id); s.links.interested = db.events.filter((e) => (e.interestedIds || []).includes(id)).map((e) => e.id); }
   if (col === 'teams') db.events.forEach((e) => e.participantIds.includes(id) && s.links.events.push(e.id));
   if (col === 'events') s.matches = db.matches.filter((m) => m.eventId === id).map(clone);
   if (col === 'referees') db.matches.forEach((m) => (m.refereeIds || []).includes(id) && s.links.matches.push(m.id));
@@ -998,6 +1004,8 @@ function restoreTrash(sn) {
   db[col].push(it);
   (sn.links.teams || []).forEach((t) => { const x = find('teams', t); if (x && !x.memberIds.includes(it.id)) x.memberIds.push(it.id); });
   (sn.links.events || []).forEach((e) => { const x = find('events', e); if (x && !x.participantIds.includes(it.id)) x.participantIds.push(it.id); });
+  (sn.links.tours || []).forEach((t) => { const x = tour(t); if (x && !x.playerIds.includes(it.id)) x.playerIds.push(it.id); });
+  (sn.links.interested || []).forEach((e) => { const x = find('events', e); if (x && !(x.interestedIds || []).includes(it.id)) x.interestedIds = (x.interestedIds || []).concat(it.id); });
   (sn.links.matches || []).forEach((m) => { const x = find('matches', m); if (x && col === 'referees' && !(x.refereeIds || []).includes(it.id)) x.refereeIds = (x.refereeIds || []).concat(it.id); });
   if (col === 'events') (sn.matches || []).forEach((m) => { if (!find('matches', m.id)) db.matches.push(m); });
 }
@@ -1920,7 +1928,6 @@ async function route(req, res, url) {
     if (b.status === 'closed' || b.status === 'open') T.status = b.status;
     if (b.organizerIds || b.refereeIds || b.newOrganizers || b.newReferees) Object.assign(T, tourStaff({ organizerIds: b.organizerIds || T.organizerIds, refereeIds: b.refereeIds || T.refereeIds, newOrganizers: b.newOrganizers, newReferees: b.newReferees, newRefereeSports: b.newRefereeSports }, pins, null));
     if (T.kind === 'friendly') T.status = 'open';
-    if (!db.tournaments.some((x) => x.status !== 'closed' && x.kind !== 'friendly')) { T.status = 'open'; throw new HttpError(400, 'At least one event must stay open.'); }
     audit(user.name, 'edited event', T.name); save(); broadcast();
     return json(res, 200, { tournament: T, pins });
   }
@@ -2596,7 +2603,19 @@ async function route(req, res, url) {
       const add = (Array.isArray(b.add) ? b.add : []).map(String).filter((id) => { const pl = find('players', id); return pl && pl.status === 'approved'; });
       addRoster(T.id, add);
       let removed = 0;
-      if (b.remove) {
+      const skipped = [];
+      if (Array.isArray(b.remove)) {   /* several at once: players with fixtures in this event are skipped and named */
+        const evs = db.events.filter((e) => e.tid === T.id);
+        for (const id of [...new Set(b.remove.map(String))].slice(0, 2000)) {
+          const pl = find('players', id); if (!pl || !T.playerIds.includes(id)) continue;
+          const busy = evs.filter((e) => db.matches.some((x) => x.eventId === e.id && inMatch(id, x)));
+          if (busy.length) { skipped.push(pl.name + ' (' + busy.map((e) => e.name).join(', ') + ')'); continue; }
+          T.playerIds = T.playerIds.filter((x) => x !== id);
+          evs.forEach((e) => { e.participantIds = e.participantIds.filter((x) => x !== id); e.interestedIds = (e.interestedIds || []).filter((x) => x !== id); });
+          db.teams.forEach((t) => { if (t.tid === T.id) t.memberIds = t.memberIds.filter((x) => x !== id); });
+          removed++;
+        }
+      } else if (b.remove) {
         const id = String(b.remove), pl = find('players', id); if (!pl) throw new HttpError(404, 'Player not found');
         const evs = db.events.filter((e) => e.tid === T.id);
         const teamIds = db.teams.filter((t) => t.tid === T.id && t.memberIds.includes(id)).map((t) => t.id);
@@ -2607,8 +2626,8 @@ async function route(req, res, url) {
         db.teams.forEach((t) => { if (teamIds.includes(t.id)) t.memberIds = t.memberIds.filter((x) => x !== id); });
         removed = 1;
       }
-      audit(user.name, 'event players', T.name + ': +' + add.length + (removed ? ' -1' : '')); save(); broadcast();
-      return json(res, 200, { ok: true, added: add.length, removed });
+      audit(user.name, 'event players', T.name + ': +' + add.length + (removed ? ' -' + removed : '')); save(); broadcast();
+      return json(res, 200, { ok: true, added: add.length, removed, skipped });
     }
     /* ---- a game (sub-event) always has an organizer and a referee: create both inline if needed ---- */
     const gameStaff = (b, pins, ev) => {
@@ -2826,6 +2845,20 @@ async function route(req, res, url) {
       return json(res, 200, { created: plan.length, stage: plan[0].stage });
     }
     /* Delete the matches an organizer ticked (one, several or all) – one Trash item restores them all. */
+    /* Delete player profiles in bulk – only people who never played and hold no role (duplicates, test entries). Each goes to Trash. */
+    if (p === '/api/admin/players/bulk-delete' && m === 'POST') {
+      if (isLead(user)) throw new HttpError(403, 'Only a main admin deletes player profiles.');
+      const b = await readJson(req, 200000), done = [], kept = [];
+      for (const id of [...new Set((Array.isArray(b.ids) ? b.ids : []).map(String))].slice(0, 2000)) {
+        const pl = find('players', id); if (!pl) continue;
+        if (hasHistory(id)) { kept.push(pl.name + ' (has played)'); continue; }
+        if (hasRole(id)) { kept.push(pl.name + ' (admin / referee role)'); continue; }
+        const snap = snapshot('players', id); cascadeDelete('players', id); pushTrash(snap); done.push(pl.name);
+      }
+      if (!done.length && !kept.length) throw new HttpError(400, 'Select at least one player.');
+      if (done.length) { audit(user.name, 'deleted players', done.length + ': ' + done.slice(0, 20).join(', ') + ' – in Trash'); save(); broadcast(); }
+      return json(res, 200, { ok: true, removed: done.length, kept });
+    }
     if (p === '/api/admin/matches/bulk-delete' && m === 'POST') {
       const b = await readJson(req, 200000);
       const ids = [...new Set((Array.isArray(b.ids) ? b.ids : []).map(String))].slice(0, 2000), ms = ids.map((id) => find('matches', id)).filter(Boolean);
@@ -2898,7 +2931,8 @@ async function route(req, res, url) {
       }
       if (m === 'DELETE' && id) {
         if (!find(col, id)) throw new HttpError(404, 'Not found');
-        if (col === 'players' && find(col, id).status !== 'pending') throw new HttpError(403, 'Player profiles are permanent. Remove the player from an event instead, or merge a duplicate into the right profile.');
+        if (col === 'players' && find(col, id).status !== 'pending' && (hasHistory(id) || hasRole(id))) throw new HttpError(403, hasRole(id) ? 'This person has an admin or referee role. Remove the role in People & roles first.' : 'This player has match history, so the profile is permanent. Remove them from an event instead, or merge a duplicate into the right profile.');
+        if (col === 'players' && isLead(user)) throw new HttpError(403, 'Only a main admin deletes player profiles.');
         const snap = snapshot(col, id);
         cascadeDelete(col, id); pushTrash(snap); audit(user.name, 'deleted ' + col.slice(0, -1), snap.name || id, col === 'matches' ? id : '');
         save(); broadcast(); return json(res, 200, { ok: true });
