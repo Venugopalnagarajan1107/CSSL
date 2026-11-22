@@ -511,17 +511,14 @@ function gameDashboard(ev, ms) {
   const st = E.standings(ev, ms.map((x) => x.m));
   const pts = ev.scoring === 'points';
   const table = h('div', { class: 'card' }, h('div', { class: 'card-h' }, h('b', {}, '🏆 Standings'), h('span', { class: 'muted small' }, (ev.config.pointsWin || 2) + ' pts per win • ties: ' + (ev.sport === 'tt' || ev.config.tiebreak === 'sets' ? 'points → set difference → sets won' : 'points → point difference'))),
-    /* three columns: position (🥇🥈🥉 for the top three once they have played), name with the details under it, points */
+    /* the usual table; positions 1, 2, 3 show gold, silver, bronze (once the game has started) and the name column is wide */
     h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl dash-st' },
-      h('colgroup', {}, h('col', { class: 'c-pos' }), h('col', { class: 'c-name' }), h('col', { class: 'c-pts' })),
-      h('thead', {}, h('tr', {}, h('th', {}, 'Pos'), h('th', { class: 'l' }, ev.sideType === 'team' ? 'Team' : 'Player'), h('th', {}, 'Points'))),
+      h('thead', {}, h('tr', {}, ['Pos', ev.sideType === 'team' ? 'Team' : 'Player', 'P', 'W', 'L'].concat(pts ? ['Sets', 'Diff'] : ['D'], ['Pts']).map((x, i) => h('th', { class: i === 1 ? 'l nm' : '' }, x)))),
       h('tbody', {}, st.map((r) => {
-        const medal = r.played > 0 && r.rank <= 3 ? ['🥇', '🥈', '🥉'][r.rank - 1] : '';
-        const detail = ['P ' + r.played, 'W ' + r.won, 'L ' + r.lost].concat(pts ? ['Sets ' + r.gw + '–' + r.gl + ' (' + (r.gw - r.gl > 0 ? '+' : '') + (r.gw - r.gl) + ')'] : r.drawn ? ['D ' + r.drawn] : []).join(' • ');
-        return h('tr', { class: medal ? 'top' + r.rank : '' },
-          h('td', { class: 'pos', 'aria-label': 'Position ' + r.rank }, medal ? h('span', { class: 'medal', title: ['Gold', 'Silver', 'Bronze'][r.rank - 1] }, medal) : r.rank),
-          h('td', { class: 'l nm' }, ev.sideType === 'player' ? h('a', { href: '#/player/' + r.id }, h('b', {}, nm(r.id))) : h('b', {}, nm(r.id)), h('div', { class: 'muted small' }, detail)),
-          h('td', { class: 'pts' }, h('b', {}, r.mp)));
+        const medal = st.some((x) => x.played > 0) && r.rank <= 3 ? ['🥇', '🥈', '🥉'][r.rank - 1] : '';
+        return h('tr', { class: medal ? 'top' + r.rank : '' }, [medal ? h('span', { class: 'medal', title: ['Gold', 'Silver', 'Bronze'][r.rank - 1], 'aria-label': 'Position ' + r.rank }, medal) : r.rank,
+          ev.sideType === 'player' ? h('a', { href: '#/player/' + r.id }, nm(r.id)) : nm(r.id), r.played, r.won, r.lost].concat(pts ? [r.gw + '–' + r.gl, (r.gw - r.gl > 0 ? '+' : '') + (r.gw - r.gl)] : [r.drawn], [h('b', {}, r.mp)])
+          .map((c, i) => h('td', { class: i === 0 ? 'pos' : i === 1 ? 'l nm' : '' }, c)));
       })))));
   /* 3. head-to-head grid (updates live as results come in) */
   const order = st.map((r) => r.id).filter((id) => ids.includes(id)).concat(ids.filter((id) => !st.some((r) => r.id === id)));

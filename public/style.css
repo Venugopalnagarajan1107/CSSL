@@ -258,14 +258,12 @@ a.card,a.row,a.grow,a.chip,.list a,.ev-top a,.tbl.rank td a{color:inherit;text-d
 .seg.scroll{scrollbar-width:none;-webkit-overflow-scrolling:touch;-webkit-mask-image:linear-gradient(90deg,#000 90%,transparent);mask-image:linear-gradient(90deg,#000 90%,transparent)}
 .seg.scroll::-webkit-scrollbar{display:none}
 .seg.scroll button{flex:0 0 auto}
-/* Dashboard standings: Position | Name (wide) | Points */
-.tbl.dash-st{width:100%;table-layout:fixed}
-.tbl.dash-st .c-pos{width:56px}.tbl.dash-st .c-pts{width:72px}
-.tbl.dash-st td.pos{text-align:center;font-weight:700;font-size:15px}
-.tbl.dash-st .medal{font-size:24px;line-height:1}
-.tbl.dash-st td.nm{white-space:normal;word-break:break-word}
-.tbl.dash-st td.nm a{color:var(--ink)}
-.tbl.dash-st td.pts{text-align:center;font-size:18px}
+/* Dashboard standings: medals for positions 1-3, wide name column */
+.tbl.dash-st{width:100%}
+.tbl.dash-st td.pos{text-align:center;font-weight:700}
+.tbl.dash-st .medal{font-size:22px;line-height:1}
+.tbl.dash-st th.nm,.tbl.dash-st td.nm{width:45%;min-width:150px;white-space:normal;word-break:break-word}
+.tbl.dash-st td.nm a{color:var(--ink);font-weight:600}
 .tbl.dash-st tr.top1 td{background:color-mix(in srgb,#f5c518 14%,transparent)}
 .tbl.dash-st tr.top2 td{background:color-mix(in srgb,#b8c2cc 16%,transparent)}
 .tbl.dash-st tr.top3 td{background:color-mix(in srgb,#cd7f32 14%,transparent)}
