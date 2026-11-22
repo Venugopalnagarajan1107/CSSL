@@ -174,6 +174,7 @@ function migrate(d) {
   const byNm = (n) => { const hits = (d.players || []).filter((p) => p.status !== 'rejected' && String(p.name).trim().toLowerCase() === String(n).trim().toLowerCase()); return hits.length === 1 ? hits[0].id : ''; };
   d.admins.forEach((a) => { if (a.playerId === undefined) a.playerId = byNm(a.name); });
   (d.referees || []).forEach((r) => { if (r.playerId === undefined) r.playerId = byNm(r.name); });
+  try { const n = consolidatePins(d); if (n) console.log('  One PIN per person: ' + n + ' existing PIN(s) moved onto player profiles.'); } catch (e) { console.error('PIN consolidation failed', e); }
   if (d.matches.some((m) => !m.plannedNo)) d.matches.forEach((m) => { if (!m.plannedNo && m.no) m.plannedNo = m.no; });
   { const keep = db; db = d; try { numberMatches(); } catch (e) { console.error('numbering failed', e); } finally { db = keep; } }
   return d;
@@ -1247,7 +1248,7 @@ function findByPin(pin) {
   for (const [kind, list] of lists) for (const rec of list) { const h = kind === 'captain' ? rec.captainHash : rec.pinHash; if (h && rec.pinIdx === idx && checkPin(pin, h)) return { kind, rec }; }
   for (const [kind, list] of lists) for (const rec of list) {   // older PINs without a fingerprint: check, then remember the fingerprint
     const h = kind === 'captain' ? rec.captainHash : rec.pinHash;
-    if (kind !== 'player' && h && !rec.pinIdx && checkPin(pin, h)) { rec.pinIdx = idx; return { kind, rec }; }
+    if (h && !rec.pinIdx && checkPin(pin, h)) { rec.pinIdx = idx; return { kind, rec }; }
   }
   return null;
 }
@@ -1271,6 +1272,26 @@ function newPersonPin() {
   for (;;) { const pin = String(crypto.randomInt(100000, 1000000)); if (/^(\d)\1+$/.test(pin) || '0123456789'.includes(pin) || '9876543210'.includes(pin)) continue; if (!findByPin(pin)) return pin; }
 }
 function givePin(pl) { const pin = newPersonPin(); pl.pinHash = hashPin(pin); pl.pinIdx = pinIdx(pin); return pin; }
+/* One PIN per person. A person's PIN lives on their player profile and opens every role they have (admin, organizer, referee,
+   captain, player). Admin / referee accounts linked to a player keep no PIN of their own: the person's existing PIN is kept –
+   their admin PIN first, else their referee PIN – and moved onto the profile. Accounts not linked to a player keep theirs. */
+function consolidatePins(d) {
+  let moved = 0;
+  for (const pl of d.players || []) {
+    const recs = [...(d.admins || []).filter((a) => a.playerId === pl.id), ...(d.referees || []).filter((r) => r.playerId === pl.id && r.status !== 'pending')];
+    const withPin = recs.filter((r) => r.pinHash); if (!withPin.length) continue;
+    if (!pl.pinHash) { pl.pinHash = withPin[0].pinHash; pl.pinIdx = withPin[0].pinIdx || ''; moved++; }
+    withPin.forEach((r) => { r.pinHash = ''; r.pinIdx = ''; });
+  }
+  return moved;
+}
+/* a new admin / referee account made for someone from the player list: the PIN to hand out, or '' when they keep their own */
+function onePinFor(rec, plain) {
+  const pl = rec.playerId && find('players', rec.playerId); if (!pl) return plain;
+  rec.pinHash = ''; rec.pinIdx = '';
+  if (pl.pinHash) return '';
+  pl.pinHash = hashPin(plain); pl.pinIdx = pinIdx(plain); return plain;
+}
 const needAdmin = (u) => { needStaff(u); if (u.role !== 'admin') throw new HttpError(403, 'Admin only'); return u; };
 
 const fileCache = new Map();   /* app files are read once, compressed once, and revalidated with an ETag */
@@ -1459,9 +1480,9 @@ function tourStaff(b, pins, creator) {
   const orgIds = (Array.isArray(b.organizerIds) ? b.organizerIds : []).map(String).filter((id) => db.admins.some((a) => a.id === id));
   if (creator && creator.role === 'admin' && !orgIds.includes(creator.adminId)) orgIds.push(creator.adminId);
   const refIds = (Array.isArray(b.refereeIds) ? b.refereeIds : []).map(String).filter((id) => { const r = find('referees', id); return r && r.status !== 'pending'; });
-  staffNames(b.newOrganizers).forEach((x) => { const a = newOrganizer(x.name, { sports: [], limited: true }); if (x.playerId) a.playerId = x.playerId; pins.push({ role: 'Organizer', name: a.name, pin: a._pin }); delete a._pin; orgIds.push(a.id); });
+  staffNames(b.newOrganizers).forEach((x) => { const a = newOrganizer(x.name, { sports: [], limited: true }); if (x.playerId) a.playerId = x.playerId; pins.push({ role: 'Organizer', name: a.name, pin: onePinFor(a, a._pin) }); delete a._pin; orgIds.push(a.id); });
   const newSports = (Array.isArray(b.newRefereeSports) ? b.newRefereeSports : []).filter((k) => SPORTS.includes(k));
-  staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee', sports: newSports }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: r._plain }); delete r._plain; db.referees.push(r); refIds.push(r.id); });
+  staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee', sports: newSports }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: onePinFor(r, r._plain) }); delete r._plain; db.referees.push(r); refIds.push(r.id); });
   if (!orgIds.length) throw new HttpError(400, 'An event needs at least one organizer – choose one or add a new one.');
   if (!refIds.length) throw new HttpError(400, 'An event needs at least one referee – choose one or add a new one.');
   return { organizerIds: [...new Set(orgIds)], refereeIds: [...new Set(refIds)] };
@@ -1683,14 +1704,16 @@ async function route(req, res, url) {
   }
   /* My profile: change my PIN, add my photo. */
   if (p === '/api/me/pin' && m === 'POST') {
-    if (!user || !user.personId) throw new HttpError(401, 'Sign in first.');
-    const pl = find('players', user.personId); if (!pl) throw new HttpError(404, 'Profile not found');
+    if (!user) throw new HttpError(401, 'Sign in first.');
+    /* the person's one PIN – or, for an admin / referee sign-in not linked to a player, that account's own */
+    const pl = (user.personId && find('players', user.personId)) || (user.adminId && db.admins.find((a) => a.id === user.adminId && !a.playerId)) || (user.refId && db.referees.find((r) => r.id === user.refId && !r.playerId));
+    if (!pl) throw new HttpError(404, 'Profile not found');
     if (lockedFor('ip:' + ip)) throw new HttpError(429, 'Too many attempts. Try again later.');
     const pin = String((await readJson(req, 500)).pin || '');
     if (!/^\d{6,10}$/.test(pin)) throw new HttpError(400, 'Use 6 to 10 digits.');
     if (/^(\d)\1+$/.test(pin) || '0123456789'.includes(pin) || '9876543210'.includes(pin)) throw new HttpError(400, 'That PIN is too easy to guess – choose another.');
     const other = findByPin(pin);
-    if (other && !(other.kind === 'player' && other.rec === pl)) { recordFail('ip:' + ip, 8); throw new HttpError(400, 'Choose a different PIN.'); }   // counts like a wrong sign-in, so it cannot be used to guess PINs
+    if (other && other.rec !== pl) { recordFail('ip:' + ip, 8); throw new HttpError(400, 'Choose a different PIN.'); }   // counts like a wrong sign-in, so it cannot be used to guess PINs
     pl.pinHash = hashPin(pin); pl.pinIdx = pinIdx(pin);
     db.admins.forEach((a) => { if (a.playerId === pl.id) { a.pinHash = ''; a.pinIdx = ''; } });   // one PIN for everything
     db.referees.forEach((r) => { if (r.playerId === pl.id) { r.pinHash = ''; r.pinIdx = ''; } });
@@ -2324,7 +2347,9 @@ async function route(req, res, url) {
         if (b.name) a.name = str(b.name, 40);
         if (b.phone != null) a.phone = str(b.phone, 30);
         if (Array.isArray(b.sports)) { a.sports = normSports(b.sports); Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].adminId === a.id) db.sessions[t].sports = a.sports; }); }
-        if (b.resetPin) { do { pin = pinN(8); } while (db.admins.some((x) => checkPin(pin, x.pinHash))); a.pinHash = hashPin(pin); Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].adminId === a.id && t !== user.token) delete db.sessions[t]; }); }
+        const lp = a.playerId && find('players', a.playerId);
+        if (b.resetPin && lp) { pin = givePin(lp); a.pinHash = ''; a.pinIdx = ''; Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].personId === lp.id && t !== user.token) delete db.sessions[t]; }); }
+        else if (b.resetPin) { do { pin = pinN(8); } while (db.admins.some((x) => checkPin(pin, x.pinHash))); a.pinHash = hashPin(pin); Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].adminId === a.id && t !== user.token) delete db.sessions[t]; }); }
         audit(user.name, b.resetPin ? 'reset admin PIN' : 'renamed admin', a.name); save();
         return json(res, 200, { id: a.id, name: a.name, pin });
       }
@@ -2812,7 +2837,7 @@ async function route(req, res, url) {
       const rec = b.type === 'admin' ? db.admins.find((a) => a.id === b.id) : find('referees', String(b.id || ''));
       if (!pl || !rec) throw new HttpError(404, 'Not found');
       if ((b.type === 'admin' ? db.admins : db.referees).some((x) => x !== rec && x.playerId === pl.id)) throw new HttpError(409, pl.name + ' already has that role.');
-      rec.playerId = pl.id; audit(user.name, 'linked account', rec.name + ' → ' + pl.name); save(); broadcast();
+      rec.playerId = pl.id; consolidatePins(db); audit(user.name, 'linked account', rec.name + ' → ' + pl.name + ' (one PIN)'); save(); broadcast();
       return json(res, 200, { ok: true });
     }
     /* ---- events: roster (enrol existing players / remove from the event) ---- */
@@ -2853,10 +2878,10 @@ async function route(req, res, url) {
     const gameStaff = (b, pins, ev) => {
       const orgIds = (Array.isArray(b.organizerIds) ? b.organizerIds : []).map(String).filter((id) => db.admins.some((a) => a.id === id));
       const refIds = (Array.isArray(b.refereeIds) ? b.refereeIds : []).map(String).filter((id) => { const r = find('referees', id); return r && r.status !== 'pending'; });
-      staffNames(b.newOrganizers).forEach((x) => { const a = newOrganizer(x.name, { sports: [], limited: true }); if (x.playerId) a.playerId = x.playerId; pins.push({ role: 'Organizer', name: a.name, pin: a._pin }); delete a._pin; orgIds.push(a.id); });
+      staffNames(b.newOrganizers).forEach((x) => { const a = newOrganizer(x.name, { sports: [], limited: true }); if (x.playerId) a.playerId = x.playerId; pins.push({ role: 'Organizer', name: a.name, pin: onePinFor(a, a._pin) }); delete a._pin; orgIds.push(a.id); });
       if (b.newOrganizer && str(b.newOrganizer, 40).trim()) { const a = newOrganizer(str(b.newOrganizer, 40).trim(), { sports: [], limited: true }); pins.push({ role: 'Organizer', name: a.name, pin: a._pin }); delete a._pin; orgIds.push(a.id); }
       const picked = mappedRefs(refIds, ev, !b.byDefault);
-      staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee', sports: [ev.sport] }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: r._plain }); delete r._plain; db.referees.push(r); picked.push(r.id); });
+      staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee', sports: [ev.sport] }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: onePinFor(r, r._plain) }); delete r._plain; db.referees.push(r); picked.push(r.id); });
       refIds.length = 0; refIds.push(...picked);
       if (!refIds.length) throw new HttpError(400, 'Every game needs at least one referee mapped to ' + sportName(ev.sport) + ' – choose one or add a new one.');
       return { organizerIds: [...new Set(orgIds)], refereeIds: [...new Set(refIds)] };
@@ -3240,7 +3265,8 @@ async function route(req, res, url) {
     if ((mm = p.match(/^\/api\/admin\/(players|teams|referees|events|matches|sponsors)(?:\/([\w-]+))?$/))) {
       const col = mm[1], id = mm[2];
       const finish = (item, code) => {
-        const plain = item._plain; delete item._plain;
+        let plain = item._plain; delete item._plain;
+        if (col === 'referees' && item.playerId && find('players', item.playerId) && plain) { const lp = find('players', item.playerId); lp.pinHash = hashPin(plain); lp.pinIdx = pinIdx(plain); item.pinHash = ''; item.pinIdx = ''; }
         save(); broadcast();
         return json(res, code || 200, col === 'referees' ? { id: item.id, name: item.name, kind: item.kind, sports: item.sports, eventIds: item.eventIds, status: item.status, pin: plain } : item);
       };

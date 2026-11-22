@@ -274,8 +274,9 @@ function staffPicker(ev, sportSel) {
 }
 function showPins(pins, after) {
   if (!pins || !pins.length) { if (after) after(); return; }
-  modal('New PINs – shown only once', h('div', {}, h('p', { class: 'small' }, 'Give each person their PIN. They sign in from Menu → Sign in.'),
-    pins.map((x) => h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, x.name), h('div', { class: 'muted small' }, x.role)), h('div', { class: 'bigpin', style: 'font-size:22px' }, x.pin)))),
+  const fresh = pins.filter((x) => x.pin);
+  modal(fresh.length ? 'New PINs – shown only once' : 'Roles added', h('div', {}, h('p', { class: 'small' }, 'One PIN per person: it opens every role they have. ' + (fresh.length ? 'Give each new PIN to that person – they sign in from Menu → Sign in.' : '')),
+    pins.map((x) => h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, x.name), h('div', { class: 'muted small' }, x.role)), x.pin ? h('div', { class: 'bigpin', style: 'font-size:22px' }, x.pin) : h('span', { class: 'muted small' }, 'uses their own PIN')))),
   [{ label: 'Done', fn: () => { if (after) after(); } }]);
 }
 function newGameModal() {
