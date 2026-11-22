@@ -11,6 +11,7 @@ const webpush = require('web-push');
 const QRCode = require('qrcode');
 const Engine = require('./public/engine.js');
 const Fx = require('./lib/fixtures.js');
+const SheetImport = require('./lib/sheet-import.js');
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -53,6 +54,8 @@ const LEVELS = ['', 'Beginner', 'Intermediate', 'Advanced', 'Pro'];
 const SLOT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
 
 /* ------------------------------------------------------------ PIN hashing */
+/* A keyed fingerprint of each PIN lets sign-in find the person directly (PIN-only sign-in) without testing every stored PIN. */
+const pinIdx = (pin) => crypto.createHmac('sha256', String(db.pinSecret || '')).update(String(pin)).digest('hex').slice(0, 32);
 function hashPin(pin) {
   const salt = crypto.randomBytes(8).toString('hex');
   return salt + ':' + crypto.scryptSync(String(pin), salt, 32).toString('hex');
@@ -108,9 +111,9 @@ function freshDb() {
   initialPin = pinN(6);
   return {
     version: 2,
-    tournament: { tz: 'Asia/Kolkata', sponsorSeconds: 8, name: 'Tournament Name', tagline: 'Badminton • Carrom • Chess • Table Tennis', dates: '', venue: '', logo: '', primary: '#0f766e', showKidsPhotos: false, signers: [] },
+    tournament: { tz: 'Asia/Kolkata', sponsorSeconds: 8, name: 'Tournament Name', tagline: 'Badminton • Carrom • Chess • Table Tennis', dates: '', venue: '', logo: '', primary: '#0f766e', showKidsPhotos: false, signers: [], seasonName: 'CSSL - Season 3', seasonStartedAt: Date.now() },
     admins: [{ id: uid(), name: 'Admin', pinHash: hashPin(initialPin) }], sessions: {}, vapid: webpush.generateVAPIDKeys(),
-    players: [], teams: [], referees: [], events: seedEvents(), matches: [], sponsors: [], gallery: [], subs: [], audit: [], kidsSeeded: true,
+    players: [], teams: [], referees: [], events: seedEvents(), matches: [], sponsors: [], gallery: [], subs: [], audit: [], seasons: [], kidsSeeded: true,
   };
 }
 
@@ -121,7 +124,9 @@ function migrate(d) {
   const t = d.tournament;
   if (t.showKidsPhotos === undefined) t.showKidsPhotos = false;
   if (!Array.isArray(t.signers) || !t.signers.length) t.signers = [{ name: '', title: 'Organizer', image: '' }, { name: '', title: 'Chief Referee', image: '' }];
-  ['players', 'teams', 'referees', 'events', 'matches', 'sponsors', 'gallery', 'subs', 'audit', 'disputes', 'trash'].forEach((k) => { if (!Array.isArray(d[k])) d[k] = []; });
+  ['players', 'teams', 'referees', 'events', 'matches', 'sponsors', 'gallery', 'subs', 'audit', 'disputes', 'trash', 'seasons'].forEach((k) => { if (!Array.isArray(d[k])) d[k] = []; });
+  if (!t.seasonName) t.seasonName = 'CSSL - Season 3';
+  if (!t.seasonStartedAt) t.seasonStartedAt = Date.now();
   d.sessions = d.sessions || {};
   if (!t.tz) t.tz = 'Asia/Kolkata';
   if (!t.sponsorSeconds) t.sponsorSeconds = 8;
@@ -151,7 +156,7 @@ function migrate(d) {
   d.teams.forEach((x) => { if (!SECTIONS.includes(x.section)) x.section = 'adults'; });
   d.events.forEach((e) => { if (!SECTIONS.includes(e.section)) e.section = 'adults'; });
   if (d.adminPin) { d.adminPinHash = hashPin(d.adminPin); delete d.adminPin; }
-  d.referees.forEach((r) => { if (r.pin) { r.pinHash = hashPin(r.pin); delete r.pin; } if (!['referee', 'chief', 'volunteer'].includes(r.kind)) r.kind = 'referee'; });
+  d.referees.forEach((r) => { if (r.pin) { r.pinHash = hashPin(r.pin); delete r.pin; } if (!['referee', 'chief', 'volunteer'].includes(r.kind)) r.kind = 'referee'; if (!Array.isArray(r.sports)) r.sports = []; if (!Array.isArray(r.eventIds)) r.eventIds = []; if (!r.status) r.status = 'active'; });
   if (!d.kidsSeeded) { if (!d.events.some((e) => e.section === 'kids')) d.events.push(...seedKidsEvents()); d.kidsSeeded = true; }
   if (!d.vapid) d.vapid = webpush.generateVAPIDKeys();
   if (!Array.isArray(d.cards)) d.cards = [];
@@ -160,8 +165,46 @@ function migrate(d) {
   if (d.adminPinHash) { d.admins.push({ id: uid(), name: 'Admin', pinHash: d.adminPinHash }); delete d.adminPinHash; }
   if (!d.admins.length) { initialPin = pinN(6); d.admins.push({ id: uid(), name: 'Admin', pinHash: hashPin(initialPin) }); }
   d.admins.forEach((a) => { if (!Array.isArray(a.sports)) a.sports = []; });
+  ensureTours(d);
+  d.matches.forEach((m) => { if (!Array.isArray(m.refereeIds)) { m.refereeIds = m.refereeId ? [m.refereeId] : []; } delete m.refereeId; });
+  if (!d.pinSecret) d.pinSecret = crypto.randomBytes(32).toString('hex');
+  /* link existing admin / referee accounts to the player with the same (unique) name */
+  const byNm = (n) => { const hits = (d.players || []).filter((p) => p.status !== 'rejected' && String(p.name).trim().toLowerCase() === String(n).trim().toLowerCase()); return hits.length === 1 ? hits[0].id : ''; };
+  d.admins.forEach((a) => { if (a.playerId === undefined) a.playerId = byNm(a.name); });
+  (d.referees || []).forEach((r) => { if (r.playerId === undefined) r.playerId = byNm(r.name); });
+  if (d.matches.some((m) => !m.plannedNo)) d.matches.forEach((m) => { if (!m.plannedNo && m.no) m.plannedNo = m.no; });
+  { const keep = db; db = d; try { numberMatches(); } catch (e) { console.error('numbering failed', e); } finally { db = keep; } }
   return d;
 }
+/* Events (e.g. "CSSL - Season 3", "Diwali Kids Cup") run side by side. Each has its own games, organizers, referees,
+   roster (players who registered, were uploaded or enrolled), registration settings, teams and fixtures.
+   Player profiles are shared by all events and are permanent. */
+const newTour = (o) => ({ id: uid(), name: 'Event', dates: '', venue: '', status: 'open', createdAt: Date.now(), createdBy: '', organizerIds: [], refereeIds: [], playerIds: [],
+  reg: { enabled: false, deadline: '', joinCode: '', notice: '', kidsNotice: '' }, ...o });
+function ensureTours(d) {
+  if (!Array.isArray(d.tournaments)) d.tournaments = [];
+  const t0 = d.tournament || {}, r0 = d.registration || {};
+  if (!d.tournaments.length) {
+    const roster = new Set();
+    (d.events || []).forEach((e) => { (e.participantIds || []).forEach((id) => roster.add(id)); (e.interestedIds || []).forEach((id) => roster.add(id)); });
+    (d.teams || []).forEach((t) => (t.memberIds || []).forEach((id) => roster.add(id)));
+    (d.players || []).forEach((p) => { if ((p.requestedEventIds || []).length) roster.add(p.id); });
+    d.tournaments.push(newTour({ name: t0.seasonName || 'CSSL - Season 3', dates: t0.dates || '', venue: t0.venue || '', createdAt: t0.seasonStartedAt || Date.now(),
+      reg: { enabled: !!r0.enabled, deadline: r0.deadline || '', joinCode: r0.joinCode || '', notice: r0.notice || '', kidsNotice: r0.kidsNotice || '' },
+      playerIds: [...roster].filter((id) => (d.players || []).some((p) => p.id === id)) }));
+  }
+  d.tournaments.forEach((t) => { ['organizerIds', 'refereeIds', 'playerIds'].forEach((k) => { if (!Array.isArray(t[k])) t[k] = []; }); t.reg = { enabled: false, deadline: '', joinCode: '', notice: '', kidsNotice: '', ...(t.reg || {}) }; if (!t.status) t.status = 'open'; });
+  if (!d.tournaments.some((t) => t.kind === 'friendly')) d.tournaments.push(newTour({ id: 'friendly', kind: 'friendly', name: 'Friendly matches' }));
+  const def = (d.tournaments.find((t) => t.status !== 'closed' && t.kind !== 'friendly') || d.tournaments[0]).id, has = (id) => d.tournaments.some((t) => t.id === id);
+  (d.events || []).forEach((e) => { if (!has(e.tid)) e.tid = def; });
+  (d.teams || []).forEach((t) => { if (!has(t.tid)) t.tid = ((d.events || []).find((e) => e.sideType === 'team' && (e.participantIds || []).includes(t.id)) || {}).tid || def; });
+}
+const tour = (id) => (db.tournaments || []).find((t) => t.id === id);
+const defTid = () => ((db.tournaments || []).find((t) => t.status !== 'closed' && t.kind !== 'friendly') || (db.tournaments || []).find((t) => t.kind !== 'friendly') || {}).id;
+const tidOf = (x) => (x && tour(String(x)) ? String(x) : defTid());
+const inRoster = (tid, pid) => { const t = tour(tid); return !!t && (t.kind === 'friendly' || t.playerIds.includes(pid)); };
+const addRoster = (tid, ids) => { const t = tour(tid); if (!t) return; ids.forEach((id) => { if (!t.playerIds.includes(id)) t.playerIds.push(id); }); };
+const tourOrg = (u, tid) => { const t = tour(tid); return !!(u && t && u.role === 'admin' && t.organizerIds.includes(u.adminId)); };
 
 let db;
 let stateV = 1;
@@ -203,7 +246,35 @@ function freezeCounts() {
     else if (!played && ev.frozenCount != null) delete ev.frozenCount;
   });
 }
+/* Every match has a number within its game: Women's Doubles #1, #2, #3…; team ties likewise. */
+/* Match numbers per game = order of play.
+   Started matches (first point, a result or a paper score) keep a fixed number in the order they started;
+   matches still to be played follow in their planned order and move up or down as needed.
+   plannedNo = the order the match was planned in (kept, shown as "planned #8"); startSeq = when it started. */
+function numberMatches() {
+  const evs = new Map(db.events.map((e) => [e.id, e])), idx = new Map(db.matches.map((m, i) => [m, i]));
+  const byCreated = (a, b) => (a.createdAt || 0) - (b.createdAt || 0) || idx.get(a) - idx.get(b);
+  const groups = new Map();
+  db.matches.forEach((m) => { if (!groups.has(m.eventId)) groups.set(m.eventId, []); groups.get(m.eventId).push(m); });
+  if (!Number.isFinite(db.startSeq)) db.startSeq = Math.max(0, ...db.matches.map((m) => m.startSeq || 0));
+  for (const [eid, ms] of groups) {
+    const ev = evs.get(eid);
+    /* planned order: new matches go to the end */
+    let top = Math.max(0, ...ms.map((m) => m.plannedNo || 0));
+    ms.filter((m) => !m.plannedNo).sort(byCreated).forEach((m) => { m.plannedNo = ++top; });
+    /* lock the start order the first time a match is seen started; a reset match goes back to the queue */
+    const started = (m) => !!(m.log && m.log.length) || !!m.result || !!m.walkover || !!m.retired || !!m.paper || (!!ev && Engine.derive(m, ev).status !== 'scheduled');
+    const st = [], q = [];
+    ms.forEach((m) => (started(m) ? st : q).push(m));
+    q.forEach((m) => { delete m.startSeq; });
+    st.filter((m) => !m.startSeq).sort((a, b) => (a.startedAt || Infinity) - (b.startedAt || Infinity) || (a.no || a.plannedNo) - (b.no || b.plannedNo)).forEach((m) => { m.startSeq = ++db.startSeq; });
+    st.sort((a, b) => a.startSeq - b.startSeq);
+    q.sort((a, b) => a.plannedNo - b.plannedNo || byCreated(a, b));
+    [...st, ...q].forEach((m, i) => { m.no = i + 1; });
+  }
+}
 function save() {
+  try { numberMatches(); } catch (e) { console.error('numbering failed', e); }
   try { applySuspensions(); freezeCounts(); } catch (e) { console.error('suspension check failed', e); }
   stateV++; savePending = true;
   if (!saveTimer) saveTimer = setTimeout(() => { saveTimer = null; try { saveNow(); } catch (e) { console.error('save failed', e); } }, 150);
@@ -353,8 +424,9 @@ function nowLocal() {
     return o.year + '-' + o.month + '-' + o.day + 'T' + o.hour + ':' + o.minute;
   } catch (e) { return new Date().toISOString().slice(0, 16); }
 }
-function regOpen() {
-  const r = db.registration;
+function regOpen(tid) {
+  const T = tour(tidOf(tid)); if (!T || T.status === 'closed') return false;
+  const r = T.reg;
   if (!r.enabled) return false;
   if (r.deadline && nowLocal().slice(0, 10) > r.deadline) return false;
   return true;
@@ -373,6 +445,7 @@ function setGames(pl, eventIds, asOrganizer) {
     const team = ev.sideType === 'team'; const pool = team ? (ev.interestedIds = ev.interestedIds || []) : ev.participantIds;
     const inNow = pool.includes(pl.id), wants = want.has(ev.id);
     if (wants && !inNow) {
+      if (!inRoster(ev.tid, pl.id)) { skipped.push(ev.name + ' (not registered for ' + ((tour(ev.tid) || {}).name || 'that event') + ')'); continue; }
       if (!asOrganizer && ev.selfRegister === false) { skipped.push(ev.name + ' (registration is by the organizers)'); continue; }
       if (!ageOk(ev, pl)) { skipped.push(ev.name + ' (age range ' + ageText(ev) + ')'); continue; }
       if (!asOrganizer && ev.maxParticipants > 0 && pool.length >= ev.maxParticipants) { skipped.push(ev.name + ' (full)'); continue; }
@@ -387,11 +460,16 @@ function setGames(pl, eventIds, asOrganizer) {
 }
 function requestedCount(ev) { return (ev.sideType === 'team' ? ev.interestedIds : ev.participantIds).length + db.players.filter((p) => p.status === 'pending' && (p.requestedEventIds || []).includes(ev.id)).length; }
 function regPublic(isAdmin) {
-  const r = db.registration;
+  const per = db.tournaments.filter((T) => T.status !== 'closed' && T.kind !== 'friendly').map((T) => regOne(T, isAdmin));
+  const d = per.find((x) => x.tid === defTid()) || per[0] || {};
+  return { ...d, publicUrl: db.registration.publicUrl || '', tours: per };
+}
+function regOne(T, isAdmin) {
+  const r = T.reg;
   return {
-    open: regOpen(), publicUrl: r.publicUrl || '', deadline: r.deadline, codeRequired: !!r.joinCode, notice: r.notice, kidsNotice: r.kidsNotice,
-    events: db.events.filter((e) => e.selfRegister !== false).map((e) => ({ id: e.id, team: e.sideType === 'team', name: e.name, section: e.section, ageMin: e.ageMin || 0, ageMax: e.ageMax || 0, full: e.maxParticipants > 0 && requestedCount(e) >= e.maxParticipants })),
-    ...(isAdmin ? { enabled: r.enabled, joinCode: r.joinCode, pending: db.players.filter((p) => p.status === 'pending').length } : {}),
+    tid: T.id, name: T.name, open: regOpen(T.id), deadline: r.deadline, codeRequired: !!r.joinCode, notice: r.notice, kidsNotice: r.kidsNotice,
+    events: db.events.filter((e) => e.tid === T.id && e.selfRegister !== false).map((e) => ({ id: e.id, team: e.sideType === 'team', name: e.name, section: e.section, ageMin: e.ageMin || 0, ageMax: e.ageMax || 0, full: e.maxParticipants > 0 && requestedCount(e) >= e.maxParticipants })),
+    ...(isAdmin ? { enabled: r.enabled, joinCode: r.joinCode, pending: db.players.filter((p) => p.status === 'pending' && tidOf(p.requestTid) === T.id).length } : {}),
   };
 }
 
@@ -401,6 +479,24 @@ function refDisplay(r) {
   const parts = String(r.name).trim().split(/\s+/);
   return same.length > 1 && parts.length > 1 ? f + ' ' + parts[parts.length - 1][0].toUpperCase() + '.' : f;
 }
+/* May this referee score this match? Organizer-set limits (sports / games) and, when switched on, match assignment. Chiefs may score everything. */
+function refScope(r) {
+  if (!r || (!r.sports.length && !r.eventIds.length)) return '';
+  return [...r.sports.map((x) => SPORT_NAMES[x] || x), ...r.eventIds.map((id) => (find('events', id) || {}).name).filter(Boolean)].join(', ');
+}
+function checkRef(user, match) {
+  if (!user.refId) return;
+  if (user.personId && inMatch(user.personId, match)) throw new HttpError(403, 'You (or your team) play in this match, so you cannot referee it.');
+  if (user.kind === 'chief') return;
+  if (db.tournament.enforceReferee && (match.refereeIds || []).length && !match.refereeIds.includes(user.refId)) throw new HttpError(403, 'This match is assigned to another referee.');
+  const r = find('referees', user.refId), ev = find('events', match.eventId);
+  if (r && ev && (r.sports.length || r.eventIds.length) && !r.eventIds.includes(ev.id) && !r.sports.includes(ev.sport) && !(ev.refereeIds || []).includes(r.id)) throw new HttpError(403, 'You are set up to referee ' + refScope(r) + ' only. Ask the organizer to change this.');
+}
+const SPORT_NAMES = { badminton: 'Badminton', tt: 'Table tennis', carrom: 'Carrom', chess: 'Chess', other: 'Other' };
+/* Per-season records for all-time rankings (past seasons are frozen when the next season starts). */
+const seasonPublic = (x, mode) => ({ id: x.id, name: x.name, startedAt: x.startedAt, endedAt: x.endedAt, champions: x.champions || [], matches: x.matches || 0,
+  records: mode === 'public' ? Object.fromEntries(Object.entries(x.records || {}).filter(([pid]) => find('players', pid))) : x.records || {} });
+
 function publicState(mode) {
   const isAdmin = mode === 'admin', names = mode === 'public' ? publicNames() : null;
   const { signers, ...tour } = db.tournament;
@@ -408,9 +504,12 @@ function publicState(mode) {
   return {
     tournament: { ...tour, signers },
     players: db.players.filter((p) => isAdmin || p.status !== 'pending').map((p) => publicPlayer(p, mode, names)),
-    teams: db.teams.map(({ captainHash, ...t }) => ({ ...t, hasCode: !!captainHash })), referees: db.referees.map((r) => ({ id: r.id, name: mode === 'public' ? refDisplay(r) : r.name, kind: r.kind })), events: db.events,
+    teams: db.teams.map(({ captainHash, ...t }) => ({ ...t, hasCode: !!captainHash })), referees: db.referees.filter((r) => isAdmin || r.status !== 'pending').map((r) => ({ id: r.id, name: mode === 'public' ? refDisplay(r) : r.name, kind: r.kind, sports: r.sports, eventIds: r.eventIds, status: r.status, playerId: r.playerId || '', ...(isAdmin ? { phone: r.phone, note: r.note, signedUpAt: r.signedUpAt } : {}) })),
+    seasons: db.seasons.map((x) => seasonPublic(x, mode)),
+    tournaments: db.tournaments.map((T) => ({ id: T.id, kind: T.kind || '', name: T.name, dates: T.dates, venue: T.venue, status: T.status, createdAt: T.createdAt, createdBy: isAdmin ? T.createdBy : '', organizerIds: T.organizerIds, refereeIds: T.refereeIds, playerIds: T.playerIds })),
+    organizers: db.admins.map((a) => (isAdmin ? { id: a.id, name: a.name, sports: a.sports || [], limited: !!a.limited } : { id: a.id, name: mode === 'public' ? firstOf(a.name) : a.name })), events: db.events,
     matches: db.matches.map(({ cids, lock, ...m00 }) => { const m0 = mode === 'public' ? (panic().hideScoreboard ? blankScores(m00) : paperPublic(m00)) : m00; const m = mode === 'public' && !tieRevealed(m0) ? hideLineups(m0) : m0; const o = flaggedSet.has(m.id) ? { ...m, flagged: true } : m; return m.rubbers ? { ...o, rubbers: m.rubbers.map(({ cids: c2, ...r }) => r) } : o; }),
-    sponsors: db.sponsors, gallery: mode === 'public' ? db.gallery.filter((g) => g.consent !== false && (!g.minors || db.tournament.showKidsPhotos)).map((g) => ({ ...g, caption: '' })) : db.gallery.filter((g) => isAdmin || !g.minors || db.tournament.showKidsPhotos),
+    sponsors: db.sponsors, gallery: (mode === 'public' ? db.gallery.filter((g) => g.consent !== false && (!g.minors || db.tournament.showKidsPhotos)) : db.gallery.filter((g) => isAdmin || !g.minors || db.tournament.showKidsPhotos)).map(({ delHash, ...g }) => g),
     feed: (db.feed || []).slice(-60).reverse(),
     panic: { freezeScoring: !!panic().freezeScoring, lockedEvents: panic().lockedEvents, hideScoreboard: !!panic().hideScoreboard },
     registration: regPublic(isAdmin), vapidPublicKey: db.vapid.publicKey, serverTime: Date.now(),
@@ -495,6 +594,62 @@ async function notify(m, title, body) {
   await pushTo((s) => !s.approvalOnly && (!(s.follow && s.follow.length) || s.follow.some((f) => ids.has(f))), title, body, '/#/match/' + m.id);
 }
 
+/* ---------------------------------------------------------- WhatsApp notify */
+const WA = { token: process.env.WHATSAPP_TOKEN || '', phoneId: process.env.WHATSAPP_PHONE_ID || '', template: process.env.WHATSAPP_TEMPLATE || '', lang: process.env.WHATSAPP_LANG || 'en', cc: String(process.env.PHONE_COUNTRY_CODE || '91').replace(/\D/g, '') || '91' };
+WA.on = !!(WA.token && WA.phoneId);
+/* "98765 43210" -> "919876543210" (international digits for wa.me / the Cloud API). */
+function waPhone(v) {
+  const raw = String(v || '').trim(); let d = raw.replace(/\D/g, '');
+  if (!d) return '';
+  if (raw.startsWith('+')) return d.length >= 8 ? d : '';
+  if (d.startsWith('00')) d = d.slice(2);
+  else if (d.length === 11 && d.startsWith('0')) d = WA.cc + d.slice(1);
+  else if (d.length === 10) d = WA.cc + d;
+  return d.length >= 8 && d.length <= 15 ? d : '';
+}
+function slotText(m) {
+  if (m.startsAt && SLOT_RE.test(m.startsAt)) {
+    const t = new Date(m.startsAt + ':00Z');
+    return t.toLocaleString('en-IN', { timeZone: 'UTC', weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+  }
+  return m.time || '';
+}
+/* Everyone who plays the match: the players themselves, or every member of the teams. */
+function matchPeople(m, ev) {
+  const ids = [...(m.sideA || []), ...(m.sideB || [])];
+  const pids = ev.sideType === 'team' ? ids.flatMap((t) => (find('teams', t) || {}).memberIds || []) : ids;
+  return [...new Set(pids)].map((id) => find('players', id)).filter(Boolean);
+}
+function notifyPlan(m, ev, base, custom) {
+  const T = tour(ev.tid), title = ev.name + (m.no ? ' – Match #' + m.no : '');
+  const vs = sideName(ev, m.sideA) + ' vs ' + sideName(ev, m.sideB);
+  const refs = (m.refereeIds || []).map((id) => (find('referees', id) || {}).name).filter(Boolean);
+  const when = slotText(m), link = base + '/#/match/' + m.id;
+  const line = [title, vs, m.court, when].filter(Boolean).join(' • ');
+  const def = 'Hi {name}, your ' + (T && T.kind !== 'friendly' ? T.name + ' ' : '') + 'match is coming up.\n' +
+    '🏅 ' + title + '\n' + vs + (when ? '\n🕒 ' + when : '') + (m.court ? '\n📍 ' + m.court : '') + (refs.length ? '\nReferee: ' + refs.join(', ') : '') +
+    '\nPlease report on time. Live score: {link}';
+  const template = str(custom, 1500) || def;
+  const recipients = [], missing = [];
+  for (const pl of matchPeople(m, ev)) {
+    const phone = waPhone(pl.phone) || waPhone(pl.guardianPhone);
+    const first = String(pl.name || '').split(' ')[0] || 'there';
+    if (!phone) { missing.push(pl.name); continue; }
+    recipients.push({ id: pl.id, name: pl.name, first, phone, text: template.replace(/\{name\}/g, first).replace(/\{link\}/g, link) });
+  }
+  return { template, recipients, missing, line, link, title };
+}
+/* WhatsApp Cloud API (Meta). Messages a player did not start need an approved template:
+   set WHATSAPP_TEMPLATE to its name; its body gets {{1}} = first name, {{2}} = match line, {{3}} = link. */
+function waSend(to, text, first, line, link) {
+  const body = WA.template
+    ? { messaging_product: 'whatsapp', to, type: 'template', template: { name: WA.template, language: { code: WA.lang }, components: [{ type: 'body', parameters: [first, line, link].map((t) => ({ type: 'text', text: String(t).slice(0, 900) })) }] } }
+    : { messaging_product: 'whatsapp', to, type: 'text', text: { body: text, preview_url: true } };
+  return fetch('https://graph.facebook.com/v20.0/' + encodeURIComponent(WA.phoneId) + '/messages', {
+    method: 'POST', headers: { Authorization: 'Bearer ' + WA.token, 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15000),
+  }).then(async (r) => { if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error((j.error && j.error.message) || 'WhatsApp error ' + r.status); } });
+}
+
 /* Possible duplicates for the organizer to review: same phone, same email, or the same / very similar name. */
 function dupCandidates(pl) {
   const dg = (x) => String(x || '').replace(/\D/g, ''), norm = (x) => String(x || '').toLowerCase().replace(/[^a-z]/g, '');
@@ -509,6 +664,7 @@ function mergePlayers(fromId, intoId, who) {
   if (!a || !b || a === b) throw new HttpError(400, 'Choose two different players');
   if (db.matches.some((m) => { const ids = [...m.sideA, ...m.sideB]; return ids.includes(a.id) && ids.includes(b.id); })) throw new HttpError(409, 'These two players are in the same match; delete that match first.');
   const swap = (arr) => [...new Set((arr || []).map((x) => (x === a.id ? b.id : x)))];
+  db.tournaments.forEach((t) => { t.playerIds = swap(t.playerIds); });
   db.events.forEach((e) => { e.participantIds = swap(e.participantIds); if (e.interestedIds) e.interestedIds = [...new Set(swap(e.interestedIds))]; if (e.withdrawn) e.withdrawn = swap(e.withdrawn); });
   db.teams.forEach((t) => { t.memberIds = swap(t.memberIds); if (t.captainId === a.id) t.captainId = b.id; });
   db.matches.forEach((m) => {
@@ -593,6 +749,12 @@ function normEvent(b, prev) {
   const sideType = (b.sideType || prev.sideType) === 'team' ? 'team' : 'player';
   const participantIds = Array.isArray(b.participantIds) ? [...new Set(b.participantIds.map(String))] : prev.participantIds || [];
   checkSection(participantIds, sideType === 'team' ? 'teams' : 'players', section);
+  const tid = b.tid && tour(String(b.tid)) ? String(b.tid) : prev.tid && tour(prev.tid) ? prev.tid : defTid();
+  if (Array.isArray(b.participantIds)) {
+    const before = new Set(prev.tid === tid ? prev.participantIds || [] : []);
+    const bad = participantIds.filter((id) => !before.has(id) && (sideType === 'team' ? (find('teams', id) || {}).tid !== tid : !inRoster(tid, id)));
+    if (bad.length) throw new HttpError(400, bad.map((id) => (find(sideType === 'team' ? 'teams' : 'players', id) || {}).name).join(', ') + (sideType === 'team' ? ' – team is not part of ' : ' – not registered for ') + ((tour(tid) || {}).name || 'this event') + '. Players join an event by registering, by an uploaded player list, or by being enrolled.');
+  }
   const sideSize = Number(b.sideSize || prev.sideSize) === 2 ? 2 : 1;
   const ageMin = clampN(b.ageMin != null ? b.ageMin : prev.ageMin, 0, 99, 0);
   let ageMax = clampN(b.ageMax != null ? b.ageMax : prev.ageMax, 0, 99, 0); if (ageMax && ageMax < ageMin) ageMax = ageMin;
@@ -627,7 +789,9 @@ function normEvent(b, prev) {
     note: str(b.note != null ? b.note : prev.note || '', 300), participantIds, config,
     maxParticipants: Math.max(0, Math.min(500, Math.round(num(b.maxParticipants, prev.maxParticipants || 0)))),
     selfRegister: b.selfRegister != null ? !!b.selfRegister : prev.selfRegister !== false,
-    withdrawn: (prev.withdrawn || []).filter((x) => participantIds.includes(x)), interestedIds: prev.interestedIds || [],
+    withdrawn: (prev.withdrawn || []).filter((x) => participantIds.includes(x)), interestedIds: prev.interestedIds || [], tid,
+    organizerIds: Array.isArray(b.organizerIds) ? [...new Set(b.organizerIds.map(String))].filter((id) => db.admins.some((a) => a.id === id)) : prev.organizerIds || [],
+    refereeIds: Array.isArray(b.refereeIds) ? [...new Set(b.refereeIds.map(String))].filter((id) => find('referees', id)) : prev.refereeIds || [],
     ...(prev.frozenCount != null ? { frozenCount: prev.frozenCount } : {}),
   };
 }
@@ -642,6 +806,10 @@ function normMatch(b, prev) {
   if (new Set(all).size !== all.length) throw new HttpError(400, 'The same player/team is selected twice');
   const col = ev.sideType === 'team' ? 'teams' : 'players';
   checkSection(all, col, ev.section || 'adults');
+  const T = tour(ev.tid);
+  if (T && T.status === 'closed') throw new HttpError(409, T.name + ' is closed.');
+  if (!prev.id) { const bad = all.filter((id) => (ev.sideType === 'team' ? (find('teams', id) || {}).tid !== ev.tid : !inRoster(ev.tid, id)));
+    if (bad.length) throw new HttpError(400, bad.map((id) => (find(col, id) || {}).name).join(', ') + ' – not registered for ' + (T ? T.name : 'this event') + '.'); }
   const lineup = (key, ids) => {
     if (ev.sideType !== 'team') return [];
     const src = b[key] !== undefined ? b[key] : prev[key] || [];
@@ -654,10 +822,19 @@ function normMatch(b, prev) {
     ...(prev.rubbers ? { rubbers: prev.rubbers } : ev.sideType === 'team' && (ev.rubbers || []).length ? { rubbers: makeRubbers(ev) } : {}),
     sideA, sideB, lineupA: lineup('lineupA', sideA), lineupB: lineup('lineupB', sideB),
     court: str(b.court != null ? b.court : prev.court || '', 30), time: str(b.time != null ? b.time : prev.time || '', 30), startsAt,
-    round: Math.max(0, Math.round(num(b.round, prev.round || 0))), totalRounds: Math.max(0, Math.min(99, Math.round(num(b.totalRounds, prev.totalRounds || 0)))), ...matchCfg(b, prev), refereeId: b.refereeId !== undefined ? str(b.refereeId, 20) : prev.refereeId || '',
+    round: Math.max(0, Math.round(num(b.round, prev.round || 0))), totalRounds: Math.max(0, Math.min(99, Math.round(num(b.totalRounds, prev.totalRounds || 0)))), ...matchCfg(b, prev), refereeIds: (() => {
+      const ids = Array.isArray(b.refereeIds) ? b.refereeIds.map(String) : b.refereeId !== undefined ? (b.refereeId ? [str(b.refereeId, 20)] : []) : prev.refereeIds || (prev.refereeId ? [prev.refereeId] : []);
+      const ok = [...new Set(ids)].filter((id) => find('referees', id)).slice(0, ev.sideType === 'team' ? 6 : 2);
+      const clash = ok.map((id) => find('referees', id)).filter((r) => r.playerId && inMatch(r.playerId, { sideA, sideB }));
+      if (clash.length && (Array.isArray(b.refereeIds) || b.refereeId !== undefined)) throw new HttpError(400, clash.map((r) => r.name).join(', ') + ' play' + (clash.length > 1 ? '' : 's') + ' in this match and cannot referee it.');
+      return ok.filter((id) => !clash.some((r) => r.id === id));
+    })(),
     log: prev.log || [], cids: prev.cids || [], result: prev.result || null, createdAt: prev.createdAt || Date.now(), ...(prev.startedAt ? { startedAt: prev.startedAt } : {}),
     ...(prev.walkover ? { walkover: prev.walkover } : {}), ...(prev.retired ? { retired: prev.retired } : {}), ...(prev.outcome ? { outcome: prev.outcome } : {}), ...(prev.lock ? { lock: prev.lock } : {}),
     ...(prev.notified15 && startsAt === prev.startsAt ? { notified15: true } : {}),
+    ...(prev.notified ? { notified: prev.notified } : {}),
+    ...(prev.eventId === ev.id ? { ...(prev.no ? { no: prev.no } : {}), ...(prev.plannedNo ? { plannedNo: prev.plannedNo } : {}), ...(prev.startSeq ? { startSeq: prev.startSeq } : {}) } : {}),
+    ...(prev.paper ? { paper: prev.paper } : {}),
   };
 }
 
@@ -727,6 +904,7 @@ const COLS = {
       profilePublic: typeof b.profilePublic === 'boolean' ? b.profilePublic : p ? p.profilePublic : sec !== 'kids',
       career: (p && p.career) || [], createdAt: (p && p.createdAt) || Date.now(),
       guardianName: own('guardianName', 60), guardianPhone: own('guardianPhone', 30),
+      pinHash: (p && p.pinHash) || '', pinIdx: (p && p.pinIdx) || '',
       status: (p && p.status) || 'approved', requestedEventIds: (p && p.requestedEventIds) || [], registeredAt: (p && p.registeredAt) || 0, consentAt: (p && p.consentAt) || 0, editTokenHash: (p && p.editTokenHash) || '',
     };
   },
@@ -734,14 +912,20 @@ const COLS = {
     const section = SECTIONS.includes(b.section) ? b.section : (p && p.section) || 'adults';
     const memberIds = Array.isArray(b.memberIds) ? b.memberIds.map(String) : (p && p.memberIds) || [];
     checkSection(memberIds, 'players', section);
+    const tid = b.tid && tour(String(b.tid)) ? String(b.tid) : (p && p.tid && tour(p.tid)) ? p.tid : defTid();
+    if (Array.isArray(b.memberIds)) { const bad = memberIds.filter((id) => !inRoster(tid, id) && !((p && p.memberIds) || []).includes(id)); if (bad.length) throw new HttpError(400, bad.map((id) => (find('players', id) || {}).name).join(', ') + ' – not registered for ' + ((tour(tid) || {}).name || 'this event')); }
     const cap = b.captainId !== undefined ? String(b.captainId || '') : (p && p.captainId) || '';
-    return { id: (p && p.id) || uid(), name: needName(b, p), section, memberIds, color: str(b.color != null ? b.color : (p && p.color) || '', 20), captainId: memberIds.includes(cap) ? cap : '', ...(p && p.captainHash ? { captainHash: p.captainHash } : {}) };
+    return { id: (p && p.id) || uid(), name: needName(b, p), section, memberIds, tid, color: str(b.color != null ? b.color : (p && p.color) || '', 20), captainId: memberIds.includes(cap) ? cap : '', ...(p && p.captainHash ? { captainHash: p.captainHash } : {}) };
   },
   referees: (b, p) => {
     let plain = null;
     if (/^\d{4,8}$/.test(String(b.pin || ''))) plain = String(b.pin); else if (!p || b.resetPin) plain = pinN(4);
     const kind = ['referee', 'chief', 'volunteer'].includes(b.kind) ? b.kind : (p && p.kind) || 'referee';
-    return { id: (p && p.id) || uid(), name: needName(b, p), kind, pinHash: plain ? hashPin(plain) : p.pinHash, _plain: plain };
+    const sports = Array.isArray(b.sports) ? [...new Set(b.sports.filter((x) => SPORTS.includes(x)))] : (p && p.sports) || [];
+    const eventIds = Array.isArray(b.eventIds) ? [...new Set(b.eventIds.map(String).filter((x) => find('events', x)))] : (p && p.eventIds) || [];
+    const status = p && p.status === 'pending' && !plain ? 'pending' : 'active';
+    return { id: (p && p.id) || uid(), name: needName(b, p), kind, sports, eventIds, status, phone: str(b.phone != null ? b.phone : (p && p.phone) || '', 30), note: str(b.note != null ? b.note : (p && p.note) || '', 200),
+      signedUpAt: (p && p.signedUpAt) || 0, pinHash: plain ? hashPin(plain) : p.pinHash, _plain: plain };
   },
   events: normEvent,
   matches: normMatch,
@@ -753,13 +937,15 @@ function cascadeDelete(col, id) {
   if (col === 'players') {
     if (used('player')) throw new HttpError(409, 'Player has matches. Delete those matches first.');
     db.teams.forEach((t) => (t.memberIds = t.memberIds.filter((x) => x !== id)));
+    db.tournaments.forEach((t) => { t.playerIds = t.playerIds.filter((x) => x !== id); });
     db.events.forEach((e) => { e.participantIds = e.participantIds.filter((x) => x !== id); e.interestedIds = (e.interestedIds || []).filter((x) => x !== id); });
   } else if (col === 'teams') {
     if (used('team')) throw new HttpError(409, 'Team has matches. Delete those matches first.');
     db.events.forEach((e) => { e.participantIds = e.participantIds.filter((x) => x !== id); e.interestedIds = (e.interestedIds || []).filter((x) => x !== id); });
   } else if (col === 'events') db.matches = db.matches.filter((m) => m.eventId !== id);
   else if (col === 'referees') {
-    db.matches.forEach((m) => { if (m.refereeId === id) m.refereeId = ''; });
+    db.matches.forEach((m) => { m.refereeIds = (m.refereeIds || []).filter((x) => x !== id); });
+    db.events.forEach((e) => { e.refereeIds = (e.refereeIds || []).filter((x) => x !== id); });
     Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].refId === id) delete db.sessions[t]; });
   }
   db[col] = db[col].filter((x) => x.id !== id);
@@ -773,7 +959,7 @@ function snapshot(col, id) {
   if (col === 'players') { db.teams.forEach((t) => t.memberIds.includes(id) && s.links.teams.push(t.id)); db.events.forEach((e) => e.participantIds.includes(id) && s.links.events.push(e.id)); }
   if (col === 'teams') db.events.forEach((e) => e.participantIds.includes(id) && s.links.events.push(e.id));
   if (col === 'events') s.matches = db.matches.filter((m) => m.eventId === id).map(clone);
-  if (col === 'referees') db.matches.forEach((m) => m.refereeId === id && s.links.matches.push(m.id));
+  if (col === 'referees') db.matches.forEach((m) => (m.refereeIds || []).includes(id) && s.links.matches.push(m.id));
   if (col === 'matches') { const ev = find('events', item.eventId); s.name = ev ? sideName(ev, item.sideA) + ' vs ' + sideName(ev, item.sideB) : 'Match'; }
   return s;
 }
@@ -791,7 +977,7 @@ function restoreTrash(sn) {
   db[col].push(it);
   (sn.links.teams || []).forEach((t) => { const x = find('teams', t); if (x && !x.memberIds.includes(it.id)) x.memberIds.push(it.id); });
   (sn.links.events || []).forEach((e) => { const x = find('events', e); if (x && !x.participantIds.includes(it.id)) x.participantIds.push(it.id); });
-  (sn.links.matches || []).forEach((m) => { const x = find('matches', m); if (x && col === 'referees') x.refereeId = it.id; });
+  (sn.links.matches || []).forEach((m) => { const x = find('matches', m); if (x && col === 'referees' && !(x.refereeIds || []).includes(it.id)) x.refereeIds = (x.refereeIds || []).concat(it.id); });
   if (col === 'events') (sn.matches || []).forEach((m) => { if (!find('matches', m.id)) db.matches.push(m); });
 }
 
@@ -816,7 +1002,22 @@ setInterval(() => {
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json',
   '.webmanifest': 'application/manifest+json', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon',
+  '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
 };
+const VIDEO_EXT = { 'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm' };
+/* ISO media (mp4 / mov: "ftyp" at byte 4) or Matroska/WebM (EBML header). */
+const looksLikeVideo = (buf, ext) => (ext === '.webm' ? buf.readUInt32BE(0) === 0x1a45dfa3 : buf.length > 12 && buf.toString('latin1', 4, 8) === 'ftyp');
+/* Streams a request body straight to disk (videos can be large); refuses beyond the limit. */
+function readBodyToFile(req, file, limit) {
+  return new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(file); let n = 0, failed = false;
+    const fail = (e) => { if (failed) return; failed = true; out.destroy(); fs.unlink(file, () => {}); reject(e); };
+    req.on('data', (c) => { n += c.length; if (n > limit) { fail(new HttpError(413, 'That file is too large (max ' + Math.round(limit / 1e6) + ' MB).')); req.destroy(); } });
+    req.on('error', fail); out.on('error', fail);
+    req.pipe(out); out.on('finish', () => { if (!failed) resolve(n); });
+  });
+}
+const maskPhone = (v) => { const d = String(v || '').replace(/\D/g, ''); return d.length < 5 ? (d ? '•••' : '') : d.slice(0, 2) + '•'.repeat(Math.max(3, d.length - 5)) + d.slice(-3); };
 const EXT_BY_TYPE = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp' };
 /* The file must really be the image type it claims to be (checks the first bytes, not just the header). */
 const looksLike = (buf, ext) => (ext === '.jpg' ? buf[0] === 0xff && buf[1] === 0xd8 : ext === '.png' ? buf[0] === 0x89 && buf.toString('latin1', 1, 4) === 'PNG' : buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP');
@@ -867,6 +1068,8 @@ function writeGames(match, b, who, tag) {
 /* ---------------------------------------------------- panic controls */
 const panic = () => (db.tournament.panic = db.tournament.panic || { freezeScoring: false, lockedEvents: [], hideScoreboard: false });
 function assertOpen(match) {
+  const T = match && tour((find('events', match.eventId) || {}).tid);
+  if (T && T.status === 'closed') throw new HttpError(423, T.name + ' is closed – scores can no longer change.');
   const pc = panic();
   if (pc.freezeScoring) throw new HttpError(423, 'Scoring is paused by the organizer. Please wait for the announcement.');
   if (match && pc.lockedEvents.includes(match.eventId)) throw new HttpError(423, 'This event is locked by the organizer.');
@@ -876,7 +1079,7 @@ function applyPaper(match, b, user) {
   const ev = find('events', match.eventId);
   if (!ev) throw new HttpError(404, 'Event not found');
   const live = (match.log || []).length || match.result || (match.rubbers || []).some((r) => (r.log || []).length || r.result);
-  if (live && !(user.role === 'referee' && user.kind === 'chief')) throw new HttpError(409, 'This match already has live scores. Ask the chief referee to correct it.');
+  if (live && !(user.refId && user.kind === 'chief')) throw new HttpError(409, 'This match already has live scores. Ask the chief referee to correct it.');
   if (ev.scoring === 'points') writeGames(match, b, user.name, 'paper');
   else {
     const r = b.result === 'draw' ? 'draw' : b.result === 'A' || b.result === 'B' ? b.result : '';
@@ -887,10 +1090,53 @@ function applyPaper(match, b, user) {
   match.paper = { by: user.name, at: Date.now(), signed: false, note: str(b.note, 120) };
   audit(user.name, 'score from paper sheet', str(b.note, 120), match.id);
 }
-const needStaff = (u) => { if (!u) throw new HttpError(401, 'Please sign in'); if (u.role === 'captain') throw new HttpError(403, 'Staff only.'); return u; };
-const needScorer = (u) => { needStaff(u); if (u.role !== 'referee' || u.kind === 'volunteer') throw new HttpError(403, 'Only referees can change scores. The organizer assigns referees.'); return u; };
-const needLineup = (u) => { if (u && u.role === 'captain') return u; needStaff(u); if (u.role === 'referee' && u.kind === 'volunteer') throw new HttpError(403, 'Volunteers cannot change line-ups.'); return u; };
-const sportOk = (u, ev) => !(u.sports && u.sports.length) || (ev && u.sports.includes(ev.sport));
+const isStaffU = (u) => !!u && !!(u.adminId || u.refId || u.role === 'admin' || u.role === 'referee');
+const needStaff = (u) => { if (!u) throw new HttpError(401, 'Please sign in'); if (!isStaffU(u)) throw new HttpError(403, 'Staff only.'); return u; };
+const needScorer = (u) => { needStaff(u); if (!u.refId || u.kind === 'volunteer') throw new HttpError(403, 'Only referees can change scores. The organizer assigns referees.'); return u; };
+/* Does this person play in the game – themselves, on its interested list, or as a member of a team entered in it? */
+/* Is this person on either side of the match – as a player, or as a member of a team that is playing it? */
+const inMatch = (pid, m) => !!pid && [...(m.sideA || []), ...(m.sideB || [])].some((id) => id === pid || ((find('teams', id) || {}).memberIds || []).includes(pid));
+const playsIn = (pid, ev) => !!(pid && ev) && ((ev.participantIds || []).includes(pid) || (ev.interestedIds || []).includes(pid) || (ev.participantIds || []).some((tid) => ((find('teams', tid) || {}).memberIds || []).includes(pid)));
+const needLineup = (u) => { if (u && u.role === 'captain') return u; needStaff(u); if (u.refId && !u.adminId && u.kind === 'volunteer') throw new HttpError(403, 'Volunteers cannot change line-ups.'); return u; };
+/* Full organizers manage everything. A sport lead manages their sports; a game organizer ("limited") manages only the games they organize. */
+const isLead = (u) => !!(u && ((u.sports && u.sports.length) || u.limited));
+const sportOk = (u, ev) => !isLead(u) || (!!ev && ((u.sports || []).includes(ev.sport) || (ev.organizerIds || []).includes(u.adminId) || tourOrg(u, ev.tid)));
+const canTour = (u, tid) => !!u && u.role === 'admin' && (!isLead(u) || tourOrg(u, tid));
+function newOrganizer(name, o) {
+  let pin; do { pin = pinN(8); } while (db.admins.some((a) => checkPin(pin, a.pinHash)));
+  const a = { id: uid(), name: str(name, 40), pinHash: hashPin(pin), sports: o.sports || [], limited: !!o.limited }; db.admins.push(a);
+  return Object.defineProperty(a, '_pin', { value: pin, enumerable: false, configurable: true, writable: true });
+}
+/* Who does this PIN belong to? Players (people), plus older admin / referee / captain PINs that are not yet a person's PIN. */
+function findByPin(pin) {
+  const idx = pinIdx(pin), lists = [['player', db.players], ['admin', db.admins], ['referee', db.referees], ['captain', db.teams]];
+  for (const [kind, list] of lists) for (const rec of list) { const h = kind === 'captain' ? rec.captainHash : rec.pinHash; if (h && rec.pinIdx === idx && checkPin(pin, h)) return { kind, rec }; }
+  for (const [kind, list] of lists) for (const rec of list) {   // older PINs without a fingerprint: check, then remember the fingerprint
+    const h = kind === 'captain' ? rec.captainHash : rec.pinHash;
+    if (kind !== 'player' && h && !rec.pinIdx && checkPin(pin, h)) { rec.pinIdx = idx; return { kind, rec }; }
+  }
+  return null;
+}
+/* One session carries every role the person has: admin / organizer, referee, team captain, player. */
+function sessionFor(who) {
+  const r0 = who.rec;
+  const personId = who.kind === 'player' ? r0.id : who.kind === 'captain' ? r0.captainId || '' : r0.playerId || '';
+  const pl = personId ? find('players', personId) : null;
+  const a = who.kind === 'admin' ? r0 : personId ? db.admins.find((x) => x.playerId === personId) : null;
+  const rf = who.kind === 'referee' ? r0 : personId ? db.referees.find((x) => x.playerId === personId && x.status !== 'pending') : null;
+  if (who.kind === 'referee' && r0.status === 'pending') return null;
+  const cap = who.kind === 'captain' ? r0 : personId ? db.teams.find((t) => t.captainId === personId) : null;
+  const role = a ? 'admin' : rf ? 'referee' : cap ? 'captain' : 'player';
+  return { role, name: (pl && pl.name) || (a && a.name) || (rf && rf.name) || (cap && cap.name) || 'Player', personId,
+    ...(a ? { adminId: a.id, sports: a.sports || [], limited: !!a.limited } : {}), ...(rf ? { refId: rf.id, kind: rf.kind || 'referee' } : {}), ...(cap ? { teamId: cap.id } : {}),
+    exp: Date.now() + (a ? 12 : 36) * 3600e3 };
+}
+const sessOut = (token, s0) => ({ token, role: s0.role, name: s0.name, kind: s0.kind || '', sports: s0.sports || [], limited: !!s0.limited, adminId: s0.adminId || '', refId: s0.refId || '', personId: s0.personId || '', teamId: s0.teamId || '' });
+/* A fresh, unique 6-digit PIN that is not trivial. */
+function newPersonPin() {
+  for (;;) { const pin = String(crypto.randomInt(100000, 1000000)); if (/^(\d)\1+$/.test(pin) || '0123456789'.includes(pin) || '9876543210'.includes(pin)) continue; if (!findByPin(pin)) return pin; }
+}
+function givePin(pl) { const pin = newPersonPin(); pl.pinHash = hashPin(pin); pl.pinIdx = pinIdx(pin); return pin; }
 const needAdmin = (u) => { needStaff(u); if (u.role !== 'admin') throw new HttpError(403, 'Admin only'); return u; };
 
 const fileCache = new Map();   /* app files are read once, compressed once, and revalidated with an ETag */
@@ -901,6 +1147,18 @@ function serveFile(req, res, file, cache, extra) {
     const etag = 'W/"' + st.size + '-' + Math.round(st.mtimeMs) + '"';
     const headers = { 'Content-Type': type, 'Cache-Control': cache || 'no-cache', ETag: etag, ...(extra || {}) };
     if (req.headers['if-none-match'] === etag) { res.writeHead(304, headers); return res.end(); }
+    if (st.size > 2e6 || /^video\//.test(type)) {   // big files and videos: stream, with byte ranges (iPhones need them to play video)
+      headers['Accept-Ranges'] = 'bytes';
+      const r = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ''));
+      if (r && (r[1] || r[2])) {
+        let start = r[1] ? Number(r[1]) : Math.max(0, st.size - Number(r[2])), end = r[1] && r[2] ? Math.min(Number(r[2]), st.size - 1) : st.size - 1;
+        if (start > end || start >= st.size) { res.writeHead(416, { 'Content-Range': 'bytes */' + st.size }); return res.end(); }
+        res.writeHead(206, { ...headers, 'Content-Range': 'bytes ' + start + '-' + end + '/' + st.size, 'Content-Length': end - start + 1 });
+        return fs.createReadStream(file, { start, end }).pipe(res);
+      }
+      res.writeHead(200, { ...headers, 'Content-Length': st.size });
+      return req.method === 'HEAD' ? res.end() : fs.createReadStream(file).pipe(res);
+    }
     const zip = /^(text\/|application\/(json|manifest))/.test(type) && /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''));
     let hit = fileCache.get(file);
     const send = () => { if (zip) { res.writeHead(200, { ...headers, 'Content-Encoding': 'gzip', Vary: 'Accept-Encoding' }); res.end(hit.gz); } else { res.writeHead(200, headers); res.end(hit.buf); } };
@@ -914,12 +1172,164 @@ function serveFile(req, res, file, cache, extra) {
   });
 }
 
-async function exportXlsx(admin) {
+/* CSV / TSV text (e.g. a Google Forms export) -> rows. Handles quotes, commas or tabs, Windows line ends. */
+function parseDelimited(text) {
+  text = text.replace(/^\uFEFF/, '');
+  const first = text.split(/\r?\n/, 1)[0], sep = (first.match(/\t/g) || []).length > (first.match(/,/g) || []).length ? '\t' : first.includes(';') && !first.includes(',') ? ';' : ',';
+  const rows = []; let row = [], cur = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (q) { if (ch === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += ch; continue; }
+    if (ch === '"' && cur === '') q = true;
+    else if (ch === sep) { row.push(cur); cur = ''; }
+    else if (ch === '\n' || ch === '\r') { if (ch === '\r' && text[i + 1] === '\n') i++; row.push(cur); rows.push(row); row = []; cur = ''; }
+    else cur += ch;
+  }
+  if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
+  return rows.slice(0, 5000);
+}
+async function loadWorkbook(buf) {
+  const ExcelJS = require('exceljs'); const wb = new ExcelJS.Workbook();
+  if (buf.length > 1 && !(buf[0] === 0x50 && buf[1] === 0x4b)) {   // not a zip (xlsx) -> try CSV / TSV text
+    const text = buf.toString('utf8');
+    if (/[\x00-\x08\x0E-\x1F]/.test(text.slice(0, 2000))) throw new HttpError(400, 'Please upload an Excel (.xlsx) or CSV file. Old .xls files: open in Excel and "Save as" .xlsx.');
+    const ws = wb.addWorksheet('Sheet1'); parseDelimited(text).forEach((r) => ws.addRow(r));
+    if (!ws.rowCount) throw new HttpError(400, 'The file is empty.');
+    return wb;
+  }
+  try { await wb.xlsx.load(buf); } catch (e) { throw new HttpError(400, 'That does not look like an Excel (.xlsx) or CSV file.'); }
+  if (!wb.worksheets.length) throw new HttpError(400, 'The workbook is empty.');
+  return wb;
+}
+/* Which sheets to import and how. Header x-import-options =
+   {"sheets":[{index, kind: players|games|teams|fixtures, headerRow, map:{field:col}, eventId, section, sportMap}]}.
+   Without it: every sheet whose kind is recognised, with the automatic column mapping. */
+const IMPORT_KINDS = ['players', 'games', 'teams', 'fixtures'];
+function importPlan(wb, header, evs) {
+  let opt = null;
+  if (header) { try { opt = JSON.parse(header); } catch (e) { throw new HttpError(400, 'Bad import options'); } }
+  const one = (ws, o) => {
+    const auto = SheetImport.inspectSheet(ws, evs);
+    const kind = IMPORT_KINDS.includes(o.kind) ? o.kind : auto.kind;
+    if (kind !== 'players') {
+      if (!IMPORT_KINDS.includes(kind)) return null;
+      const k = SheetImport.sheetKind(ws);
+      const kc = k.kind === kind ? k.cols : {};
+      return { ws, kind, headerRow: k.kind === kind ? k.headerRow : auto.headerRow, cols: kc };
+    }
+    const map = {}, src = o.map && typeof o.map === 'object' ? o.map : auto.map;
+    SheetImport.FIELD_KEYS.forEach((k) => { const c = Math.floor(Number(src[k])); if (c >= 1 && c <= 60) map[k] = c; });
+    if (!map.name && !map.firstName) throw new HttpError(400, 'Sheet "' + ws.name + '": choose which column holds the player name.');
+    const headerRow = Math.max(1, Math.min(50, Math.floor(Number(o.headerRow)) || auto.headerRow));
+    const used = new Set(Object.values(map));
+    const sportMap = {};
+    if (o.sportMap && typeof o.sportMap === 'object') Object.entries(o.sportMap).slice(0, 20).forEach(([k, v]) => { if (/^[a-z]+\|(adults|kids)$/.test(k) && (v === 'skip' || evs.some((e) => e.id === v))) sportMap[k] = v; });
+    return { ws, kind, headerRow, map, eventCols: auto.eventCols.filter((x) => !used.has(x.col)), sportCols: auto.sportCols.filter((x) => !used.has(x.col)), sportMap, eventId: evs.some((e) => e.id === o.eventId) ? o.eventId : '', section: ['adults', 'kids'].includes(o.section) ? o.section : '' };
+  };
+  const plan = (opt && Array.isArray(opt.sheets)
+    ? opt.sheets.slice(0, 50).map((o) => { const ws = wb.worksheets[Number(o.index)]; if (!ws) throw new HttpError(400, 'Sheet not found'); return one(ws, o); })
+    : wb.worksheets.map((ws) => one(ws, {}))).filter(Boolean);
+  if (!plan.length) throw new HttpError(400, opt ? 'Choose at least one sheet to import.' : 'No sheet with players, games, teams or fixtures was found (a players sheet needs a "Name" column).');
+  return plan;
+}
+/* Games, teams and fixtures sheets (players have their own, richer path in the import endpoint). Latest sheet wins. */
+function importOthers(sheets, kind, errors, warnings, tid, evs) {
+  const out = { rowsBySheet: {} }, nm = (t) => String(t || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const playerByName = (name, section) => { const hits = db.players.filter((p) => p.status !== 'rejected' && (p.section || 'adults') === section && nm(p.name) === nm(name) && inRoster(tid, p.id)); return hits.length === 1 ? hits[0] : hits.length ? 'many' : null; };
+  for (const sh of sheets) {
+    const W = (row, name, error) => warnings.push({ sheet: sh.ws.name, row, name, error });
+    const E = (row, name, error) => errors.push({ sheet: sh.ws.name, row, name, error });
+    if (kind === 'games') {
+      const rows = SheetImport.readGames(sh.ws, sh.headerRow, sh.cols); out.rowsBySheet[sh.ws.name] = rows.length;
+      rows.forEach((g) => {
+        if (evs.some((e) => nm(e.name) === nm(g.name) && (e.section || 'adults') === g.section)) { out.gamesExisting = (out.gamesExisting || 0) + 1; return; }
+        const like = evs.find((e) => e.sport === g.sport && (e.section || 'adults') === g.section && e.sideType === g.sideType) || evs.find((e) => e.sport === g.sport);
+        try {
+          const ev = normEvent({ name: g.name, section: g.section, sport: g.sport, sideType: g.sideType, sideSize: g.sideType === 'team' ? 1 : g.sideSize, scoring: like ? like.scoring : g.sport === 'chess' ? 'result' : 'points',
+            config: { ...(like ? like.config : {}), ...(g.bestOf ? { bestOf: g.bestOf } : {}), ...(g.target ? { target: g.target } : {}) }, participantIds: [], tid }, null);
+          db.events.push(ev); evs.push(ev); out.gamesMade = (out.gamesMade || 0) + 1;
+        } catch (e) { E(g.row, g.name, e.message); }
+      });
+    }
+    if (kind === 'teams') {
+      const rows = SheetImport.readTeams(sh.ws, sh.headerRow, sh.cols); out.rowsBySheet[sh.ws.name] = rows.length;
+      rows.forEach((r) => {
+        const teamEvs = r.games.map((g) => SheetImport.eventByName(g, evs, r.section || undefined)).filter(Boolean);
+        r.games.filter((g) => !SheetImport.eventByName(g, evs)).forEach((g) => W(r.row, r.name, 'unknown game "' + g + '"'));
+        const section = r.section || (teamEvs[0] && teamEvs[0].section) || 'adults';
+        const ids = [];
+        r.members.forEach((mn) => { const p = playerByName(mn, section); if (p === 'many') W(r.row, r.name, 'two players are called "' + mn + '" – add them in the app'); else if (!p) W(r.row, r.name, 'player "' + mn + '" is not registered for this event – put them in a Players sheet of the same file'); else if (!ids.includes(p.id)) ids.push(p.id); });
+        let t = db.teams.find((x) => nm(x.name) === nm(r.name) && (x.section || 'adults') === section && x.tid === tid);
+        if (t) { if (r.members.length) t.memberIds = ids; out.teamsUpdated = (out.teamsUpdated || 0) + 1; }
+        else { t = COLS.teams({ name: r.name, section, memberIds: ids, tid }, null); db.teams.push(t); out.teamsCreated = (out.teamsCreated || 0) + 1; }
+        teamEvs.forEach((e) => {
+          if (e.sideType !== 'team') { W(r.row, r.name, e.name + ' is not a team game'); return; }
+          if ((e.section || 'adults') !== section) { W(r.row, r.name, e.name + ' is in the other section'); return; }
+          if (!e.participantIds.includes(t.id)) { e.participantIds.push(t.id); out.teamEntries = (out.teamEntries || 0) + 1; }
+          e.interestedIds = (e.interestedIds || []).filter((id) => !ids.includes(id));   // placed in a team now
+        });
+      });
+    }
+    if (kind === 'fixtures') {
+      const rows = SheetImport.readFixtures(sh.ws, sh.headerRow, sh.cols); out.rowsBySheet[sh.ws.name] = rows.length;
+      rows.forEach((f) => {
+        const label = f.sideA.join(' & ') + ' vs ' + f.sideB.join(' & ');
+        const ev = SheetImport.eventByName(f.game, evs); if (!ev) { E(f.row, label, f.game ? 'unknown game "' + f.game + '"' : 'no game given'); return; }
+        const sec = ev.section || 'adults', team = ev.sideType === 'team';
+        const resolve = (names) => names.map((n) => {
+          if (team) { const t = db.teams.filter((x) => (x.section || 'adults') === sec && x.tid === tid && nm(x.name) === nm(n)); if (t.length !== 1) throw new Error('team "' + n + '" not found'); return t[0].id; }
+          const p = playerByName(n, sec); if (p === 'many') throw new Error('two players are called "' + n + '"'); if (!p) throw new Error('player "' + n + '" is not registered for this event'); return p.id;
+        });
+        try {
+          const A = resolve(f.sideA), B = resolve(f.sideB);
+          const key = (x) => [...x].sort().join(',');
+          if (db.matches.some((m) => m.eventId === ev.id && m.stage === f.stage && (m.round || 0) === f.round && ((key(m.sideA) === key(A) && key(m.sideB) === key(B)) || (key(m.sideA) === key(B) && key(m.sideB) === key(A))))) { out.fixturesExisting = (out.fixturesExisting || 0) + 1; return; }
+          [...A, ...B].forEach((id) => { if (!ev.participantIds.includes(id)) ev.participantIds.push(id); });
+          const ref = f.referee ? db.referees.find((r) => nm(r.name) === nm(f.referee) && r.status !== 'pending') : null;
+          if (f.referee && !ref) W(f.row, label, 'referee "' + f.referee + '" not found');
+          const m = normMatch({ eventId: ev.id, sideA: A, sideB: B, stage: f.stage, round: f.round, group: f.group, startsAt: f.startsAt, time: f.time, court: f.court, refereeId: ref ? ref.id : '' }, null);
+          const c = findClashes(m); if (c.length) W(f.row, label, 'time clash: ' + c[0]);
+          db.matches.push(m); out.fixturesMade = (out.fixturesMade || 0) + 1;
+        } catch (e) { E(f.row, label, e.message); }
+      });
+    }
+  }
+  return out;
+}
+/* New organizers / referees: typed names ("Ravi, Asha") or people picked from the player list ({ playerId }). */
+function staffNames(x) {
+  const list = Array.isArray(x) ? x : String(x || '').split(',');
+  return list.map((v) => { if (v && typeof v === 'object') { const pl = v.playerId && find('players', String(v.playerId)); return { name: str(pl ? pl.name : v.name, 60).trim(), playerId: pl ? pl.id : '' }; } return { name: str(v, 60).trim(), playerId: '' }; })
+    .filter((v) => v.name).slice(0, 10);
+}
+/* An event's organizers and referees: existing ones and/or new ones (created with a PIN, shown once). At least one of each. */
+function tourStaff(b, pins, creator) {
+  const orgIds = (Array.isArray(b.organizerIds) ? b.organizerIds : []).map(String).filter((id) => db.admins.some((a) => a.id === id));
+  if (creator && creator.role === 'admin' && !orgIds.includes(creator.adminId)) orgIds.push(creator.adminId);
+  const refIds = (Array.isArray(b.refereeIds) ? b.refereeIds : []).map(String).filter((id) => { const r = find('referees', id); return r && r.status !== 'pending'; });
+  staffNames(b.newOrganizers).forEach((x) => { const a = newOrganizer(x.name, { sports: [], limited: true }); if (x.playerId) a.playerId = x.playerId; pins.push({ role: 'Organizer', name: a.name, pin: a._pin }); delete a._pin; orgIds.push(a.id); });
+  staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee' }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: r._plain }); delete r._plain; db.referees.push(r); refIds.push(r.id); });
+  if (!orgIds.length) throw new HttpError(400, 'An event needs at least one organizer – choose one or add a new one.');
+  if (!refIds.length) throw new HttpError(400, 'An event needs at least one referee – choose one or add a new one.');
+  return { organizerIds: [...new Set(orgIds)], refereeIds: [...new Set(refIds)] };
+}
+/* One game (sub-event) of an event, with the usual rules for its sport. */
+function makeGame(tid, g, staff) {
+  const sport = SPORTS.includes(g.sport) ? g.sport : 'other', section = g.section === 'kids' ? 'kids' : 'adults', kind = ['singles', 'doubles', 'team'].includes(g.kind) ? g.kind : 'singles';
+  const name = str(g.name, 80).trim() || ({ badminton: 'Badminton', tt: 'Table Tennis', carrom: 'Carrom', chess: 'Chess' }[sport] || 'Game') + (kind === 'doubles' ? ' – Doubles' : kind === 'team' ? ' – Team Event' : '') + (section === 'kids' ? ' (Kids)' : '');
+  if (db.events.some((e) => e.tid === tid && e.name.toLowerCase() === name.toLowerCase() && (e.section || 'adults') === section)) throw new HttpError(409, 'Duplicate game');
+  const like = db.events.find((e) => e.sport === sport && (e.section || 'adults') === section && (e.sideType === 'team') === (kind === 'team')) || [...seedEvents(), ...seedKidsEvents()].find((e) => e.sport === sport && e.section === section) || seedEvents().find((e) => e.sport === sport);
+  const ev = normEvent({ name, sport, section, sideType: kind === 'team' ? 'team' : 'player', sideSize: kind === 'doubles' ? 2 : 1, scoring: like ? like.scoring : 'points', config: like ? like.config : {}, participantIds: [], tid, ...staff }, null);
+  db.events.push(ev); return ev;
+}
+async function exportXlsx(admin, tid) {
   const ExcelJS = require('exceljs');
   const wb = new ExcelJS.Workbook();
   wb.creator = db.tournament.name;
-  for (const ev of db.events) {
-    const ws = wb.addWorksheet(((ev.section === 'kids' && !/^Kids/i.test(ev.name) ? 'Kids ' : '') + ev.name).replace(/[\\/*?:[\]]/g, '').slice(0, 31));
+  const used = new Set(['matches', 'players']);
+  const sheetName = (t) => { let base = t.replace(/[\\/*?:[\]]/g, '').slice(0, 28) || 'Game', n = base, i = 2; while (used.has(n.toLowerCase())) n = base.slice(0, 26) + ' ' + i++; used.add(n.toLowerCase()); return n; };
+  for (const ev of db.events.filter((e) => !tid || e.tid === tid)) {
+    const ws = wb.addWorksheet(sheetName((ev.section === 'kids' && !/^Kids/i.test(ev.name) ? 'Kids ' : '') + ev.name));
     ws.addRow([db.tournament.name + ' – ' + ev.name + (ev.section === 'kids' ? ' (Kids)' : '')]).font = { bold: true, size: 14 };
     ws.addRow([]);
     const hdr = ['Rank', ev.sideType === 'team' ? 'Team' : 'Player', 'Played', 'Won', 'Drawn', 'Lost', 'Points', 'Tally (scored)', 'Conceded', 'Point diff', 'Qualified'];
@@ -1044,7 +1454,7 @@ async function route(req, res, url) {
 
   if (p === '/api/state' && m === 'GET') {
     if (user && user.role === 'admin') return json(res, 200, publicState('admin'));
-    if (user && user.role === 'referee') return json(res, 200, publicState('staff'));
+    if (user && user.refId) return json(res, 200, publicState('staff'));
     const c = publicCache();
     if (req.headers['if-none-match'] === c.etag) { res.writeHead(304, { ETag: c.etag, 'Cache-Control': 'no-cache' }); return res.end(); }
     const gz = /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''));
@@ -1079,6 +1489,15 @@ async function route(req, res, url) {
     if (wait) throw new HttpError(429, 'Too many wrong PINs from this network. Try again in ' + Math.ceil(wait / 60000) + ' min.');
     if (lockedFor('glob:' + (b.role === 'admin' ? 'admin' : str(b.refereeId || b.teamId, 20)))) throw new HttpError(429, 'Sign-in is temporarily paused after many failed attempts. Try again in a few minutes.');
     let sess;
+    if (!b.role && !b.refereeId && !b.teamId) {   // one PIN per person
+      const pin = String(b.pin || '');
+      const fail = () => { recordFail(ipK, 8); recordFail('glob:pin', 60); throw new HttpError(401, 'Wrong PIN'); };
+      if (lockedFor('glob:pin')) throw new HttpError(429, 'Sign-in is temporarily paused after many failed attempts. Try again in a few minutes.');
+      if (!/^\d{4,10}$/.test(pin)) fail();
+      const who = findByPin(pin); if (!who) fail();
+      sess = sessionFor(who);
+      if (!sess) throw new HttpError(403, 'Your referee sign-up is waiting for the organizer to approve it.');
+    } else {
     const bad = () => { recordFail(ipK, 8); recordFail('glob:' + (b.role === 'admin' ? 'admin' : str(b.refereeId || b.teamId, 20)), b.role === 'admin' ? 25 : 5); throw new HttpError(401, 'Wrong PIN'); };
     if (b.role === 'captain') {
       const t = find('teams', b.teamId);
@@ -1087,11 +1506,13 @@ async function route(req, res, url) {
     } else if (b.role === 'admin') {
       const a = db.admins.find((x) => checkPin(String(b.pin || ''), x.pinHash));
       if (!a) bad();
-      sess = { role: 'admin', name: a.name, adminId: a.id, sports: a.sports || [], exp: Date.now() + 12 * 3600e3 };
+      sess = { role: 'admin', name: a.name, adminId: a.id, sports: a.sports || [], limited: !!a.limited, exp: Date.now() + 12 * 3600e3 };
     } else {
       const r = find('referees', b.refereeId);
+      if (r && r.status === 'pending') throw new HttpError(403, 'Your referee sign-up is waiting for the organizer to approve it.');
       if (!r || !checkPin(String(b.pin || ''), r.pinHash)) bad();
-      sess = { role: 'referee', name: r.name, refId: r.id, kind: r.kind || 'referee', exp: Date.now() + 36 * 3600e3 };
+      sess = { role: 'referee', name: r.name, refId: r.id, kind: r.kind || 'referee', personId: r.playerId || '', exp: Date.now() + 36 * 3600e3 };
+    }
     }
     fails.delete(ipK);
     Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].exp && db.sessions[t].exp < Date.now()) delete db.sessions[t]; });
@@ -1099,9 +1520,40 @@ async function route(req, res, url) {
     db.sessions[token] = sess;
     audit(sess.name, 'login', sess.role);
     save();
-    return json(res, 200, { token, role: sess.role, name: sess.name, kind: sess.kind || '', sports: sess.sports || [], teamId: sess.teamId || '' });
+    return json(res, 200, sessOut(token, sess));
   }
-  if (p === '/api/me' && m === 'GET') return json(res, 200, user ? { role: user.role, name: user.name, kind: user.kind || '', sports: user.sports || [] } : { role: null });
+  if (p === '/api/me' && m === 'GET') {
+    if (!user) return json(res, 200, { role: null });
+    const pl = user.personId && find('players', user.personId);
+    const mine = pl ? (({ pinHash, pinIdx: _i, editTokenHash, ...x }) => x)(pl) : null;
+    return json(res, 200, { ...sessOut(user.token, user), token: undefined, profile: mine, hasPin: !!(pl && pl.pinHash) });
+  }
+  /* My profile: change my PIN, add my photo. */
+  if (p === '/api/me/pin' && m === 'POST') {
+    if (!user || !user.personId) throw new HttpError(401, 'Sign in first.');
+    const pl = find('players', user.personId); if (!pl) throw new HttpError(404, 'Profile not found');
+    if (lockedFor('ip:' + ip)) throw new HttpError(429, 'Too many attempts. Try again later.');
+    const pin = String((await readJson(req, 500)).pin || '');
+    if (!/^\d{6,10}$/.test(pin)) throw new HttpError(400, 'Use 6 to 10 digits.');
+    if (/^(\d)\1+$/.test(pin) || '0123456789'.includes(pin) || '9876543210'.includes(pin)) throw new HttpError(400, 'That PIN is too easy to guess – choose another.');
+    const other = findByPin(pin);
+    if (other && !(other.kind === 'player' && other.rec === pl)) { recordFail('ip:' + ip, 8); throw new HttpError(400, 'Choose a different PIN.'); }   // counts like a wrong sign-in, so it cannot be used to guess PINs
+    pl.pinHash = hashPin(pin); pl.pinIdx = pinIdx(pin);
+    db.admins.forEach((a) => { if (a.playerId === pl.id) { a.pinHash = ''; a.pinIdx = ''; } });   // one PIN for everything
+    db.referees.forEach((r) => { if (r.playerId === pl.id) { r.pinHash = ''; r.pinIdx = ''; } });
+    audit(pl.name, 'changed own PIN'); save();
+    return json(res, 200, { ok: true });
+  }
+  if (p === '/api/me/photo' && m === 'POST') {
+    if (!user || !user.personId) throw new HttpError(401, 'Sign in first.');
+    const pl = find('players', user.personId); if (!pl) throw new HttpError(404, 'Profile not found');
+    limit('ph:' + ip, 30, 3600e3);
+    const buf = await readBody(req, 6e6), ext = EXT_BY_TYPE[String(req.headers['content-type'] || '')];
+    if (!ext || !buf.length || !looksLike(buf, ext)) throw new HttpError(400, 'Upload a JPG, PNG or WEBP photo');
+    const file = uid() + uid() + ext; fs.writeFileSync(path.join(UPLOAD_DIR, file), buf);
+    pl.photo = '/uploads/' + file; audit(pl.name, 'changed own photo'); save(); broadcast();
+    return json(res, 200, { ok: true, photo: pl.photo });
+  }
   if (p === '/api/logout' && m === 'POST') { if (user) { delete db.sessions[user.token]; save(); } return json(res, 200, { ok: true }); }
 
   /* ---- staff: scoring (batch of ops, idempotent) ---- */
@@ -1111,7 +1563,7 @@ async function route(req, res, url) {
     if (!match) throw new HttpError(404, 'Match not found');
     assertOpen(match);
     const ev = find('events', match.eventId);
-    if (user.role === 'referee' && user.kind !== 'chief' && db.tournament.enforceReferee && match.refereeId && match.refereeId !== user.refId) throw new HttpError(403, 'This match is assigned to another referee.');
+    checkRef(user, match);
     const b = await readJson(req);
     const myKey = user.role === 'admin' ? 'admin:' + (user.adminId || '') : 'ref:' + (user.refId || '');
     if (match.lock && match.lock.until > Date.now() && match.lock.key !== myKey && !b.force && Array.isArray(b.ops) && b.ops.length)
@@ -1147,7 +1599,7 @@ async function route(req, res, url) {
     const match = find('matches', mt[1]); if (!match) throw new HttpError(404, 'Match not found');
     assertOpen(match);
     const ev = find('events', match.eventId);
-    if (user.kind !== 'chief' && db.tournament.enforceReferee && match.refereeId && match.refereeId !== user.refId) throw new HttpError(403, 'This match is assigned to another referee.');
+    checkRef(user, match);
     const b = await readJson(req, 2000), pid = String(b.playerId || ''), color = b.color === 'red' ? 'red' : b.color === 'yellow' ? 'yellow' : '';
     if (!color) throw new HttpError(400, 'Choose yellow or red');
     const inMatch = new Set([...match.sideA, ...match.sideB]);
@@ -1162,7 +1614,7 @@ async function route(req, res, url) {
     return json(res, 200, { ok: true, card: cardInfo(pid) });
   }
   if ((mt = p.match(/^\/api\/cards\/([\w-]+)\/revoke$/)) && m === 'POST') {
-    needStaff(user); if (!(user.role === 'referee' && user.kind === 'chief')) throw new HttpError(403, 'Only the chief referee can revoke a card.');
+    needStaff(user); if (!(user.refId && user.kind === 'chief')) throw new HttpError(403, 'Only the chief referee can revoke a card.');
     const c = db.cards.find((x) => x.id === mt[1]); if (!c) throw new HttpError(404, 'Card not found');
     if (!c.revoked) { c.revoked = true; if (c.color === 'red') db.suspend[c.playerId] = Math.max(0, (db.suspend[c.playerId] || 0) - 2); audit(user.name, 'card revoked', ((find('players', c.playerId) || {}).name || '') + ' (' + c.color + ')', c.matchId); save(); broadcast(); }
     return json(res, 200, { ok: true });
@@ -1171,13 +1623,13 @@ async function route(req, res, url) {
     needScorer(user);
     const match = find('matches', mt[1]); if (!match) throw new HttpError(404, 'Match not found');
     assertOpen(match);
-    if (user.kind !== 'chief' && db.tournament.enforceReferee && match.refereeId && match.refereeId !== user.refId) throw new HttpError(403, 'This match is assigned to another referee.');
+    checkRef(user, match);
     applyPaper(match, await readJson(req, 4000), user);
     if (Engine.derive(match, find('events', match.eventId)).status === 'completed') autoAdvance(find('events', match.eventId), user.name);
     save(); broadcast(); return json(res, 200, { ok: true });
   }
   if ((mt = p.match(/^\/api\/matches\/([\w-]+)\/paper\/sign$/)) && m === 'POST') {
-    needStaff(user); if (!(user.role === 'referee' && user.kind === 'chief')) throw new HttpError(403, 'Only the chief referee signs off paper scores.');
+    needStaff(user); if (!(user.refId && user.kind === 'chief')) throw new HttpError(403, 'Only the chief referee signs off paper scores.');
     const match = find('matches', mt[1]); if (!match || !match.paper) throw new HttpError(404, 'No paper score on this match');
     match.paper.signed = true; match.paper.signedBy = user.name; match.paper.signedAt = Date.now();
     audit(user.name, 'signed off paper score', '', match.id); save(); broadcast(); return json(res, 200, { ok: true });
@@ -1237,7 +1689,7 @@ async function route(req, res, url) {
     needLineup(user);
     const match = find('matches', mt[1]); if (!match || !(match.rubbers || []).length) throw new HttpError(404, 'This match has no rubbers');
     const ev = find('events', match.eventId);
-    if (user.role === 'referee' && user.kind !== 'chief' && db.tournament.enforceReferee && match.refereeId && match.refereeId !== user.refId) throw new HttpError(403, 'This match is assigned to another referee.');
+    checkRef(user, match);
     const b = await readJson(req, 20000);
     let capSide = '';
     if (user.role === 'captain') {
@@ -1303,6 +1755,31 @@ async function route(req, res, url) {
     fs.writeFileSync(path.join(UPLOAD_DIR, file), buf);
     return json(res, 200, { url: '/uploads/' + file });
   }
+  /* Anyone with the link can add photos or videos to the gallery. Organizers can remove anything; the uploader can remove their own. */
+  if (p === '/api/gallery/media' && m === 'POST') {
+    limit('gal:' + ip, 80, 3600e3, 'Too many uploads from this network – please try again in an hour.');
+    const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    const img = EXT_BY_TYPE[type], vid = VIDEO_EXT[type];
+    if (!img && !vid) throw new HttpError(400, 'Upload a photo (JPG, PNG, WEBP) or a video (MP4, MOV, WEBM).');
+    if (db.gallery.length >= 1500) throw new HttpError(400, 'The gallery is full. Ask the organizers to make room.');
+    const ext = img || vid, name = uid() + uid() + ext, file = path.join(UPLOAD_DIR, name), tmp = file + '.part';
+    const size = await readBodyToFile(req, tmp, vid ? 200e6 : 12e6);
+    const head = Buffer.alloc(16); const fd = fs.openSync(tmp, 'r'); fs.readSync(fd, head, 0, 16, 0); fs.closeSync(fd);
+    if (!size || !(img ? looksLike(head, ext) : looksLikeVideo(head, ext))) { fs.unlink(tmp, () => {}); throw new HttpError(400, 'That file is not a real ' + (img ? 'photo' : 'video') + '.'); }
+    fs.renameSync(tmp, file);
+    const key = crypto.randomBytes(12).toString('hex');
+    const by = user ? user.name : str(url.searchParams.get('by'), 40).trim() || 'Guest';
+    const item = { id: uid(), url: '/uploads/' + name, type: vid ? 'video' : 'image', size, caption: str(url.searchParams.get('caption'), 120), by, ts: Date.now(), minors: url.searchParams.get('minors') === '1', delHash: sha(key) };
+    db.gallery.unshift(item); save(); broadcast();
+    return json(res, 200, { ok: true, id: item.id, deleteKey: key });
+  }
+  if ((mt = p.match(/^\/api\/gallery\/([\w-]+)$/)) && m === 'DELETE') {
+    const g = db.gallery.find((x) => x.id === mt[1]); if (!g) throw new HttpError(404, 'Not found');
+    const key = String(req.headers['x-delete-key'] || '');
+    if (!(user && user.role === 'admin') && !(g.delHash && key && safeEq(sha(key), g.delHash))) throw new HttpError(403, 'Only the person who added it, or an organizer, can remove it.');
+    db.gallery = db.gallery.filter((x) => x !== g); save(); broadcast();
+    return json(res, 200, { ok: true });
+  }
   if (p === '/api/gallery' && m === 'POST') {
     needStaff(user);
     const b = await readJson(req);
@@ -1330,12 +1807,108 @@ async function route(req, res, url) {
   }
 
   /* ---- public: registration (needs admin approval), self-service edit link, score disputes ---- */
+  if (p === '/api/referee-signup' && m === 'POST') {
+    limit('refsign:' + ip, 10, 3600e3, 'Too many sign-ups from this network. Please try again later.');
+    const b = await readJson(req, 4000);
+    if (b.website) return json(res, 200, { ok: true });          /* honeypot */
+    if (!db.tournament.refSignupOpen) throw new HttpError(403, 'Referee sign-up is closed. Please contact the organizers.');
+    if (db.referees.filter((x) => x.status === 'pending').length >= 100) throw new HttpError(503, 'Too many sign-ups are waiting. Please contact the organizers.');
+    const name = str(b.name, 60).trim(); if (name.length < 2) throw new HttpError(400, 'Please enter your name.');
+    const phone = str(b.phone, 30).trim(); if (!/\d{6,}/.test(phone.replace(/\D/g, ''))) throw new HttpError(400, 'Please enter a phone number so the organizers can reach you.');
+    if (db.referees.some((x) => x.name.toLowerCase() === name.toLowerCase() && String(x.phone || '').replace(/\D/g, '') === phone.replace(/\D/g, ''))) throw new HttpError(409, 'You have already signed up.');
+    const r = { id: uid(), name, kind: 'referee', sports: (Array.isArray(b.sports) ? b.sports : []).filter((x) => SPORTS.includes(x)).slice(0, 5), eventIds: [], status: 'pending', phone, note: str(b.note, 200), signedUpAt: Date.now(), pinHash: '' };
+    db.referees.push(r); audit(name, 'referee sign-up', r.sports.join(', ')); save(); broadcast();
+    return json(res, 200, { ok: true });
+  }
+  /* ---- events: anyone signed in (organizer or referee) may create one and set its organizers and referees ---- */
+  if (p === '/api/staff/friendly' && m === 'POST') {
+    if (!isStaffU(user)) throw new HttpError(401, 'Sign in to start a match.');
+    const b = await readJson(req, 4000);
+    const sport = SPORTS.includes(b.sport) ? b.sport : 'other', kind = b.kind === 'doubles' ? 'doubles' : 'singles', n = kind === 'doubles' ? 2 : 1;
+    const A = (b.sideA || []).map(String), B = (b.sideB || []).map(String);
+    const people = [...A, ...B].map((id) => find('players', id));
+    if (A.length !== n || B.length !== n || people.some((x) => !x)) throw new HttpError(400, 'Choose ' + n + ' player' + (n > 1 ? 's' : '') + ' for each side.');
+    const section = people.every((x) => x.section === 'kids') ? 'kids' : 'adults';
+    if (people.some((x) => (x.section || 'adults') !== section)) throw new HttpError(400, 'Adults and kids cannot play in the same friendly match.');
+    const name = ({ badminton: 'Badminton', tt: 'Table Tennis', carrom: 'Carrom', chess: 'Chess' }[sport] || 'Game') + (kind === 'doubles' ? ' – Doubles' : '') + (section === 'kids' ? ' (Kids)' : '') + ' – Friendly';
+    let ev = db.events.find((e) => e.tid === 'friendly' && e.name === name);
+    if (!ev) {
+      const like = [...seedEvents(), ...seedKidsEvents()].find((e) => e.sport === sport && e.section === section) || seedEvents().find((e) => e.sport === sport);
+      ev = normEvent({ name, sport, section, sideType: 'player', sideSize: n, scoring: like ? like.scoring : 'points', config: { ...(like ? like.config : {}), finalists: 0 }, participantIds: [], tid: 'friendly', selfRegister: false }, null);
+      db.events.push(ev);
+    }
+    [...A, ...B].forEach((id) => { if (!ev.participantIds.includes(id)) ev.participantIds.push(id); });
+    const mt0 = normMatch({ eventId: ev.id, stage: 'Play-off', sideA: A, sideB: B, court: str(b.court, 30), refereeId: user.refId && !(user.personId && [...A, ...B].includes(user.personId)) ? user.refId : '' }, null);
+    db.matches.push(mt0); audit(user.name, 'friendly match', ev.name); save(); broadcast();
+    return json(res, 200, mt0);
+  }
+  /* 🔔 Notify: WhatsApp messages to the players of a match that is still to be played.
+     Staff only (they need the players' numbers). Sent automatically when the WhatsApp Cloud API
+     is configured (WHATSAPP_TOKEN + WHATSAPP_PHONE_ID); otherwise the app returns tap-to-send links. */
+  if ((mt = p.match(/^\/api\/staff\/matches\/([\w-]+)\/notify$/)) && m === 'POST') {
+    if (!isStaffU(user)) throw new HttpError(401, 'Sign in as an organizer or referee to notify players.');
+    const match = find('matches', mt[1]); if (!match) throw new HttpError(404, 'Match not found');
+    const ev = find('events', match.eventId); if (!ev) throw new HttpError(404, 'Game not found');
+    if (user.role === 'admin' && !user.refId && !sportOk(user, ev)) throw new HttpError(403, 'You do not organize this game.');
+    if (Engine.derive(match, ev).status !== 'scheduled') throw new HttpError(409, 'This match has already started or finished.');
+    const b = await readJson(req, 6000);
+    const given = String(b.base || '').replace(/\/+$/, ''), base = db.registration.publicUrl || (/^https?:\/\/[\w.-]+(:\d+)?$/.test(given) ? given : 'https://' + String(req.headers.host || 'localhost').replace(/[^\w.:-]/g, ''));
+    const out = notifyPlan(match, ev, base, b.message);
+    if (b.send) {
+      if (!WA.on) throw new HttpError(400, 'Automatic WhatsApp sending is not set up on this server – use the WhatsApp buttons.');
+      for (const r of out.recipients) {
+        try { await waSend(r.phone, r.text, r.first, out.line, out.link); r.sent = true; } catch (e) { r.error = String(e.message || e).slice(0, 160); }
+      }
+    }
+    if (b.send || b.mark) {
+      const n = b.send ? out.recipients.filter((r) => r.sent).length : Math.max(0, Math.min(out.recipients.length, num(b.mark, 0)));
+      match.notified = { at: Date.now(), by: user.name, n, via: b.send ? 'auto' : 'manual', no: match.no };
+      audit(user.name, 'WhatsApp notify', n + ' player(s)', match.id); save(); broadcast();
+    }
+    return json(res, 200, { auto: WA.on, message: out.template, ...out });
+  }
+  if (p === '/api/staff/tournaments' && m === 'POST') {
+    if (!isStaffU(user)) throw new HttpError(401, 'Sign in with your PIN (organizer or referee) to create an event.');
+    const b = await readJson(req, 60000);
+    const name = str(b.name, 80).trim(); if (name.length < 3) throw new HttpError(400, 'Give the event a name.');
+    if (db.tournaments.some((x) => x.name.toLowerCase() === name.toLowerCase())) throw new HttpError(409, 'An event called "' + name + '" already exists.');
+    if (db.tournaments.length >= 100) throw new HttpError(400, 'Too many events – close or archive old ones first.');
+    const pins = [], staff = tourStaff(b, pins, user);
+    const T = newTour({ name, dates: str(b.dates, 60), venue: str(b.venue, 120), createdBy: user.name, ...staff });
+    db.tournaments.push(T);
+    const src = b.copyFrom && tour(String(b.copyFrom));
+    const games = src ? db.events.filter((e) => e.tid === src.id).map((e) => ({ copy: e })) : (Array.isArray(b.games) ? b.games : []).slice(0, 40);
+    const made = [];
+    games.forEach((g) => {
+      try {
+        if (g.copy) { const c = JSON.parse(JSON.stringify(g.copy)); Object.assign(c, { id: uid(), tid: T.id, participantIds: [], withdrawn: [], interestedIds: [], organizerIds: staff.organizerIds, refereeIds: staff.refereeIds }); delete c.frozenCount; delete c.groups; delete c.bracket; delete c.byes; db.events.push(c); made.push(c); return; }
+        made.push(makeGame(T.id, g, staff));
+      } catch (e) { /* skip a bad row, the rest is created */ }
+    });
+    audit(user.name, 'created event', name + ' (' + made.length + ' games)'); save(); broadcast();
+    return json(res, 200, { tournament: T, games: made.length, pins });
+  }
+  if ((mt = p.match(/^\/api\/staff\/tournaments\/([\w-]+)$/)) && m === 'PUT') {
+    const T = tour(mt[1]); if (!T) throw new HttpError(404, 'Event not found');
+    if (!canTour(user, T.id)) throw new HttpError(403, 'Only this event’s organizers can change it.');
+    const b = await readJson(req, 60000), pins = [];
+    if (b.name != null) { const n = str(b.name, 80).trim(); if (n.length < 3) throw new HttpError(400, 'Give the event a name.'); if (db.tournaments.some((x) => x !== T && x.name.toLowerCase() === n.toLowerCase())) throw new HttpError(409, 'Another event has that name.'); T.name = n; }
+    if (b.dates != null) T.dates = str(b.dates, 60);
+    if (b.venue != null) T.venue = str(b.venue, 120);
+    if (b.status === 'closed' || b.status === 'open') T.status = b.status;
+    if (b.organizerIds || b.refereeIds || b.newOrganizers || b.newReferees) Object.assign(T, tourStaff({ organizerIds: b.organizerIds || T.organizerIds, refereeIds: b.refereeIds || T.refereeIds, newOrganizers: b.newOrganizers, newReferees: b.newReferees }, pins, null));
+    if (T.kind === 'friendly') T.status = 'open';
+    if (!db.tournaments.some((x) => x.status !== 'closed' && x.kind !== 'friendly')) { T.status = 'open'; throw new HttpError(400, 'At least one event must stay open.'); }
+    audit(user.name, 'edited event', T.name); save(); broadcast();
+    return json(res, 200, { tournament: T, pins });
+  }
   if (p === '/api/register' && m === 'POST') {
     limit('reg:' + ip, 150, 3600e3, 'Too many registrations from this network. Please try again later.');
     const b = await readJson(req, 20000);
     if (b.website) return json(res, 200, { ok: true });          /* honeypot: bots fill hidden fields */
-    if (!regOpen()) throw new HttpError(403, 'Registration is closed.');
-    const r = db.registration;
+    const regTid = tidOf(b.tid);
+    if (!regOpen(regTid)) throw new HttpError(403, 'Registration is closed.');
+    const r = tour(regTid).reg;
     if (lockedFor('code:' + ip)) throw new HttpError(429, 'Too many wrong join codes. Try again later.');
     if (r.joinCode && !safeEq(String(b.code || '').trim().toLowerCase(), r.joinCode.toLowerCase())) { recordFail('code:' + ip, 10); throw new HttpError(403, 'That join code is not correct.'); }
     if (db.players.filter((x) => x.status === 'pending').length >= 500) throw new HttpError(503, 'The registration queue is full. Please contact the organisers.');
@@ -1356,7 +1929,7 @@ async function route(req, res, url) {
     if (!ids.length) throw new HttpError(400, 'Choose at least one event.');
     for (const id of ids) {
       const ev = find('events', id);
-      if (!ev || ev.selfRegister === false) throw new HttpError(400, 'One of the chosen events is not open for registration.');
+      if (!ev || ev.selfRegister === false || ev.tid !== regTid) throw new HttpError(400, 'One of the chosen games is not open for registration in ' + tour(regTid).name + '.');
       if ((ev.section || 'adults') !== section) throw new HttpError(400, ev.name + ' is not in the ' + (section === 'kids' ? 'Kids' : 'Adults') + ' section.');
       if (ev.maxParticipants > 0 && requestedCount(ev) >= ev.maxParticipants) throw new HttpError(409, ev.name + ' is full.');
       if (section === 'kids' && !ageOk(ev, { ageGroup: b.ageGroup })) throw new HttpError(400, ev.name + ' is for ' + ageText(ev) + '. Please pick the event for your age.');
@@ -1371,11 +1944,12 @@ async function route(req, res, url) {
     const pl = COLS.players({ name, section, ageGroup: str(b.ageGroup, 20), gender: b.gender, phone, email, affiliation: b.affiliation, hand: b.hand, emergency: b.emergency, tshirt: b.tshirt, sports: sportsIn, guardianName, guardianPhone, profilePublic: section !== 'kids' }, null);
     const tok = crypto.randomBytes(18).toString('hex');
     pl.dob = dobIn; pl.dupOf = dupCandidates(pl);
-    Object.assign(pl, { status: 'pending', requestedEventIds: ids, registeredAt: Date.now(), consentAt: Date.now(), editTokenHash: sha(tok) });
+    Object.assign(pl, { status: 'pending', requestTid: regTid, requestedEventIds: ids, registeredAt: Date.now(), consentAt: Date.now(), editTokenHash: sha(tok) });
     db.players.push(pl);
     audit('Registration', 'registered', name + ' (' + section + ')');
     save(); broadcast();
-    return json(res, 200, { ok: true, id: pl.id, playerNo: pl.playerNo, editToken: tok, status: 'pending' });
+    const firstPin = givePin(pl); save();
+    return json(res, 200, { ok: true, id: pl.id, playerNo: pl.playerNo, editToken: tok, status: 'pending', pin: firstPin });
   }
 
   let sm;
@@ -1442,12 +2016,13 @@ async function route(req, res, url) {
     limit('x:' + ip, 20, 60e3);
     let adminXl = !!(user && user.role === 'admin');
     const dl = url.searchParams.get('dl');
+    if (!dl && !isStaffU(user)) throw new HttpError(403, 'Reports can be downloaded by organizers and referees only.');
     if (dl) {
       const e = dlTokens.get(dl); dlTokens.delete(dl);
       if (!e || e.exp < Date.now()) throw new HttpError(403, 'That download link has expired. Create a new one.');
       adminXl = true;
     }
-    const buf = await exportXlsx(adminXl);
+    const buf = await exportXlsx(adminXl, tour(url.searchParams.get('tid')) ? url.searchParams.get('tid') : '');
     res.writeHead(200, { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': 'attachment; filename="tournament-results.xlsx"' });
     return res.end(Buffer.from(buf));
   }
@@ -1455,10 +2030,11 @@ async function route(req, res, url) {
   /* ---- admin ---- */
   if (p.startsWith('/api/admin/')) {
     const chiefPath = /^\/api\/admin\/matches\/[\w-]+\/(scores|reset)$/.test(p);
-    if (chiefPath) { needStaff(user); if (!(user.role === 'referee' && user.kind === 'chief')) throw new HttpError(403, 'Only the chief referee corrects or resets scores.'); } else needAdmin(user);
+    if (chiefPath) { needStaff(user); if (!(user.refId && user.kind === 'chief')) throw new HttpError(403, 'Only the chief referee corrects or resets scores.'); } else needAdmin(user);
     let mm;
-    if (user.sports && user.sports.length) {
-      if (/^\/api\/admin\/(admins|pin|tournament|revoke-sessions|purge|backup|restore|new-tournament|trash|registration|export-link|secrets|shift|panic|snapshots|rollback|import-|reachability)/.test(p)) throw new HttpError(403, 'This is for the organizer only. Sport leads manage their own sport.');
+    if (isLead(user)) {
+      if (/^\/api\/admin\/(admins|pin|tournament(?!s)|revoke-sessions|purge|backup|restore|new-tournament|trash|registration|export-link|secrets|shift|panic|snapshots|rollback|import-|reachability)/.test(p)
+        && !(/^\/api\/admin\/(registration|import-)/.test(p) && tourOrg(user, url.searchParams.get('tid')))) throw new HttpError(403, 'This is for the organizer only. Sport leads manage their own sport.');
       let ge = null; const em = p.match(/^\/api\/admin\/events\/([\w-]+)/), mtc = p.match(/^\/api\/admin\/matches\/([\w-]+)/);
       if (em) ge = find('events', em[1]); else if (mtc) { const x = find('matches', mtc[1]); ge = x && find('events', x.eventId); }
       if ((em || mtc) && !sportOk(user, ge)) throw new HttpError(403, 'That event belongs to another sport.');
@@ -1476,6 +2052,9 @@ async function route(req, res, url) {
       if (/^#[0-9a-fA-F]{6}$/.test(b.primary || '')) t.primary = b.primary;
       if (b.showKidsPhotos != null) t.showKidsPhotos = !!b.showKidsPhotos;
       if (b.enforceReferee != null) t.enforceReferee = !!b.enforceReferee;
+      if (b.refSignupOpen != null) t.refSignupOpen = !!b.refSignupOpen;
+      if (b.seasonName != null && str(b.seasonName, 80).trim()) t.seasonName = str(b.seasonName, 80).trim();
+      if (b.rankPts && typeof b.rankPts === 'object') { t.rankPts = {}; Object.keys(Engine.RANK_POINTS).forEach((k) => { t.rankPts[k] = Math.max(0, Math.min(100, Math.round(num(b.rankPts[k], Engine.RANK_POINTS[k])))); }); }
       if (b.tz != null) { try { new Intl.DateTimeFormat('en-GB', { timeZone: String(b.tz) }); t.tz = String(b.tz); } catch (e) { throw new HttpError(400, 'Unknown time zone (use a name like Asia/Kolkata)'); } }
       if (b.sponsorSeconds != null) t.sponsorSeconds = Math.max(3, Math.min(60, Math.round(num(b.sponsorSeconds, 8))));
       if (Array.isArray(b.signers)) t.signers = b.signers.slice(0, 3).map((s) => ({ name: str(s.name, 60), title: str(s.title, 60), image: /^\/uploads\/[\w.-]+$/.test(s.image || '') ? s.image : '' }));
@@ -1490,13 +2069,12 @@ async function route(req, res, url) {
       Object.keys(db.sessions).forEach((t) => { const x = db.sessions[t]; if (x.role === 'admin' && (x.adminId || me().id) === me().id && t !== user.token) delete db.sessions[t]; });
       audit(user.name, 'pin changed'); save(); return json(res, 200, { ok: true });
     }
-    if (p === '/api/admin/admins' && m === 'GET') return json(res, 200, db.admins.map((a) => ({ id: a.id, name: a.name, sports: a.sports || [], me: a.id === me().id })));
+    if (p === '/api/admin/admins' && m === 'GET') return json(res, 200, db.admins.map((a) => ({ id: a.id, name: a.name, sports: a.sports || [], limited: !!a.limited, games: db.events.filter((e) => (e.organizerIds || []).includes(a.id)).map((e) => e.name), me: a.id === me().id })));
     if (p === '/api/admin/admins' && m === 'POST') {
       const b = await readJson(req, 2000); const name = str(b.name, 40);
       if (!name) throw new HttpError(400, 'Enter a name for the new admin');
-      if (db.admins.length >= 8) throw new HttpError(400, 'Maximum 8 admins');
-      let pin; do { pin = pinN(8); } while (db.admins.some((a) => checkPin(pin, a.pinHash)));
-      const a = { id: uid(), name, pinHash: hashPin(pin), sports: normSports(b.sports) }; db.admins.push(a);
+      if (db.admins.length >= 40) throw new HttpError(400, 'Maximum 40 organizer accounts');
+      const a = newOrganizer(name, { sports: normSports(b.sports), limited: !!b.limited }); const pin = a._pin; delete a._pin;
       audit(user.name, 'added admin', name); save();
       return json(res, 200, { id: a.id, name, pin });
     }
@@ -1514,6 +2092,7 @@ async function route(req, res, url) {
         if (db.admins.length <= 1) throw new HttpError(400, 'You cannot remove the only admin.');
         if (a.id === me().id) throw new HttpError(400, 'You cannot remove yourself. Ask another admin.');
         db.admins = db.admins.filter((x) => x !== a); Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].adminId === a.id) delete db.sessions[t]; });
+        db.events.forEach((e) => { e.organizerIds = (e.organizerIds || []).filter((x) => x !== a.id); });
         audit(user.name, 'removed admin', a.name); save(); return json(res, 200, { ok: true });
       }
     }
@@ -1532,14 +2111,15 @@ async function route(req, res, url) {
       return json(res, 200, { url: '/api/export.xlsx?dl=' + t });
     }
     if (p === '/api/admin/registration' && m === 'POST') {
-      const b = await readJson(req, 8000); const r = db.registration;
+      const b = await readJson(req, 8000); const regT = tour(tidOf(url.searchParams.get('tid') || b.tid)), r = regT.reg;
+      if (!canTour(user, regT.id)) throw new HttpError(403, 'Only this event’s organizers can change its registration.');
       if (b.enabled != null) r.enabled = !!b.enabled;
       if (b.deadline != null) { if (b.deadline && !/^\d{4}-\d{2}-\d{2}$/.test(b.deadline)) throw new HttpError(400, 'Deadline must be a date'); r.deadline = b.deadline; }
       if (b.joinCode != null) { if (!/^[A-Za-z0-9-]{0,24}$/.test(b.joinCode)) throw new HttpError(400, 'Join code: letters, numbers and dashes only (max 24)'); r.joinCode = b.joinCode; }
       if (b.publicUrl != null) {
         let u = String(b.publicUrl).trim().replace(/\/+$/, '');
         if (u && !/^https?:\/\/[A-Za-z0-9.-]+(:\d{1,5})?$/i.test(u)) throw new HttpError(400, 'Web address must look like https://your-name.ts.net (no path)');
-        r.publicUrl = u;
+        db.registration.publicUrl = u;
       }
       if (b.rotateCode) { const al = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; r.joinCode = Array.from({ length: 6 }, () => al[crypto.randomInt(al.length)]).join(''); }
       if (b.notice != null) r.notice = str(b.notice, 600);
@@ -1585,8 +2165,8 @@ async function route(req, res, url) {
       const b = await readJson(req, 3000); const text = str(b.text, 240), title = str(b.title, 60) || 'Announcement';
       if (text.length < 3) throw new HttpError(400, 'Write the announcement first');
       const sport = SPORTS.includes(b.sport) ? b.sport : '';
-      if (sport && user.sports && user.sports.length && !user.sports.includes(sport)) throw new HttpError(403, 'You can only announce for your sport.');
-      if (!sport && user.sports && user.sports.length) throw new HttpError(403, 'Sport leads announce for their own sport only.');
+      if (sport && isLead(user) && !user.sports.includes(sport)) throw new HttpError(403, 'You can only announce for your sport.');
+      if (!sport && isLead(user)) throw new HttpError(403, 'Sport leads announce for their own sport only.');
       addFeed(title, text, { kind: 'announcement', sport });
       audit(user.name, 'announcement', title + ': ' + text);
       const ids = sport ? new Set(db.events.filter((e) => e.sport === sport).flatMap((e) => e.participantIds)) : null;
@@ -1634,7 +2214,7 @@ async function route(req, res, url) {
       for (const [f, data] of Object.entries(b.uploads || {})) {
         if (/^[\w.-]+$/.test(f) && ['.jpg', '.png', '.webp'].includes(path.extname(f).toLowerCase())) fs.writeFileSync(path.join(UPLOAD_DIR, f), Buffer.from(data, 'base64'));
       }
-      ['tournament', 'players', 'teams', 'referees', 'events', 'matches', 'sponsors', 'gallery', 'registration'].forEach((k) => { if (b[k] !== undefined) db[k] = b[k]; });
+      ['tournament', 'tournaments', 'seasons', 'players', 'teams', 'referees', 'events', 'matches', 'sponsors', 'gallery', 'registration'].forEach((k) => { if (b[k] !== undefined) db[k] = b[k]; });
       migrate(db); audit(user.name, 'restore backup'); save(); broadcast();
       return json(res, 200, { ok: true });
     }
@@ -1643,29 +2223,46 @@ async function route(req, res, url) {
       const stamp = new Date().toISOString().replace(/[:.]/g, '-');
       flush(); const archName = 'archive-' + stamp + '.json' + (BK_PASS ? '.enc' : '');
       writeSecure(path.join(DATA_DIR, 'archive-' + stamp + '.json'), fs.readFileSync(DB_FILE));
+      { /* freeze this season: results per player per sport (for all-time rankings) and each game's podium */
+        const data = { players: db.players, teams: db.teams, events: db.events, matches: db.matches };
+        const nameIds = (ev, ids) => ids.map((id) => (find(ev.sideType === 'team' ? 'teams' : 'players', id) || {}).name || '?').join(' & ');
+        const champions = db.events.map((ev) => { const pod = Engine.podium(ev, db.matches); return pod ? { event: ev.name, section: ev.section || 'adults', sport: ev.sport, first: nameIds(ev, pod.first), second: nameIds(ev, pod.second), third: pod.third.length ? nameIds(ev, pod.third) : '' } : null; }).filter(Boolean);
+        const done = db.matches.filter((x) => { const ev = find('events', x.eventId); return ev && Engine.derive(x, ev).status === 'completed'; }).length;
+        if (db.matches.length || champions.length) db.seasons.push({ id: uid(), name: db.tournament.seasonName || db.tournament.name, startedAt: db.tournament.seasonStartedAt || 0, endedAt: Date.now(), champions, matches: done, records: b.keepPlayers ? Engine.seasonRecords(data, db.matches) : {} });
+      }
       if (b.keepPlayers) {
         const data = { players: db.players, teams: db.teams, events: db.events, matches: db.matches };
         db.players.forEach((pl) => {
           const st = Engine.playerStats(pl.id, data);
           const entered = db.events.some((e) => (e.participantIds || []).includes(pl.id) || (e.sideType === 'team' && e.participantIds.some((t) => (find('teams', t) || { memberIds: [] }).memberIds.includes(pl.id))));
           if (!st.totals.played && !entered) return;
-          pl.career = (pl.career || []).concat([{ tournament: db.tournament.name, dates: db.tournament.dates, played: st.totals.played, won: st.totals.won, lost: st.totals.lost, drawn: st.totals.drawn, tally: Engine.r2(st.totals.pf), honours: st.honours.map((h) => h.event + ' – ' + h.place), at: Date.now() }]);
+          pl.career = (pl.career || []).concat([{ tournament: db.tournament.name, season: db.tournament.seasonName || '', dates: db.tournament.dates, played: st.totals.played, won: st.totals.won, lost: st.totals.lost, drawn: st.totals.drawn, tally: Engine.r2(st.totals.pf), honours: st.honours.map((h) => h.event + ' – ' + h.place), at: Date.now() }]);
         });
       }
-      db.matches = []; db.teams = []; db.gallery = []; db.disputes = []; db.trash = []; db.events = seedEvents();
+      const games = b.keepGames ? db.events.map((ev) => { const c = JSON.parse(JSON.stringify(ev)); c.id = uid(); c.participantIds = []; c.withdrawn = []; c.interestedIds = []; delete c.frozenCount; delete c.groups; delete c.bracket; delete c.byes; return c; }) : null;
+      db.matches = []; db.teams = []; db.gallery = []; db.disputes = []; db.trash = []; db.events = games || seedEvents();
+      if (!b.keepPlayers) db.seasons = db.seasons.map((x) => ({ ...x, records: {} }));
       if (!b.keepPlayers) { db.cards = []; db.suspend = {}; }
       db.players = db.players.filter((x) => x.status !== 'pending' || b.keepPlayers);
       if (!b.keepPlayers) db.players = [];
       if (!b.keepReferees) db.referees = [];
       if (!b.keepSponsors) db.sponsors = [];
       if (b.name) db.tournament.name = str(b.name, 80);
-      audit(user.name, 'new tournament', 'archived as ' + archName); save(); broadcast();
-      return json(res, 200, { ok: true, archive: archName });
+      /* next season's name: as typed, otherwise "… Season 3" becomes "… Season 4" */
+      const prevSeason = db.tournament.seasonName || '';
+      db.tournament.seasonName = str(b.season, 80).trim() || (/\d+\s*$/.test(prevSeason) ? prevSeason.replace(/(\d+)\s*$/, (x) => String(Number(x) + 1)) : (prevSeason ? prevSeason + ' (next)' : 'Season 1'));
+      db.tournament.seasonStartedAt = Date.now();
+      db.tournaments = [newTour({ name: db.tournament.seasonName })]; ensureTours(db);
+      db.referees.forEach((r) => { r.eventIds = []; });   // game-specific referee limits pointed at last season's games
+      audit(user.name, 'new season', db.tournament.seasonName + ' (previous archived as ' + archName + ')'); save(); broadcast();
+      return json(res, 200, { ok: true, archive: archName, season: db.tournament.seasonName });
     }
     const enrol = (pl) => {
       const enrolled = [], skipped = [];
+      if (pl.requestTid) addRoster(pl.requestTid, [pl.id]);
       (pl.requestedEventIds || []).forEach((id) => {
         const ev = find('events', id); if (!ev) return;
+        addRoster(ev.tid, [pl.id]);
         const team = ev.sideType === 'team', pool = team ? (ev.interestedIds = ev.interestedIds || []) : ev.participantIds;
         if (pool.includes(pl.id)) return;
         if ((ev.section || 'adults') !== pl.section) { skipped.push(ev.name + ' (not allowed)'); return; }
@@ -1701,14 +2298,14 @@ async function route(req, res, url) {
       let snap; try { snap = JSON.parse(fs.readFileSync(fp, 'utf8')); } catch (e) { throw new HttpError(400, 'That snapshot cannot be read'); }
       if (!Array.isArray(snap.players) || !Array.isArray(snap.matches)) throw new HttpError(400, 'That snapshot is not valid');
       backup();   /* keep what we have now so the rollback itself can be undone */
-      ['tournament', 'players', 'teams', 'referees', 'events', 'matches', 'sponsors', 'gallery', 'registration', 'cards', 'suspend', 'feed', 'nextPlayerNo'].forEach((k) => { if (snap[k] !== undefined) db[k] = snap[k]; });
+      ['tournament', 'tournaments', 'seasons', 'players', 'teams', 'referees', 'events', 'matches', 'sponsors', 'gallery', 'registration', 'cards', 'suspend', 'feed', 'nextPlayerNo'].forEach((k) => { if (snap[k] !== undefined) db[k] = snap[k]; });
       migrate(db); audit(user.name, 'rolled back to snapshot', b.file); save(); broadcast();
       return json(res, 200, { ok: true });
     }
     /* ---- clone an event (settings, format, rubbers; no players or matches) ---- */
     if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/clone$/)) && m === 'POST') {
       const src = find('events', mm[1]); if (!src) throw new HttpError(404, 'Event not found');
-      if (user.sports && user.sports.length && !user.sports.includes(src.sport)) throw new HttpError(403, 'That event belongs to another sport.');
+      if (!sportOk(user, src)) throw new HttpError(403, 'That event belongs to another sport.');
       const b = await readJson(req, 1000);
       const copy = JSON.parse(JSON.stringify(src));
       Object.assign(copy, { id: uid(), name: str(b.name, 80) || src.name + ' (copy)', participantIds: [], withdrawn: [], groups: undefined, bracket: undefined, byes: undefined });
@@ -1726,56 +2323,351 @@ async function route(req, res, url) {
       ws.addRow(['Ravi Kumar', 'adults', 'M', '9800000001', '', '1989-09-30', '', 'Finance', [ind && ind.name, tm && tm.name].filter(Boolean).join(', '), 'Red Hawks']);
       ws.addRow(['Meena Iyer', 'adults', 'F', '9800000002', '', '1993-01-15', '', 'HR', tm ? tm.name : '', 'Red Hawks']);
       ws.columns.forEach((c, i) => { c.width = i === 8 ? 44 : 22; });
-      const ev = wb.addWorksheet('Event names'); ev.addRow(['Event name (copy exactly)', 'Section', 'Type']).font = { bold: true };
-      db.events.forEach((e) => ev.addRow([e.name, (e.section || 'adults') === 'kids' ? 'kids' : 'adults', e.sideType === 'team' ? 'Team event' : 'Individual / doubles'])); ev.columns.forEach((c) => { c.width = 34; });
-      const h = wb.addWorksheet('How it works'); [['How the import maps players'],
-        ['• One row per player. Name is the only required column.'],
-        ['• Games: list event names from the "Event names" sheet, separated by commas. The player is entered in each one.'],
-        ['• Team: give a team name. If the team does not exist it is created in the same section, and the player is added to it.'],
-        ['• Team events: if a player lists a team event AND has a Team, that team is entered in the event. With no Team, the player goes on the event\'s interested list so you can place them later.'],
-        ['• Players already in a draw or with fixtures are not changed. Possible duplicates are flagged for you to check.'],
-        ['• You see a preview before anything is saved.']].forEach((r, k) => { const x = h.addRow(r); if (!k) x.font = { bold: true }; }); h.getColumn(1).width = 110;
+      const bold = (ws2) => { ws2.getRow(1).font = { bold: true }; ws2.columns.forEach((c) => { c.width = 26; }); };
+      const gs = wb.addWorksheet('Games'); gs.addRow(['Game', 'Sport', 'Category', 'Type']);
+      db.events.forEach((e) => gs.addRow([e.name, { badminton: 'Badminton', tt: 'Table Tennis', carrom: 'Carrom', chess: 'Chess' }[e.sport] || 'Other', (e.section || 'adults') === 'kids' ? 'Under-16' : 'Seniors', e.sideType === 'team' ? 'Team' : e.sideSize === 2 ? 'Doubles' : 'Singles']));
+      gs.addRow(['Badminton – Men Doubles', 'Badminton', 'Seniors', 'Doubles']); bold(gs);
+      const teamEv = db.events.find((e) => e.sideType === 'team' && (e.section || 'adults') === 'adults');
+      const tsh = wb.addWorksheet('Teams'); tsh.addRow(['Team', 'Game', 'Player 1', 'Player 2', 'Player 3', 'Player 4']);
+      tsh.addRow(['Red Hawks', teamEv ? teamEv.name : 'Badminton – Team Event', 'Ravi Kumar', 'Asha Verma', '', '']); bold(tsh);
+      const fx = wb.addWorksheet('Fixtures'); fx.addRow(['Game', 'Side A', 'Side B', 'Round', 'Date', 'Time', 'Court', 'Referee']);
+      fx.addRow([ind ? ind.name : 'Table Tennis', 'Asha Verma', 'Ravi Kumar', 'League', '29/11/2026', '10:30 AM', 'Court 1', '']); bold(fx);
+      const h = wb.addWorksheet('How it works'); [['How the upload works – fill only the sheets you need, delete the rest'],
+        ['• Players: one row per player. Name is the only required column. Your own layout also works (e.g. "Participant Name", "Select Games to Participate [Badminton]" = Yes, Category Seniors / Under-16, Villa Number, Age).'],
+        ['• Games: new games to create (existing names are skipped). Type = Singles, Doubles or Team. Category = Seniors or Under-16.'],
+        ['• Teams: team name, its game, and its players (Player 1, Player 2… or one "Members" column, comma separated). Players must exist – put them in the Players sheet of the same file. The team is entered in the game.'],
+        ['• Fixtures: Game, Side A, Side B (player or team names; doubles: "Asha & Meena"), optional Round (League, Group A, Quarter final, Semi final, Final), Date, Time, Court, Referee.'],
+        ['• Order: games are created first, then players, then teams, then fixtures – so one file can set up everything.'],
+        ['• Players already in the app are updated with the latest details; nothing is duplicated. Existing fixtures are not duplicated either.'],
+        ['• You choose which sheets to import and see a preview before anything is saved.']].forEach((r, k) => { const x = h.addRow(r); if (!k) x.font = { bold: true }; }); h.getColumn(1).width = 120;
       res.writeHead(200, { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': 'attachment; filename="players-import-template.xlsx"' });
       return res.end(Buffer.from(await wb.xlsx.writeBuffer()));
     }
+    /* Look at every sheet of an uploaded workbook: which ones hold players, and how their columns map. */
+    if (p === '/api/admin/import-inspect' && m === 'POST') {
+      const wb = await loadWorkbook(await readBody(req, 5e6));
+      const evs = db.events.filter((e) => e.tid === tidOf(url.searchParams.get('tid')));
+      return json(res, 200, {
+        fields: SheetImport.FIELDS.map((f) => ({ key: f.key, label: f.label })),
+        sheets: wb.worksheets.map((ws, i) => ({ index: i, ...SheetImport.inspectSheet(ws, evs) })),
+      });
+    }
     if (p === '/api/admin/import-players' && m === 'POST') {
-      const buf = await readBody(req, 5e6);
-      const ExcelJS = require('exceljs'); const wb = new ExcelJS.Workbook();
-      try { await wb.xlsx.load(buf); } catch (e) { throw new HttpError(400, 'That does not look like an Excel (.xlsx) file.'); }
-      const ws = wb.worksheets[0]; if (!ws) throw new HttpError(400, 'The workbook is empty.');
-      const cell = (r, c) => { let v = r.getCell(c).value; if (v && typeof v === 'object') { if ('result' in v) v = v.result; else if ('text' in v) v = v.text; else if (v instanceof Date) v = v.toISOString().slice(0, 10); } return v == null ? '' : String(v).trim(); };
-      let created = 0, flagged = 0; const errors = [], made = [], totals = { games: 0, interested: 0, teamEntries: 0, teamsMade: 0 };
-      const dry = url.searchParams.get('dry') === '1';
-      for (let i = 2; i <= Math.min(ws.rowCount, 1000); i++) {
-        const row = ws.getRow(i), name = cell(row, 1); if (!name) continue;
-        try {
-          if (db.players.length >= 5000) throw new Error('Player limit reached');
-          const section = /kid|child/i.test(cell(row, 2)) ? 'kids' : 'adults';
-          const dob = /^\d{4}-\d{2}-\d{2}/.test(cell(row, 6)) ? cell(row, 6).slice(0, 10) : '';
-          const evNames = cell(row, 9).split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
-          const evs = evNames.map((n) => { const e = db.events.find((x) => x.name.toLowerCase() === n && (x.section || 'adults') === section) || db.events.find((x) => x.name.toLowerCase() === n); if (!e) throw new Error('Unknown event "' + n + '"'); return e; });
-          const pl = COLS.players({ name, section, gender: cell(row, 3).toUpperCase().slice(0, 1), phone: cell(row, 4), email: cell(row, 5), dob, ageGroup: cell(row, 7), affiliation: cell(row, 8) }, null);
-          if (db.players.some((x) => x.status !== 'rejected' && x.dob && dob && x.dob === dob && x.name.toLowerCase() === name.toLowerCase() && evs.some((e) => e.participantIds.includes(x.id)))) throw new Error('Already registered for that event');
-          pl.status = 'approved'; pl.profilePublic = false; pl.dupOf = dupCandidates(pl); if (pl.dupOf.length) flagged++;
-          const tn = cell(row, 10);
-          const stat = { games: 0, interested: 0, teamEntries: 0, teamsMade: 0 };
-          if (!dry) {
-            db.players.push(pl);
-            let t = null;
-            if (tn) { t = db.teams.find((x) => x.name.toLowerCase() === tn.toLowerCase() && x.section === section); if (!t) { t = COLS.teams({ name: tn, section, memberIds: [] }, null); db.teams.push(t); stat.teamsMade++; } if (!t.memberIds.includes(pl.id)) t.memberIds.push(pl.id); }
-            evs.forEach((e) => {
-              if (e.sideType !== 'team') { if (!e.participantIds.includes(pl.id)) { e.participantIds.push(pl.id); stat.games++; } return; }
-              if (t) { if (!e.participantIds.includes(t.id)) { e.participantIds.push(t.id); stat.teamEntries++; } stat.games++; }
-              else { e.interestedIds = e.interestedIds || []; if (!e.interestedIds.includes(pl.id)) { e.interestedIds.push(pl.id); stat.interested++; stat.games++; } }
+      const wb = await loadWorkbook(await readBody(req, 5e6));
+      const impTid = tidOf(url.searchParams.get('tid')), impT = tour(impTid);
+      if (impT.status === 'closed') throw new HttpError(409, impT.name + ' is closed.');
+      const evs = db.events.filter((e) => e.tid === impTid);
+      const fullPlan = importPlan(wb, req.headers['x-import-options'], evs);
+      const preview = url.searchParams.get('dry') === '1';
+      /* A preview runs the real import on the live data and then puts the data back exactly as it was. */
+      const snap = preview ? JSON.stringify({ players: db.players, teams: db.teams, events: db.events, matches: db.matches, tournaments: db.tournaments, nextPlayerNo: db.nextPlayerNo }) : null;
+      try {
+      const dry = false;
+      let created = 0, flagged = 0, merged = 0, updated = 0; const errors = [], warnings = [], made = [], totals = { games: 0, interested: 0, teamEntries: 0, teamsMade: 0 }, perSheet = [];
+      const extra = importOthers(fullPlan.filter((x) => x.kind === 'games'), 'games', errors, warnings, impTid, evs);
+      const plan = fullPlan.filter((x) => x.kind === 'players');
+      /* Same person = same name + phone (else email, else date of birth), in any section, so a child who moves up to
+         Seniors keeps their profile. The latest sheet wins: a player already in the app gets the sheet's details and
+         game choices; what the sheet does not hold (photo, bio, results, history) is kept, and replaced values are noted. */
+      const nm = (x) => String(x.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const keyOf = (x) => nm(x) + '|' + (String(x.phone || '').replace(/\D/g, '').slice(-10) || String(x.email || '').toLowerCase() || x.dob || x.section || 'adults');
+      const existing = new Map(); db.players.forEach((q) => { if (q.status !== 'rejected') existing.set(keyOf(q), q); });
+      /* Fallback for players entered earlier without a phone (or with a placeholder one): the only player with
+         that name in the section is the same person, unless the sheet itself lists two different people by that name. */
+      const nameKey = (x) => (x.section || 'adults') + '|' + nm(x);
+      const byName = new Map(); db.players.forEach((q) => { if (q.status === 'rejected') return; const k = nameKey(q); byName.set(k, byName.has(k) ? null : q); });
+      const allRows = plan.map((sh) => SheetImport.readRows(sh.ws, sh, evs));
+      const sheetKeys = new Map(); allRows.flat().forEach((x) => { const k = nameKey(x); if (!sheetKeys.has(k)) sheetKeys.set(k, new Set()); sheetKeys.get(k).add(keyOf(x)); });
+      const findExisting = (x) => existing.get(keyOf(x)) || (sheetKeys.get(nameKey(x)).size === 1 ? byName.get(nameKey(x)) || null : null);
+      const seen = new Map(), plans = new Map();
+      const nextNo = db.nextPlayerNo;
+      const SPN = { badminton: 'Badminton', tt: 'Table Tennis', carrom: 'Carrom', chess: 'Chess' };
+      const FIELDS = ['phone', 'email', 'dob', 'ageGroup', 'affiliation', 'gender'];
+      const LBL = { phone: 'phone', email: 'email', dob: 'date of birth', ageGroup: 'age', affiliation: 'villa / dept', gender: 'gender', section: 'section' };
+      const same = (k, t) => (k === 'phone' ? String(t).replace(/\D/g, '').slice(-10) : String(t).toLowerCase());
+      const inFixtures = (ev, id) => db.matches.some((x) => x.eventId === ev.id && (x.sideA.includes(id) || x.sideB.includes(id)));
+      for (const [si, sh] of plan.entries()) {
+        const rows = allRows[si]; let n = 0, u = 0;
+        for (const x of rows.slice(0, 2000)) {
+          try {
+            const rowEvs = x.games.map((g) => { const e = SheetImport.eventByName(g, evs, x.section); if (!e) throw new Error('Unknown event "' + g + '"'); return e; });
+            (x.sports || []).forEach((sp) => {
+              const e = SheetImport.eventForSport(sp, x, evs, (sh.sportMap || {})[sp + '|' + x.section]);
+              if (e) { if (!rowEvs.includes(e)) rowEvs.push(e); }
+              else if ((sh.sportMap || {})[sp + '|' + x.section] !== 'skip') warnings.push({ sheet: sh.ws.name, row: x.row, name: x.name, error: 'no ' + (SPN[sp] || sp) + ' game for ' + (x.section === 'kids' ? 'kids' : 'adults') + ' fits (' + [x.gender === 'F' ? 'female' : x.gender === 'M' ? 'male' : '', x.ageGroup].filter(Boolean).join(', ') + ')' });
             });
-          } else { db.players.push(pl); evs.forEach(() => { stat.games++; }); }
-          totals.games += stat.games; totals.interested += stat.interested; totals.teamEntries += stat.teamEntries; totals.teamsMade += stat.teamsMade;
-          created++; made.push(pl.id);
-        } catch (e) { errors.push({ row: i, name, error: e.message }); }
+            const key = keyOf(x); let pl = seen.get(key), isNew = false;
+            if (pl) merged++;
+            else if ((pl = findExisting(x)) && !made.includes(pl.id)) { seen.set(key, pl); updated++; u++; }
+            else {
+              if (db.players.length >= 5000) throw new Error('Player limit reached');
+              pl = COLS.players({ name: x.name, section: x.section, gender: x.gender, phone: x.phone, email: x.email, dob: x.dob, ageGroup: x.ageGroup, affiliation: x.affiliation }, null);
+              pl.status = 'approved'; pl.profilePublic = false; pl.dupOf = dupCandidates(pl); if (pl.dupOf.length) flagged++;
+              db.players.push(pl); seen.set(key, pl); made.push(pl.id); isNew = true; created++;
+            }
+            addRoster(impTid, [pl.id]);
+            let pp = plans.get(pl.id);
+            if (!pp) plans.set(pl.id, (pp = { pl, existed: !made.includes(pl.id), sheet: sh.ws.name, want: new Set(), covered: new Set(), set: {}, old: {} }));
+            rowEvs.forEach((e) => pp.want.add(e.id));
+            (sh.sportCols || []).forEach((c) => pp.covered.add(c.sport));
+            (sh.eventCols || []).forEach((c) => { const e = find('events', c.eventId); if (e) pp.covered.add(e.sport); });
+            if (sh.map && sh.map.games) pp.covered.add('*');
+            if (pp.existed) {   // latest sheet wins for every detail it provides
+              FIELDS.forEach((k) => { const v = String(x[k] || '').slice(0, k === 'email' ? 80 : 60).trim(); if (v) pp.set[k] = v; });
+              if (x.section !== pl.section) pp.set.section = x.section;
+            }
+            const stat = { games: 0, interested: 0, teamEntries: 0, teamsMade: 0 };
+            const sec = pp.set.section || pl.section;
+            const mine = rowEvs.filter((e) => (e.section || 'adults') === sec);
+            if (!dry) {
+              let t = null;
+              if (x.team) { t = db.teams.find((q) => q.name.toLowerCase() === x.team.toLowerCase() && q.section === sec && q.tid === impTid); if (!t) { t = COLS.teams({ name: x.team, section: sec, memberIds: [], tid: impTid }, null); db.teams.push(t); stat.teamsMade++; } if (!t.memberIds.includes(pl.id)) t.memberIds.push(pl.id); }
+              mine.forEach((e) => {
+                if (e.sideType !== 'team') { if (!e.participantIds.includes(pl.id)) { e.participantIds.push(pl.id); stat.games++; } return; }
+                if (t) { if (!e.participantIds.includes(t.id)) { e.participantIds.push(t.id); stat.teamEntries++; } stat.games++; }
+                else { e.interestedIds = e.interestedIds || []; if (!e.interestedIds.includes(pl.id)) { e.interestedIds.push(pl.id); stat.interested++; stat.games++; } }
+              });
+            } else mine.forEach((e) => { if (!e.participantIds.includes(pl.id) && !(e.interestedIds || []).includes(pl.id)) { stat.games++; if (e.sideType === 'team' && !x.team) stat.interested++; } });
+            Object.keys(totals).forEach((k) => { totals[k] += stat[k]; });
+            if (isNew) n++;
+          } catch (e) { errors.push({ sheet: sh.ws.name, row: x.row, name: x.name, error: e.message }); }
+        }
+        perSheet.push({ sheet: sh.ws.name, rows: rows.length, added: n, updated: u });
       }
-      if (dry) { db.players = db.players.filter((x) => !made.includes(x.id)); db.nextPlayerNo -= made.length; }
-      else { audit(user.name, 'imported players from Excel', created + ' added, ' + errors.length + ' skipped'); save(); broadcast(); }
-      return json(res, 200, { created, flagged, errors, dryRun: dry, ...totals });
+      /* Apply the latest details and game choices to players who were already in the app. */
+      let changed = 0, removedGames = 0;
+      const today = new Date().toLocaleDateString('en-CA', { timeZone: db.tournament.tz || 'Asia/Kolkata' });
+      for (const pp of plans.values()) {
+        if (!pp.existed) continue;
+        const pl = pp.pl, id = pl.id, was = [], left = [];
+        // section move (e.g. a child now in Seniors): only when no fixtures hold them in the old section
+        if (pp.set.section) {
+          const oldEvs = evs.filter((e) => (e.section || 'adults') === pl.section);
+          const stuck = oldEvs.filter((e) => e.sideType !== 'team' && inFixtures(e, id));
+          if (stuck.length) { warnings.push({ sheet: pp.sheet, row: '', name: pl.name, error: 'stays in ' + pl.section + ' – already has fixtures in ' + stuck.map((e) => e.name).join(', ') }); delete pp.set.section; }
+          else {
+            was.push('section was ' + pl.section);
+            oldEvs.forEach((e) => { const pool = e.sideType === 'team' ? (e.interestedIds || []) : e.participantIds; if (pool.includes(id)) { left.push(e.name); removedGames++; if (!dry) pool.splice(pool.indexOf(id), 1); } });
+            if (!dry) { pl.section = pp.set.section; db.teams.forEach((t) => { if (t.section !== pl.section && t.memberIds.includes(id)) t.memberIds = t.memberIds.filter((m) => m !== id); }); }
+          }
+        }
+        FIELDS.forEach((k) => {
+          const v = pp.set[k]; if (!v) return;
+          const cur = String(pl[k] || '').trim(); if (same(k, cur) === same(k, v)) return;
+          if (cur) was.push(LBL[k] + ' was ' + (k === 'phone' ? maskPhone(cur) : k === 'email' ? cur.replace(/^(.).*(@.*)$/, '$1•••$2') : cur));
+          if (!dry) pl[k] = k === 'gender' ? (['M', 'F'].includes(v) ? v : cur) : v;
+        });
+        // game choices: in the sports this sheet asks about, the player plays exactly what they ticked now
+        const sec = pp.set.section || pl.section;
+        if (pp.covered.size) evs.forEach((ev) => {
+          if ((ev.section || 'adults') !== sec || pp.want.has(ev.id) || (!pp.covered.has('*') && !pp.covered.has(ev.sport))) return;
+          const team = ev.sideType === 'team', pool = team ? (ev.interestedIds || []) : ev.participantIds;
+          if (!pool.includes(id)) return;
+          if (!team && (inFixtures(ev, id) || ev.groups || ev.bracket)) { warnings.push({ sheet: pp.sheet, row: '', name: pl.name, error: 'kept in ' + ev.name + ' although not ticked – the draw/fixtures are already made (use Withdraw)' }); return; }
+          left.push(ev.name); removedGames++; if (!dry) pool.splice(pool.indexOf(id), 1);
+        });
+        if (was.length || left.length) changed++;
+        if (!dry && (was.length || left.length)) {
+          const line = 'Updated ' + today + ' from ' + pp.sheet + ': ' + was.concat(left.length ? ['left ' + left.join(', ')] : []).join('; ');
+          pl.notes = ((pl.notes ? pl.notes + '\n' : '') + line).slice(-500);
+        }
+      }
+      Object.assign(extra, importOthers(fullPlan.filter((x) => x.kind === 'teams'), 'teams', errors, warnings, impTid, evs));
+      Object.assign(extra, importOthers(fullPlan.filter((x) => x.kind === 'fixtures'), 'fixtures', errors, warnings, impTid, evs));
+      fullPlan.filter((x) => x.kind !== 'players').forEach((x) => perSheet.push({ sheet: x.ws.name, kind: x.kind, rows: (extra.rowsBySheet || {})[x.ws.name] || 0 }));
+      delete extra.rowsBySheet;
+      void nextNo;
+      if (!preview) { audit(user.name, 'imported from Excel', [created + ' players added', updated + ' updated', extra.gamesMade ? extra.gamesMade + ' games' : '', extra.teamsCreated || extra.teamsUpdated ? (extra.teamsCreated || 0) + ' teams made, ' + (extra.teamsUpdated || 0) + ' updated' : '', extra.fixturesMade ? extra.fixturesMade + ' fixtures' : '', errors.length + ' skipped'].filter(Boolean).join(', ')); save(); broadcast(); }
+      return json(res, 200, { created, updated, changed, removedGames, flagged, merged, errors, warnings, dryRun: preview, sheets: perSheet, ...totals, ...extra });
+      } finally { if (preview) Object.assign(db, JSON.parse(snap)); }
+    }
+    /* ---- teams under an event: create one from the event's players and pick the team games it plays ---- */
+    const setTeamGames = (t, ids) => {
+      const want = new Set((Array.isArray(ids) ? ids : []).map(String)), out = { added: 0, removed: 0, kept: [] };
+      db.events.filter((e) => e.tid === t.tid && e.sideType === 'team' && (e.section || 'adults') === t.section).forEach((e) => {
+        const inNow = e.participantIds.includes(t.id);
+        if (want.has(e.id) && !inNow) { e.participantIds.push(t.id); e.interestedIds = (e.interestedIds || []).filter((id) => !t.memberIds.includes(id)); out.added++; }
+        else if (!want.has(e.id) && inNow) {
+          if (db.matches.some((x) => x.eventId === e.id && [...x.sideA, ...x.sideB].includes(t.id))) { out.kept.push(e.name); return; }
+          e.participantIds = e.participantIds.filter((id) => id !== t.id); out.removed++;
+        }
+      });
+      return out;
+    };
+    if ((mm = p.match(/^\/api\/admin\/tournaments\/([\w-]+)\/teams$/)) && m === 'POST') {
+      const T = tour(mm[1]); if (!T || T.kind === 'friendly') throw new HttpError(404, 'Event not found');
+      if (!canTour(user, T.id)) throw new HttpError(403, 'Only this event’s organizers can make its teams.');
+      const b = await readJson(req, 20000), section = b.section === 'kids' ? 'kids' : 'adults';
+      const t = COLS.teams({ name: b.name, section, memberIds: (Array.isArray(b.memberIds) ? b.memberIds : []).map(String), tid: T.id }, null);
+      if (db.teams.some((x) => x.tid === T.id && x.section === section && x.name.toLowerCase() === t.name.toLowerCase())) throw new HttpError(409, 'A team called "' + t.name + '" already exists in ' + T.name + '.');
+      db.teams.push(t); const g = setTeamGames(t, b.eventIds);
+      audit(user.name, 'made team', t.name + ' in ' + T.name); save(); broadcast();
+      return json(res, 200, { team: t, ...g });
+    }
+    if ((mm = p.match(/^\/api\/admin\/teams\/([\w-]+)\/games$/)) && m === 'PUT') {
+      const t = find('teams', mm[1]); if (!t) throw new HttpError(404, 'Team not found');
+      if (!canTour(user, t.tid)) throw new HttpError(403, 'Only this event’s organizers can change its teams.');
+      const g = setTeamGames(t, (await readJson(req, 8000)).eventIds);
+      audit(user.name, 'team games', t.name); save(); broadcast();
+      return json(res, 200, g);
+    }
+    /* ---- people & roles: the main admin gives a person admin / referee roles and PINs; one login does it all ---- */
+    if (p === '/api/admin/people' && m === 'GET') {
+      if (isLead(user)) throw new HttpError(403, 'Only a main admin manages people and roles.');
+      return json(res, 200, {
+        people: db.players.filter((x) => x.status !== 'rejected').map((x) => ({ id: x.id, name: x.name, section: x.section, hasPin: !!x.pinHash,
+          admin: db.admins.some((a) => a.playerId === x.id && !a.limited && !(a.sports || []).length), organizer: db.admins.some((a) => a.playerId === x.id && (a.limited || (a.sports || []).length)),
+          referee: (db.referees.find((r) => r.playerId === x.id && r.status !== 'pending') || {}).kind || '', captain: db.teams.some((t) => t.captainId === x.id) })),
+        unlinked: [...db.admins.filter((a) => !a.playerId).map((a) => ({ type: 'admin', id: a.id, name: a.name })), ...db.referees.filter((r) => !r.playerId && r.status !== 'pending').map((r) => ({ type: 'referee', id: r.id, name: r.name }))],
+      });
+    }
+    if ((mm = p.match(/^\/api\/admin\/people\/([\w-]+)\/(roles|pin)$/)) && m === 'POST') {
+      if (isLead(user)) throw new HttpError(403, 'Only a main admin manages people and roles.');
+      const pl = find('players', mm[1]); if (!pl || pl.status === 'rejected') throw new HttpError(404, 'Person not found');
+      if (mm[2] === 'pin') { const pin = givePin(pl); audit(user.name, 'new PIN', pl.name); save(); return json(res, 200, { name: pl.name, pin }); }
+      const b = await readJson(req, 2000), out = {};
+      if (b.admin != null) {
+        const a = db.admins.find((x) => x.playerId === pl.id);
+        if (b.admin && !a) { db.admins.push({ id: uid(), name: pl.name, pinHash: '', sports: [], limited: false, playerId: pl.id }); out.admin = 'added'; }
+        else if (b.admin && a) { a.limited = false; a.sports = []; out.admin = 'main admin'; }
+        else if (!b.admin && a) {
+          if (a.id === user.adminId) throw new HttpError(400, 'You cannot remove your own admin role. Ask another admin.');
+          if (!a.limited && !(a.sports || []).length && db.admins.filter((x) => !x.limited && !(x.sports || []).length).length <= 1) throw new HttpError(400, 'Keep at least one main admin.');
+          db.admins = db.admins.filter((x) => x !== a); db.events.forEach((e) => { e.organizerIds = (e.organizerIds || []).filter((x) => x !== a.id); }); db.tournaments.forEach((t) => { t.organizerIds = t.organizerIds.filter((x) => x !== a.id); });
+          Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].adminId === a.id) delete db.sessions[t]; }); out.admin = 'removed';
+        }
+      }
+      if (b.referee != null) {
+        const r = db.referees.find((x) => x.playerId === pl.id);
+        const kind = ['referee', 'chief', 'volunteer'].includes(b.referee) ? b.referee : '';
+        if (kind && !r) { db.referees.push({ id: uid(), name: pl.name, kind, sports: [], eventIds: [], status: 'active', phone: '', note: '', signedUpAt: 0, pinHash: '', playerId: pl.id }); out.referee = 'added'; }
+        else if (kind && r) { r.kind = kind; r.status = 'active'; out.referee = kind; }
+        else if (!kind && r) { cascadeDelete('referees', r.id); db.referees = db.referees.filter((x) => x !== r); Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].refId === r.id) delete db.sessions[t]; }); out.referee = 'removed'; }
+      }
+      let pin = null; if (!pl.pinHash && (b.admin || b.referee)) pin = givePin(pl);   // a role needs a way to sign in
+      audit(user.name, 'roles', pl.name + ': ' + JSON.stringify(out)); save(); broadcast();
+      return json(res, 200, { ok: true, ...out, pin, name: pl.name });
+    }
+    if (p === '/api/admin/people/pins' && m === 'POST') {
+      if (isLead(user)) throw new HttpError(403, 'Only a main admin manages people and roles.');
+      const b = await readJson(req, 50000), tid = b.tid && tour(String(b.tid));
+      const who = db.players.filter((x) => x.status === 'approved' && !x.pinHash && (!tid || tid.playerIds.includes(x.id)));
+      const out = who.slice(0, 2000).map((x) => ({ id: x.id, name: x.name, pin: givePin(x) }));
+      audit(user.name, 'generated PINs', out.length + ' people'); save();
+      return json(res, 200, { pins: out });
+    }
+    if (p === '/api/admin/people/link' && m === 'POST') {
+      if (isLead(user)) throw new HttpError(403, 'Only a main admin manages people and roles.');
+      const b = await readJson(req, 2000), pl = find('players', String(b.playerId || ''));
+      const rec = b.type === 'admin' ? db.admins.find((a) => a.id === b.id) : find('referees', String(b.id || ''));
+      if (!pl || !rec) throw new HttpError(404, 'Not found');
+      if ((b.type === 'admin' ? db.admins : db.referees).some((x) => x !== rec && x.playerId === pl.id)) throw new HttpError(409, pl.name + ' already has that role.');
+      rec.playerId = pl.id; audit(user.name, 'linked account', rec.name + ' → ' + pl.name); save(); broadcast();
+      return json(res, 200, { ok: true });
+    }
+    /* ---- events: roster (enrol existing players / remove from the event) ---- */
+    if ((mm = p.match(/^\/api\/admin\/tournaments\/([\w-]+)\/roster$/)) && m === 'POST') {
+      const T = tour(mm[1]); if (!T) throw new HttpError(404, 'Event not found');
+      if (!canTour(user, T.id)) throw new HttpError(403, 'Only this event’s organizers can change its players.');
+      const b = await readJson(req, 50000);
+      const add = (Array.isArray(b.add) ? b.add : []).map(String).filter((id) => { const pl = find('players', id); return pl && pl.status === 'approved'; });
+      addRoster(T.id, add);
+      let removed = 0;
+      if (b.remove) {
+        const id = String(b.remove), pl = find('players', id); if (!pl) throw new HttpError(404, 'Player not found');
+        const evs = db.events.filter((e) => e.tid === T.id);
+        const teamIds = db.teams.filter((t) => t.tid === T.id && t.memberIds.includes(id)).map((t) => t.id);
+        const busy = evs.filter((e) => db.matches.some((x) => x.eventId === e.id && [...x.sideA, ...x.sideB].includes(id)));
+        if (busy.length) throw new HttpError(409, pl.name + ' already has fixtures in ' + busy.map((e) => e.name).join(', ') + ' – use Withdraw / replace there first.');
+        T.playerIds = T.playerIds.filter((x) => x !== id);
+        evs.forEach((e) => { e.participantIds = e.participantIds.filter((x) => x !== id); e.interestedIds = (e.interestedIds || []).filter((x) => x !== id); });
+        db.teams.forEach((t) => { if (teamIds.includes(t.id)) t.memberIds = t.memberIds.filter((x) => x !== id); });
+        removed = 1;
+      }
+      audit(user.name, 'event players', T.name + ': +' + add.length + (removed ? ' -1' : '')); save(); broadcast();
+      return json(res, 200, { ok: true, added: add.length, removed });
+    }
+    /* ---- a game (sub-event) always has an organizer and a referee: create both inline if needed ---- */
+    const gameStaff = (b, pins) => {
+      const orgIds = (Array.isArray(b.organizerIds) ? b.organizerIds : []).map(String).filter((id) => db.admins.some((a) => a.id === id));
+      const refIds = (Array.isArray(b.refereeIds) ? b.refereeIds : []).map(String).filter((id) => { const r = find('referees', id); return r && r.status !== 'pending'; });
+      staffNames(b.newOrganizers).forEach((x) => { const a = newOrganizer(x.name, { sports: [], limited: true }); if (x.playerId) a.playerId = x.playerId; pins.push({ role: 'Organizer', name: a.name, pin: a._pin }); delete a._pin; orgIds.push(a.id); });
+      if (b.newOrganizer && str(b.newOrganizer, 40).trim()) { const a = newOrganizer(str(b.newOrganizer, 40).trim(), { sports: [], limited: true }); pins.push({ role: 'Organizer', name: a.name, pin: a._pin }); delete a._pin; orgIds.push(a.id); }
+      staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee' }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: r._plain }); delete r._plain; db.referees.push(r); refIds.push(r.id); });
+      if (!refIds.length) throw new HttpError(400, 'Every game needs at least one referee – choose one or add a new one.');
+      return { organizerIds: [...new Set(orgIds)], refereeIds: [...new Set(refIds)] };
+    };
+    if (p === '/api/admin/games' && m === 'POST') {
+      const b = await readJson(req, 20000);
+      const tid = tidOf(b.tid);
+      const sport = SPORTS.includes(b.sport) ? b.sport : 'other', section = b.section === 'kids' ? 'kids' : 'adults';
+      if (isLead(user) && !tourOrg(user, tid) && !(user.sports || []).includes(sport)) throw new HttpError(403, 'You can only add games to events you organize.');
+      if (tour(tid).status === 'closed') throw new HttpError(409, tour(tid).name + ' is closed.');
+      const kind = ['singles', 'doubles', 'team'].includes(b.kind) ? b.kind : 'singles';
+      const name = str(b.name, 80).trim() || ({ badminton: 'Badminton', tt: 'Table Tennis', carrom: 'Carrom', chess: 'Chess' }[sport] || 'Game') + (kind === 'doubles' ? ' – Doubles' : kind === 'team' ? ' – Team Event' : '') + (section === 'kids' ? ' (Kids)' : '');
+      if (db.events.some((e) => e.tid === tid && e.name.toLowerCase() === name.toLowerCase() && (e.section || 'adults') === section)) throw new HttpError(409, 'A game called "' + name + '" already exists in ' + tour(tid).name + '.');
+      if (!(Array.isArray(b.refereeIds) && b.refereeIds.length) && !(b.newReferees && b.newReferees.length)) b.refereeIds = tour(tid).refereeIds;   // the event's referees by default
+      const pins = [], staff = gameStaff(b, pins);
+      const like = db.events.find((e) => e.sport === sport && (e.section || 'adults') === section && (e.sideType === 'team') === (kind === 'team')) || db.events.find((e) => e.sport === sport)
+        || [...seedEvents(), ...seedKidsEvents()].find((e) => e.sport === sport && e.section === section) || seedEvents().find((e) => e.sport === sport);
+      const ev = normEvent({ name, sport, section, sideType: kind === 'team' ? 'team' : 'player', sideSize: kind === 'doubles' ? 2 : 1, scoring: like ? like.scoring : 'points', config: like ? like.config : {}, participantIds: [], tid, ...staff }, null);
+      db.events.push(ev); audit(user.name, 'created game', name + ' in ' + tour(tid).name); save(); broadcast();
+      return json(res, 200, { event: ev, pins });
+    }
+    if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/staff$/)) && m === 'PUT') {
+      const ev = find('events', mm[1]); if (!ev) throw new HttpError(404, 'Game not found');
+      const pins = [], staff = gameStaff(await readJson(req, 20000), pins);
+      ev.organizerIds = staff.organizerIds; ev.refereeIds = staff.refereeIds;
+      audit(user.name, 'set organizer & referees', ev.name); save(); broadcast();
+      return json(res, 200, { ok: true, pins });
+    }
+    /* ---- team builder for a team game: players who chose the game -> teams entered in it ---- */
+    if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/(teams|auto-teams)$/)) && m === 'POST') {
+      const ev = find('events', mm[1]); if (!ev) throw new HttpError(404, 'Game not found');
+      if (ev.sideType !== 'team') throw new HttpError(400, ev.name + ' is not a team game.');
+      const sec = ev.section || 'adults', b = await readJson(req, 20000);
+      const placed = new Set(ev.participantIds.flatMap((tid) => (find('teams', tid) || { memberIds: [] }).memberIds));
+      const freeName = () => { let n = 1; while (db.teams.some((x) => x.section === sec && x.tid === ev.tid && x.name.toLowerCase() === 'team ' + n)) n++; return 'Team ' + n; };
+      const make = (name, ids) => {
+        const t = COLS.teams({ name, section: sec, memberIds: ids, tid: ev.tid }, null);
+        if (db.teams.some((x) => x.section === sec && x.tid === ev.tid && x.name.toLowerCase() === t.name.toLowerCase())) throw new HttpError(409, 'A team called "' + t.name + '" already exists – choose another name.');
+        db.teams.push(t); ev.participantIds.push(t.id);
+        ev.interestedIds = (ev.interestedIds || []).filter((id) => !ids.includes(id));
+        return t;
+      };
+      if (mm[2] === 'teams') {
+        const ids = [...new Set((Array.isArray(b.memberIds) ? b.memberIds : []).map(String))].filter((id) => { const pl = find('players', id); return pl && (pl.section || 'adults') === sec && inRoster(ev.tid, id); });
+        const t = make(str(b.name, 60).trim() || freeName(), ids);
+        audit(user.name, 'made team for ' + ev.name, t.name + ' (' + ids.length + ' players)'); save(); broadcast();
+        return json(res, 200, t);
+      }
+      const pool = (ev.interestedIds || []).map((id) => find('players', id)).filter((pl) => pl && !placed.has(pl.id) && (pl.section || 'adults') === sec && inRoster(ev.tid, pl.id));
+      if (pool.length < 2) throw new HttpError(400, 'At least 2 players must be waiting for a team.');
+      const size = clampN(b.size, 2, 20, 4), k = Math.max(1, Math.round(pool.length / size));
+      for (let i = pool.length - 1; i > 0; i--) { const j = crypto.randomInt(i + 1); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+      const order = { F: 0, M: 1 }; pool.sort((a, c) => (order[a.gender] ?? 2) - (order[c.gender] ?? 2));   // deal women, then men, so teams are mixed evenly
+      const groups = Array.from({ length: k }, () => []); pool.forEach((pl, i) => groups[i % k].push(pl.id));
+      const made = groups.map((ids) => make(freeName(), ids));
+      audit(user.name, 'auto-made teams for ' + ev.name, made.length + ' teams from ' + pool.length + ' players'); save(); broadcast();
+      return json(res, 200, { teams: made.length, players: pool.length });
+    }
+    if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/teams\/([\w-]+)\/remove$/)) && m === 'POST') {
+      const ev = find('events', mm[1]), t = find('teams', mm[2]); if (!ev || !t) throw new HttpError(404, 'Not found');
+      if (db.matches.some((x) => x.eventId === ev.id && (x.sideA.includes(t.id) || x.sideB.includes(t.id)))) throw new HttpError(409, t.name + ' already has fixtures in ' + ev.name + ' – use Withdraw / replace instead.');
+      ev.participantIds = ev.participantIds.filter((id) => id !== t.id);
+      ev.interestedIds = [...new Set((ev.interestedIds || []).concat(t.memberIds))];
+      audit(user.name, 'removed team from ' + ev.name, t.name); save(); broadcast();
+      return json(res, 200, { ok: true });
+    }
+    if ((mm = p.match(/^\/api\/admin\/referees\/([\w-]+)\/approve$/)) && m === 'POST') {
+      const r = find('referees', mm[1]); if (!r) throw new HttpError(404, 'Not found');
+      const b = await readJson(req, 3000);
+      const pin = pinN(4); r.pinHash = hashPin(pin); r.status = 'active';
+      if (['referee', 'chief', 'volunteer'].includes(b.kind)) r.kind = b.kind;
+      if (Array.isArray(b.sports)) r.sports = [...new Set(b.sports.filter((x) => SPORTS.includes(x)))];
+      if (Array.isArray(b.eventIds)) r.eventIds = [...new Set(b.eventIds.map(String).filter((x) => find('events', x)))];
+      audit(user.name, 'approved referee', r.name); save(); broadcast();
+      return json(res, 200, { ok: true, name: r.name, pin });
     }
     if (p === '/api/admin/players/approve-all' && m === 'POST') {
       let n = 0; db.players.filter((x) => x.status === 'pending').forEach((x) => { x.status = 'approved'; enrol(x); n++; });
@@ -1825,11 +2717,12 @@ async function route(req, res, url) {
     }
     if ((mm = p.match(/^\/api\/admin\/players\/([\w-]+)$/)) && m === 'GET') {
       const x = find('players', mm[1]); if (!x) throw new HttpError(404, 'Not found');
-      return json(res, 200, x);
+      const { pinHash, pinIdx: _pi, editTokenHash, ...safe } = x;
+      return json(res, 200, { ...safe, hasPin: !!pinHash });
     }
     if ((mm = p.match(/^\/api\/admin\/matches\/([\w-]+)\/reset$/)) && m === 'POST') {
       const match = find('matches', mm[1]); if (!match) throw new HttpError(404, 'Match not found');
-      match.log = []; match.cids = []; match.result = null; match.walkover = null; match.retired = null; match.outcome = ''; delete match.startedAt; delete match.lock; delete match.notified15;
+      match.log = []; match.cids = []; match.result = null; match.walkover = null; match.retired = null; match.outcome = ''; delete match.startedAt; delete match.lock; delete match.notified15; delete match.paper;
       (match.rubbers || []).forEach((r) => { r.log = []; r.cids = []; r.result = null; r.walkover = null; r.outcome = ''; });
       audit(user.name, 'reset scores', '', match.id); save(); broadcast(); return json(res, 200, { ok: true });
     }
@@ -1943,13 +2836,14 @@ async function route(req, res, url) {
       const finish = (item, code) => {
         const plain = item._plain; delete item._plain;
         save(); broadcast();
-        return json(res, code || 200, col === 'referees' ? { id: item.id, name: item.name, pin: plain } : item);
+        return json(res, code || 200, col === 'referees' ? { id: item.id, name: item.name, kind: item.kind, sports: item.sports, eventIds: item.eventIds, status: item.status, pin: plain } : item);
       };
       if (m === 'POST' && !id) {
         const b = await readJson(req);
         if (col === 'matches' && !sportOk(user, find('events', b.eventId))) throw new HttpError(403, 'That event belongs to another sport.');
-        if (col === 'events' && user.sports && user.sports.length && !user.sports.includes(b.sport)) throw new HttpError(403, 'You can only add events for your sport.');
+        if (col === 'events' && isLead(user) && !(user.sports || []).includes(b.sport)) throw new HttpError(403, 'You can only add events for your sport.');
         const item = COLS[col](b, null);
+        if (col === 'players') { const tid = tidOf(b.tid); if (!canTour(user, tid) && isLead(user)) throw new HttpError(403, 'Only this event’s organizers can add players to it.'); addRoster(tid, [item.id]); }
         if (col === 'matches') { const c = findClashes(item); if (c.length && !b.force) throw new HttpError(409, 'Schedule clash:\n• ' + c.join('\n• '), { clash: true, clashes: c }); }
         db[col].push(item); audit(user.name, 'created ' + col.slice(0, -1), item.name || '', col === 'matches' ? item.id : '');
         return finish(item);
@@ -1965,6 +2859,7 @@ async function route(req, res, url) {
       }
       if (m === 'DELETE' && id) {
         if (!find(col, id)) throw new HttpError(404, 'Not found');
+        if (col === 'players' && find(col, id).status !== 'pending') throw new HttpError(403, 'Player profiles are permanent. Remove the player from an event instead, or merge a duplicate into the right profile.');
         const snap = snapshot(col, id);
         cascadeDelete(col, id); pushTrash(snap); audit(user.name, 'deleted ' + col.slice(0, -1), snap.name || id, col === 'matches' ? id : '');
         save(); broadcast(); return json(res, 200, { ok: true });

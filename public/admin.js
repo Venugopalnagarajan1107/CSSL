@@ -15,7 +15,7 @@ const fill = (el, ...kids) => el.replaceChildren(...kids.flat(Infinity).filter((
 const sel = (opts, val) => h('select', {}, opts.map(([v, l]) => h('option', { value: v, selected: String(val) === String(v) }, l)));
 const inp = (val, o) => h('input', { value: val == null ? '' : val, ...(o || {}) });
 const SECTION_OPTS = [['adults', 'Adults'], ['kids', 'Kids']];
-const playersIn = (section) => S.players.filter((p) => (p.section || 'adults') === section);
+const playersIn = (section, tid) => { const T = tourById(tid || curTid()) || { playerIds: [] }; return S.players.filter((p) => (p.section || 'adults') === section && (T.kind === 'friendly' || T.playerIds.includes(p.id))); };
 
 /* ------------------------------------------------------------------ player */
 const STYLE_HINTS = {
@@ -24,6 +24,249 @@ const STYLE_HINTS = {
   carrom: ['Striker', 'Defender', 'Queen specialist', 'Slammer'],
   chess: ['Aggressive', 'Positional', 'Tactical', 'Defensive'],
 };
+/* Contact details are masked on screen ("98•••••343"); "Show" reveals them for editing. Unrevealed fields are not sent back, so they stay unchanged. */
+function secretInput(v, attrs, kind) {
+  const masked = !v ? '' : kind === 'email' ? String(v).replace(/^(.).*(@.*)$/, '$1•••$2') : kind === 'text' ? '•••••• (hidden)' : maskPhone(v);
+  const i = inp(masked, attrs || {}); i.readOnly = !!v;
+  let open = !v;
+  const btn = v ? h('button', { type: 'button', class: 'btn ghost sm', onclick: () => { i.value = v; i.readOnly = false; open = true; btn.remove(); } }, 'Show') : null;
+  const el = h('div', { class: 'secret' }, i, btn);
+  Object.defineProperty(el, 'value', { get: () => (open ? i.value : undefined) });
+  return el;
+}
+function secretText(prefix, v) {
+  const span = h('span', {}, prefix + maskPhone(v) + ' ');
+  span.append(h('button', { type: 'button', class: 'btn ghost sm', onclick: (e) => { span.textContent = prefix + v; e.stopPropagation(); } }, 'Show'));
+  return span;
+}
+
+/* Add people by typing a name or picking someone from the player list. values(): ["Typed Name", { playerId }] */
+function staffAdder(label) {
+  const picked = [], dl = 'pl-' + Math.random().toString(36).slice(2);
+  const list = h('datalist', { id: dl }, S.players.filter((p) => p.status !== 'pending').map((p) => h('option', { value: p.name })));
+  const input = h('input', { list: dl, placeholder: label + ': type a name or pick a player', 'aria-label': label });
+  const chips = h('div', { class: 'chips' });
+  const draw = () => chips.replaceChildren(...picked.map((x, i) => h('span', { class: 'chip plain' }, (x.playerId ? '👤 ' : '') + x.name, ' ', h('button', { type: 'button', class: 'x', 'aria-label': 'Remove', onclick: () => { picked.splice(i, 1); draw(); } }, '✕'))));
+  const add = () => { const v = input.value.trim(); if (!v) return; const pl = S.players.find((p) => p.name.toLowerCase() === v.toLowerCase()); if (!picked.some((x) => x.name.toLowerCase() === v.toLowerCase())) picked.push(pl ? { name: pl.name, playerId: pl.id } : { name: v }); input.value = ''; draw(); };
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } });
+  const el = h('div', { class: 'adder' }, h('div', { class: 'secret' }, input, list, h('button', { type: 'button', class: 'btn ghost sm', onclick: add }, 'Add')), chips);
+  return { el, values: () => { if (input.value.trim()) add(); return picked.map((x) => (x.playerId ? { playerId: x.playerId } : x.name)); } };
+}
+/* New event: name, dates, organizers, referees and its games (or copy the games of another event). */
+function newEventModal() {
+  const name = inp('', { placeholder: 'e.g. CSSL - Season 4 or Diwali Kids Cup', maxlength: 80 }), dates = inp('', { placeholder: 'e.g. 29–30 Nov 2026' }), venue = inp('');
+  const myRef = me.role === 'referee' ? S.referees.find((r) => r.name === me.name) : null;
+  const orgs = checkList((S.organizers || []).map((a) => ({ id: a.id, name: a.name })), isAdmin() ? [me.adminId] : []), newOrgs = staffAdder('New organizer');
+  const refs = checkList(S.referees.filter((r) => r.status !== 'pending').map((r) => ({ id: r.id, name: r.name })), myRef ? [myRef.id] : []), newRefs = staffAdder('New referee');
+  const copy = sel([['', '— set up games below —']].concat(realTours().map((t) => [t.id, 'Copy the games of ' + t.name])), '');
+  const rows = [], box = h('div', {});
+  const drawRows = () => box.replaceChildren(...rows.map((r, i) => h('div', { class: 'gamerow' }, r.sport, r.kind, r.section, r.name, h('button', { type: 'button', class: 'btn ghost sm', 'aria-label': 'Remove game', onclick: () => { rows.splice(i, 1); drawRows(); } }, '✕'))));
+  const row = (g) => { rows.push({ sport: sel([['badminton', '🏸 Badminton'], ['tt', '🏓 Table tennis'], ['carrom', '🎯 Carrom'], ['chess', '♟️ Chess'], ['other', '🏅 Other']], g.sport), kind: sel([['singles', 'Singles'], ['doubles', 'Doubles'], ['team', 'Team']], g.kind || 'singles'), section: sel(SECTION_OPTS, g.section || 'adults'), name: inp(g.name || '', { placeholder: 'Name (optional)' }) }); drawRows(); };
+  ['badminton', 'tt', 'carrom', 'chess'].forEach((sp) => row({ sport: sp }));
+  const addBtn = h('button', { type: 'button', class: 'btn ghost sm', onclick: () => row({ sport: 'badminton' }) }, '+ Add game');
+  copy.addEventListener('change', () => { box.hidden = addBtn.hidden = !!copy.value; });
+  modal('New event', h('div', {}, field('Event name', name), h('div', { class: 'two' }, field('Dates', dates), field('Venue', venue)),
+    h('b', {}, '👔 Organizers'), h('p', { class: 'muted small' }, (isAdmin() ? 'You are an organizer of this event. ' : 'Add at least one organizer – add yourself by name to get an organizer PIN. ') + 'Organizers manage the event.'), orgs, newOrgs.el,
+    h('b', {}, '🧑‍⚖️ Referees'), refs, newRefs.el,
+    h('b', {}, '🏸 Games'), copy, box, addBtn,
+    h('p', { class: 'muted small' }, 'Players join by registering for this event, by an uploaded player list, or when an organizer enrols them. Everything can be changed later.')),
+  [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, { label: 'Create event', fn: async () => {
+    const r = await api('POST', '/api/staff/tournaments', { name: name.value, dates: dates.value, venue: venue.value, organizerIds: orgs.values(), newOrganizers: newOrgs.values(), refereeIds: refs.values(), newReferees: newRefs.values(),
+      copyFrom: copy.value, games: copy.value ? [] : rows.map((x) => ({ sport: x.sport.value, kind: x.kind.value, section: x.section.value, name: x.name.value })) });
+    await refresh(); ui.tid = r.tournament.id; store.set('tid', r.tournament.id); scope(); location.hash = '#/season/games'; showPins(r.pins, () => render());
+  } }]);
+}
+function tourDetailsModal(T) {
+  const name = inp(T.name), dates = inp(T.dates), venue = inp(T.venue), closed = T.status === 'closed';
+  modal('Event details', h('div', {}, field('Event name', name), field('Dates', dates), field('Venue', venue),
+    h('p', { class: 'muted small' }, closed ? 'This event is closed: scores are frozen. Reopen it to change anything.' : 'Close the event when it is over – scores freeze; it stays in All events and in all-time rankings.')),
+  [{ label: closed ? 'Reopen event' : 'Close event', cls: closed ? 'ghost' : 'danger', close: false, fn: (close) => confirmBox((closed ? 'Reopen ' : 'Close ') + T.name + '?', guard(async () => { await api('PUT', '/api/staff/tournaments/' + T.id, { status: closed ? 'open' : 'closed' }); close(); await refresh(); }), closed ? 'Reopen' : 'Close event') },
+    { label: 'Save', fn: async () => { await api('PUT', '/api/staff/tournaments/' + T.id, { name: name.value, dates: dates.value, venue: venue.value }); await refresh(); } }]);
+}
+function tourStaffModal(T, what) {
+  const orgsMode = what === 'organizers';
+  const pool = orgsMode ? (S.organizers || []).map((a) => ({ id: a.id, name: a.name })) : S.referees.filter((r) => r.status !== 'pending').map((r) => ({ id: r.id, name: r.name }));
+  const list = checkList(pool, orgsMode ? T.organizerIds : T.refereeIds), adder = staffAdder(orgsMode ? 'New organizer' : 'New referee');
+  modal((orgsMode ? 'Organizers' : 'Referees') + ' – ' + T.name, h('div', {}, h('p', { class: 'muted small' }, 'Tick existing ' + (orgsMode ? 'organizers' : 'referees') + ', or add new ones by name or from the player list. At least one is needed. New people get a PIN.'), list, adder.el),
+    [{ label: 'Save', fn: async () => { const r = await api('PUT', '/api/staff/tournaments/' + T.id, orgsMode ? { organizerIds: list.values(), newOrganizers: adder.values() } : { refereeIds: list.values(), newReferees: adder.values() }); await refresh(); showPins(r.pins); } }]);
+}
+/* Event → Teams: teams made from the event's players, and the team games each plays. */
+function eventTeams(T) {
+  const mine = canManageTour(T), teamGames = S.events.filter((e) => e.sideType === 'team');
+  const gamesOf = (t) => teamGames.filter((e) => e.participantIds.includes(t.id)).map((e) => e.name);
+  return h('div', {},
+    mine && T.status !== 'closed' ? h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: () => eventTeamModal(T, null) }, '+ New team'), !teamGames.length ? h('span', { class: 'muted small' }, 'Tip: add a team game first (Games → + New game → Team).') : null) : null,
+    teamGames.map((ev) => { const placed = new Set(ev.participantIds.flatMap((id) => (byId('teams', id) || { memberIds: [] }).memberIds)); const w = (ev.interestedIds || []).filter((id) => !placed.has(id)).length;
+      return w && mine ? h('a', { class: 'card tip', href: '#/event/' + ev.id, onclick: () => { ui.eventTab[ev.id] = 'people'; } }, '🙋 ' + w + ' players chose ' + ev.name + ' and are waiting for a team – build or auto-make teams ›') : null; }),
+    S.teams.length ? groupBySection(S.teams, (t) => h('div', { class: 'row', onclick: () => (mine ? eventTeamModal(T, t) : null) }, h('div', { class: 'grow' }, h('b', {}, t.name),
+      h('div', { class: 'muted small' }, t.memberIds.map((i) => (byId('players', i) || {}).name).filter(Boolean).join(', ') || 'No players yet'),
+      h('div', { class: 'small' }, '🏆 ' + (gamesOf(t).join(', ') || 'not in a game yet'))), mine ? h('span', { class: 'muted' }, 'Edit') : null))
+      : h('p', { class: 'empty' }, 'No teams yet.'));
+}
+function eventTeamModal(T, t) {
+  const name = inp(t ? t.name : ''), section = sel(SECTION_OPTS, t ? t.section : ui.section), wrap = h('div', {});
+  let members = checkList([], []), games = checkList([], []);
+  const draw = () => {
+    members = checkList(playersIn(section.value, T.id).sort((a, b) => a.name.localeCompare(b.name)), t && t.section === section.value ? t.memberIds : []);
+    games = checkList(S.events.filter((e) => e.sideType === 'team' && secOf(e) === section.value), t ? S.events.filter((e) => e.participantIds.includes(t.id)).map((e) => e.id) : []);
+    wrap.replaceChildren(h('b', {}, 'Players (from ' + T.name + ')'), members, h('b', {}, 'Team games this team plays'), games);
+  };
+  section.addEventListener('change', draw); draw();
+  modal(t ? 'Edit team' : 'New team in ' + T.name, h('div', {}, field('Team name', name), t ? null : field('Section', section), wrap),
+    [t ? { label: 'Delete team', cls: 'danger', close: false, fn: (close) => confirmBox('Delete team ' + t.name + '?', guard(async () => { await api('DELETE', '/api/admin/teams/' + t.id); close(); await refresh(); }), 'Delete') } : null,
+      { label: 'Save', fn: async () => {
+        if (t) { await api('PUT', '/api/admin/teams/' + t.id, { name: name.value, memberIds: members.values() }); const r = await api('PUT', '/api/admin/teams/' + t.id + '/games', { eventIds: games.values() }); if (r.kept.length) toast('Still in ' + r.kept.join(', ') + ' – it already has fixtures', true); }
+        else await api('POST', '/api/admin/tournaments/' + T.id + '/teams', { name: name.value, section: section.value, memberIds: members.values(), eventIds: games.values() });
+        await refresh();
+      } }].filter(Boolean));
+}
+/* Event → Players: the event's roster. Players join by registering, an uploaded list, or being enrolled by an organizer. */
+function eventPlayers(T) {
+  const mine = canManageTour(T), R = S.registration || {};
+  let q = '';
+  const list = h('div', { class: 'list' });
+  const draw = () => list.replaceChildren(...S.players.filter((p) => (T.playerIds || []).includes(p.id) && p.name.toLowerCase().includes(q)).sort((a, b) => a.name.localeCompare(b.name)).map((p) =>
+    h('div', { class: 'row' }, avatar(p, 32), h('a', { class: 'grow', href: '#/player/' + p.id }, h('b', {}, p.name), h('div', { class: 'muted small' }, [SEC[p.section || 'adults'], S.events.filter((e) => e.participantIds.includes(p.id) || (e.interestedIds || []).includes(p.id)).map((e) => e.name).join(', ') || 'no games yet'].join(' • '))),
+      mine && T.status !== 'closed' ? h('button', { class: 'btn ghost sm', 'aria-label': 'Remove ' + p.name + ' from ' + T.name, onclick: () => confirmBox('Remove ' + p.name + ' from ' + T.name + '? Their profile stays in the player database.', guard(async () => { await api('POST', '/api/admin/tournaments/' + T.id + '/roster', { remove: p.id }); await refresh(); }), 'Remove') }, '✕') : null)));
+  draw();
+  return h('div', {},
+    mine && T.status !== 'closed' ? h('div', {},
+      h('div', { class: 'card' }, h('b', {}, '📝 Registration for ' + T.name), h('p', { class: 'muted small' }, R.open ? 'Open' + (R.deadline ? ' until ' + R.deadline : '') + (R.pending ? ' • ' + R.pending + ' waiting for approval' : '') : 'Closed'),
+        h('div', { class: 'actions' }, h('a', { class: 'btn ghost sm', href: '#/admin', onclick: () => { ui.adminTab = 'registration'; } }, 'Settings & approvals ›'), R.open ? copyBtn(BASE() + '/#/register/' + T.id, 'Copy registration link') : null)),
+      importCard(),
+      h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: () => enrolModal(T) }, '➕ Enrol existing player'), h('button', { class: 'btn ghost', onclick: () => playerModal(null, ui.section) }, '+ New player'))) : null,
+    h('input', { class: 'search', type: 'search', placeholder: 'Search ' + (T.playerIds || []).length + ' players…', 'aria-label': 'Search players', oninput: (e) => { q = e.target.value.toLowerCase(); draw(); } }),
+    list, !(T.playerIds || []).length ? h('p', { class: 'empty' }, 'No players in this event yet. They register, are uploaded, or are enrolled.') : null);
+}
+function enrolModal(T) {
+  const out = S.players.filter((p) => p.status === 'approved' && !(T.playerIds || []).includes(p.id)).sort((a, b) => a.name.localeCompare(b.name));
+  const list = checkList(out.map((p) => ({ id: p.id, name: p.name + (p.section === 'kids' ? ' (kids)' : '') })), []);
+  modal('Enrol players in ' + T.name, h('div', {}, h('p', { class: 'muted small' }, 'Players already in the database (from other events). After enrolling, put them in games from the game’s settings or their profile.'), out.length ? list : h('p', { class: 'empty' }, 'Everyone is already in this event.')),
+    [{ label: 'Enrol', fn: async () => { const r = await api('POST', '/api/admin/tournaments/' + T.id + '/roster', { add: list.values() }); toast(r.added + ' enrolled'); await refresh(); } }]);
+}
+
+/* ---- games (sub-events) with their organizer and referees ---- */
+function staffPicker(ev) {
+  const orgs = (S.organizers || []).map((a) => ({ id: a.id, name: a.name + (a.limited ? ' (game organizer)' : (a.sports || []).length ? ' (sport lead)' : ' (main organizer)') }));
+  const refs = S.referees.filter((r) => r.status !== 'pending').map((r) => ({ id: r.id, name: r.name + (r.kind === 'chief' ? ' (chief)' : '') }));
+  const orgList = checkList(orgs, ev ? ev.organizerIds || [] : []), refList = checkList(refs, ev ? ev.refereeIds || [] : curT().refereeIds || []);
+  const newRefs = staffAdder('New referee'), newOrgs = staffAdder('Extra organizer');
+  const el = h('div', {},
+    h('b', {}, '🧑‍⚖️ Referees for this game (at least one)'), refList, h('div', { class: 'muted small' }, '…or add new ones – type a name or pick a player:'), newRefs.el,
+    h('details', {}, h('summary', { class: 'small' }, 'Extra organizer just for this game (optional – the event’s organizers already manage it)'), orgList, newOrgs.el));
+  return { el, values: () => ({ organizerIds: orgList.values(), refereeIds: refList.values(), newOrganizers: newOrgs.values(), newReferees: newRefs.values() }) };
+}
+function showPins(pins, after) {
+  if (!pins || !pins.length) { if (after) after(); return; }
+  modal('New PINs – shown only once', h('div', {}, h('p', { class: 'small' }, 'Give each person their PIN. They sign in from Menu → Sign in.'),
+    pins.map((x) => h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, x.name), h('div', { class: 'muted small' }, x.role)), h('div', { class: 'bigpin', style: 'font-size:22px' }, x.pin)))),
+  [{ label: 'Done', fn: () => { if (after) after(); } }]);
+}
+function newGameModal() {
+  const sport = sel([['badminton', '🏸 Badminton'], ['tt', '🏓 Table tennis'], ['carrom', '🎯 Carrom'], ['chess', '♟️ Chess'], ['other', '🏅 Other']], me.sports && me.sports[0] || 'badminton');
+  const section = sel(SECTION_OPTS, ui.section), kind = sel([['singles', 'Individual – singles'], ['doubles', 'Individual – doubles (pairs)'], ['team', 'Team event']], 'singles');
+  const name = inp('', { placeholder: 'Optional, e.g. Men’s Doubles', maxlength: 80 });
+  const staff = staffPicker(null);
+  modal('New game – ' + (S.tournament.seasonName || 'this season'), h('div', {}, field('Sport', sport), field('Who plays', kind), field('Section', section), field('Name', name, 'Leave empty to name it after the sport.'), staff.el,
+    h('p', { class: 'muted small' }, 'Scoring rules start from the usual rules for the sport – change them later under ⚙ Game settings.')),
+  [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, { label: 'Create game', fn: async () => {
+    const r = await api('POST', '/api/admin/games', { tid: curTid(), sport: sport.value, section: section.value, kind: kind.value, name: name.value, ...staff.values() });
+    await refresh(); showPins(r.pins, () => { location.hash = '#/event/' + r.event.id; });
+  } }]);
+}
+function staffModal(ev) {
+  const staff = staffPicker(ev);
+  modal('Referees – ' + ev.name, staff.el, [{ label: 'Save', fn: async () => { const r = await api('PUT', '/api/admin/events/' + ev.id + '/staff', staff.values()); await refresh(); showPins(r.pins); } }]);
+}
+function seasonModal() {
+  const T = S.tournament, f = { season: inp(T.seasonName || ''), dates: inp(T.dates, { placeholder: 'e.g. 29–30 Nov 2026' }), venue: inp(T.venue) };
+  modal('Event details', h('div', {}, field('Event / season name', f.season), field('Dates', f.dates), field('Venue', f.venue), h('p', { class: 'muted small' }, 'Start the next season from Admin → Data.')),
+    [{ label: 'Save', fn: async () => { await api('POST', '/api/admin/tournament', { seasonName: f.season.value, dates: f.dates.value, venue: f.venue.value }); await refresh(); } }]);
+}
+const shiftModal = () => modal('Running late?', shiftCard());
+
+/* ---- team builder (team game → Teams tab): players who chose the game, waiting for a team ---- */
+function teamBuilder(ev) {
+  const entered = (ev.participantIds || []).map((id) => byId('teams', id)).filter(Boolean);
+  const placed = new Set(entered.flatMap((t) => t.memberIds));
+  const waiting = (ev.interestedIds || []).filter((id) => !placed.has(id)).map((id) => byId('players', id)).filter(Boolean);
+  const hasFx = (tid) => S.matches.some((m) => m.eventId === ev.id && (m.sideA.includes(tid) || m.sideB.includes(tid)));
+  const size = inp(4, { type: 'number', min: 2, max: 20, inputmode: 'numeric', 'aria-label': 'Players per team', style: 'width:70px' });
+  const names = (ids) => ids.map((i) => (byId('players', i) || {}).name).filter(Boolean).join(', ');
+  return h('div', {},
+    h('div', { class: 'card' }, h('b', {}, '🙋 Waiting for a team (' + waiting.length + ')'),
+      h('p', { class: 'muted small' }, 'Players who chose ' + ev.name + ' (registration or Excel upload) and are not in a team yet.'),
+      waiting.length ? h('div', { class: 'chips' }, waiting.map((p) => h('span', { class: 'chip plain' }, p.name + (p.gender ? ' · ' + p.gender : '')))) : h('p', { class: 'muted small' }, 'Nobody is waiting.'),
+      h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: () => newTeamForEvent(ev, waiting) }, '+ New team'),
+        waiting.length >= 2 ? h('span', { class: 'actions' }, h('span', { class: 'muted small' }, 'Players per team'), size,
+          h('button', { class: 'btn ghost', onclick: () => confirmBox('Split the ' + waiting.length + ' waiting players into teams of about ' + size.value + '? Teams are mixed evenly (women and men) and named Team 1, Team 2… – you can rename and edit them afterwards.', guard(async () => { const r = await api('POST', '/api/admin/events/' + ev.id + '/auto-teams', { size: size.value }); toast(r.teams + ' teams made from ' + r.players + ' players'); await refresh(); }), 'Make teams') }, '⚡ Auto-make teams')) : null,
+        S.teams.some((t) => t.section === secOf(ev) && !(ev.participantIds || []).includes(t.id)) ? h('button', { class: 'btn ghost', onclick: () => addExistingTeams(ev) }, 'Add existing team') : null)),
+    h('h3', {}, 'Teams in this game (' + entered.length + ')'),
+    entered.length ? h('div', { class: 'list' }, entered.map((t) => h('div', { class: 'row' },
+      h('div', { class: 'grow' }, h('b', {}, t.name), h('div', { class: 'muted small' }, names(t.memberIds) || 'No players yet')),
+      h('button', { class: 'btn ghost sm', onclick: () => teamModal(t) }, 'Edit'),
+      hasFx(t.id) ? null : h('button', { class: 'btn danger sm', 'aria-label': 'Remove ' + t.name + ' from this game', onclick: () => confirmBox('Take ' + t.name + ' out of ' + ev.name + '? Its players go back to the waiting list; the team itself is kept.', guard(async () => { await api('POST', '/api/admin/events/' + ev.id + '/teams/' + t.id + '/remove'); await refresh(); }), 'Remove') }, '✕'))))
+      : h('p', { class: 'empty' }, 'No teams yet. Make them from the waiting list above, or upload a Teams sheet (Admin → Players → Upload).'));
+}
+function newTeamForEvent(ev, waiting) {
+  const name = inp('', { placeholder: 'e.g. Red Hawks', 'aria-label': 'Team name' });
+  const w = new Set(waiting.map((p) => p.id));
+  const others = playersIn(secOf(ev)).filter((p) => !w.has(p.id)).sort((a, b) => a.name.localeCompare(b.name));
+  const list = checkList(waiting.map((p) => ({ id: p.id, name: p.name + (p.gender ? ' · ' + p.gender : '') })).concat(others.map((p) => ({ id: p.id, name: p.name + ' (did not choose this game)' }))), []);
+  modal('New team in ' + ev.name, h('div', {}, field('Team name', name, 'Leave empty for Team 1, Team 2…'), h('b', {}, 'Players'), h('p', { class: 'muted small' }, 'Players waiting for this game are listed first.'), list),
+    [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, { label: 'Create & enter team', fn: async () => { const t = await api('POST', '/api/admin/events/' + ev.id + '/teams', { name: name.value, memberIds: list.values() }); toast(t.name + ' entered in ' + ev.name); await refresh(); } }]);
+}
+function addExistingTeams(ev) {
+  const list = checkList(S.teams.filter((t) => t.section === secOf(ev) && !(ev.participantIds || []).includes(t.id)).map((t) => ({ id: t.id, name: t.name })), []);
+  modal('Add teams to ' + ev.name, list, [{ label: 'Add', fn: async () => { await api('PUT', '/api/admin/events/' + ev.id, { participantIds: (ev.participantIds || []).concat(list.values()) }); await refresh(); } }]);
+}
+
+/* ---- referees (organizer) ---- */
+const REF_KINDS = [['referee', 'Referee – scores matches'], ['chief', 'Chief referee – scores everything, corrects, resolves reports'], ['volunteer', 'Volunteer – check-in only, no scoring']];
+/* Which sports / games a referee may score. Nothing ticked = everything. */
+function scopePicker(sports, eventIds) {
+  const sp = Object.keys(SPORT_LABEL).filter((k) => S.events.some((e) => e.sport === k)).map((k) => ({ k, cb: h('input', { type: 'checkbox', checked: sports.includes(k) }) }));
+  const evs = checkList(S.events.map((e) => ({ id: e.id, name: e.name + (secOf(e) === 'kids' ? ' (kids)' : '') })), eventIds);
+  const el = h('div', {}, h('div', { class: 'field' }, h('span', {}, 'May score these sports'), h('div', { class: 'checks' }, sp.map((x) => h('label', { class: 'chk' }, x.cb, SPORT_ICON[x.k] + ' ' + SPORT_LABEL[x.k])))),
+    h('details', { open: eventIds.length > 0 }, h('summary', { class: 'small' }, '…or only specific games'), evs),
+    h('small', { class: 'muted' }, 'Leave everything unticked to allow all sports. Chief referees can always score everything.'));
+  return { el, values: () => ({ sports: sp.filter((x) => x.cb.checked).map((x) => x.k), eventIds: evs.values() }) };
+}
+function refereesAdmin() {
+  const t = S.tournament, pend = S.referees.filter((r) => r.status === 'pending');
+  const name = inp('', { placeholder: 'Name', 'aria-label': 'Name' }), kind = sel(REF_KINDS, 'referee'), scope = scopePicker([], []);
+  const link = BASE() + '/#/refsignup';
+  return h('div', {},
+    pend.length ? h('div', { class: 'card warnbox' }, h('b', {}, '🙋 ' + pend.length + ' referee sign-up(s) waiting for approval'),
+      pend.map((r) => h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, r.name), h('div', { class: 'muted small' }, [maskPhone(r.phone), (r.sports || []).map((k) => SPORT_LABEL[k]).join(', '), r.note].filter(Boolean).join(' • '))),
+        h('button', { class: 'btn sm', onclick: () => refereeModal(r, true) }, 'Review'),
+        h('button', { class: 'btn danger sm', 'aria-label': 'Reject ' + r.name, onclick: () => confirmBox('Reject ' + r.name + '’s sign-up?', guard(async () => { await api('DELETE', '/api/admin/referees/' + r.id); await refresh(); }), 'Reject') }, '✕')))) : null,
+    h('div', { class: 'card' }, h('b', {}, 'Add a referee'), h('p', { class: 'muted small' }, 'Only referees change scores; organizers do not. A personal PIN is shown once – give it to the person. They sign in from Menu → Sign in.'),
+      field('Name', name), field('Role', kind), scope.el,
+      h('button', { class: 'btn', onclick: guard(async () => { const r = await api('POST', '/api/admin/referees', { name: name.value, kind: kind.value, ...scope.values() }); await refresh(); showPin(r.name, r.pin); }) }, 'Add referee')),
+    h('div', { class: 'card' }, h('b', {}, 'Referee sign-up'),
+      h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked: !!t.refSignupOpen, onchange: guard(async (e) => { await api('POST', '/api/admin/tournament', { refSignupOpen: e.target.checked }); toast(e.target.checked ? 'Referee sign-up is open' : 'Referee sign-up is closed'); await refresh(); }) }), 'Let people sign up as referees (you approve each one)'),
+      t.refSignupOpen ? h('div', {}, h('div', { class: 'muted small wrap' }, link), h('div', { class: 'actions' },
+        h('button', { class: 'btn ghost sm', onclick: guard(async () => { await navigator.clipboard.writeText(link); toast('Link copied'); }) }, 'Copy link'),
+        h('button', { class: 'btn ghost sm', onclick: () => modal('Referee sign-up', h('div', { class: 'center' }, h('img', { class: 'qr', src: '/api/qr.svg?text=' + encodeURIComponent(link), alt: 'QR code for referee sign-up' }), h('div', { class: 'muted small wrap' }, link))) }, 'QR code'))) : null));
+}
+function refereeModal(r, approving) {
+  const name = inp(r.name), kind = sel(REF_KINDS, r.kind || 'referee'), scope = scopePicker(r.sports || [], r.eventIds || []);
+  modal(approving ? 'Approve referee' : 'Edit referee', h('div', {}, approving ? h('p', { class: 'small' }, r.phone ? secretText('📞 ', r.phone) : null, r.note ? ' • ' + r.note : '') : null, field('Name', name), field('Role', kind), scope.el),
+    [approving ? null : { label: 'Remove', cls: 'danger', close: false, fn: (close) => confirmBox('Remove ' + r.name + '?', guard(async () => { await api('DELETE', '/api/admin/referees/' + r.id); close(); await refresh(); }), 'Remove') },
+      approving ? null : { label: 'New PIN', cls: 'ghost', fn: async () => { const x = await api('PUT', '/api/admin/referees/' + r.id, { resetPin: true }); await refresh(); showPin(x.name, x.pin); } },
+      { label: approving ? 'Approve & get PIN' : 'Save', fn: async () => {
+        if (approving) { await api('PUT', '/api/admin/referees/' + r.id, { name: name.value }); const x = await api('POST', '/api/admin/referees/' + r.id + '/approve', { kind: kind.value, ...scope.values() }); await refresh(); showPin(x.name, x.pin); }
+        else { await api('PUT', '/api/admin/referees/' + r.id, { name: name.value, kind: kind.value, ...scope.values() }); toast('Saved'); await refresh(); }
+      } }].filter(Boolean));
+}
+function rankPtsModal() {
+  const P = rankPts(), L = { win: 'Win', draw: 'Draw', loss: 'Loss', gold: 'Champion bonus', silver: 'Runner-up bonus', bronze: 'Third place bonus' };
+  const f = Object.keys(L).map((k) => ({ k, i: inp(P[k], { type: 'number', min: 0, max: 100, inputmode: 'numeric' }) }));
+  modal('Ranking points', h('div', {}, h('p', { class: 'muted small' }, 'Points each player gets. Changing them recalculates every ranking, including past seasons.'), f.map((x) => field(L[x.k], x.i))),
+    [{ label: 'Save', fn: async () => { await api('POST', '/api/admin/tournament', { rankPts: Object.fromEntries(f.map((x) => [x.k, x.i.value])) }); toast('Points saved'); await refresh(); } }]);
+}
+
 async function playerModal(p, defaultSection) {
   let priv = {};
   if (p) { try { priv = await api('GET', '/api/admin/players/' + p.id); } catch (e) { toast(e.message, true); return; } }
@@ -33,9 +276,9 @@ async function playerModal(p, defaultSection) {
     affiliation: inp(priv.affiliation, { placeholder: 'Department / company / school' }), bio: h('textarea', { rows: 2, maxlength: 300, placeholder: 'A line or two about the player' }, priv.bio || ''),
     achievements: h('textarea', { rows: 3, placeholder: 'One per line, e.g.\n2025 – Carrom runner-up' }, (priv.achievements || []).join('\n')),
     public: h('input', { type: 'checkbox', checked: p ? priv.profilePublic !== false : (defaultSection || ui.section) !== 'kids' }),
-    phone: inp(priv.phone, { type: 'tel' }), email: inp(priv.email, { type: 'email' }), emergency: inp(priv.emergency, { placeholder: 'Name and phone' }), tshirt: inp(priv.tshirt, { placeholder: 'e.g. M' }),
+    phone: secretInput(priv.phone, { type: 'tel' }), email: secretInput(priv.email, { type: 'email' }, 'email'), emergency: secretInput(priv.emergency, { placeholder: 'Name and phone' }, 'text'), tshirt: inp(priv.tshirt, { placeholder: 'e.g. M' }),
     notes: h('textarea', { rows: 2, placeholder: 'Anything the organisers should remember' }, priv.notes || ''),
-    guardianName: inp(priv.guardianName, { placeholder: 'Parent / guardian name (kids)' }), guardianPhone: inp(priv.guardianPhone, { type: 'tel', placeholder: 'Parent / guardian phone (kids)' }),
+    guardianName: inp(priv.guardianName, { placeholder: 'Parent / guardian name (kids)' }), guardianPhone: secretInput(priv.guardianPhone, { type: 'tel', placeholder: 'Parent / guardian phone (kids)' }),
   };
   if (!p) f.section.addEventListener('change', () => { f.public.checked = f.section.value !== 'kids'; });
   const sportRows = ['badminton', 'tt', 'carrom', 'chess'].map((k) => {
@@ -68,12 +311,12 @@ async function playerModal(p, defaultSection) {
     field('Guardian name', f.guardianName), field('Guardian phone', f.guardianPhone), field('Phone', f.phone), field('Email', f.email), field('Emergency contact', f.emergency), field('T-shirt size', f.tshirt), field('Private notes', f.notes),
     h('p', { class: 'muted small' }, 'Collect contact details only with the player’s (or a guardian’s) consent.'),
     h('div', { class: 'actions' }, prev, file, h('button', { type: 'button', class: 'btn ghost', onclick: () => file.click() }, '📷 Photo'))),
-  [p ? { label: 'Delete', cls: 'danger', close: false, fn: (close) => confirmBox('Delete ' + p.name + '?', async () => { await api('DELETE', '/api/admin/players/' + p.id); close(); location.hash = '#/players'; await refresh(); }, 'Delete') } : null,
+  [
     { label: 'Save', fn: async () => {
       const sports = {}; sportRows.forEach((r) => { sports[r.k] = { level: r.level.value, style: r.style.value, rating: r.rating ? r.rating.value : '' }; });
       const body = { name: f.name.value, section: f.section.value, ageGroup: f.ageGroup.value, gender: f.gender.value, hand: f.hand.value, affiliation: f.affiliation.value, bio: f.bio.value, sports,
         achievements: f.achievements.value.split('\n'), profilePublic: f.public.checked, phone: f.phone.value, email: f.email.value, emergency: f.emergency.value, tshirt: f.tshirt.value, notes: f.notes.value, guardianName: f.guardianName.value, guardianPhone: f.guardianPhone.value, photo };
-      const saved = p ? (await api('PUT', '/api/admin/players/' + p.id, body), p) : await api('POST', '/api/admin/players', body);
+      const saved = p ? (await api('PUT', '/api/admin/players/' + p.id, body), p) : await api('POST', '/api/admin/players', { ...body, tid: curTid() });
       const g = await api('PUT', '/api/admin/players/' + saved.id + '/games', { eventIds: [...gameSet] });
       if (g.skipped && g.skipped.length) toast('Saved. Not changed: ' + g.skipped.join('; '), true);
       await refresh();
@@ -86,7 +329,7 @@ function teamModal(t, defaultSection) {
   const section = sel(SECTION_OPTS, t ? t.section : defaultSection || ui.section);
   const wrap = h('div', {});
   let members = checkList([], []);
-  const draw = () => { members = checkList(playersIn(section.value), ((t && t.section === section.value) ? t.memberIds : [])); wrap.replaceChildren(h('b', {}, 'Members'), members); };
+  const draw = () => { members = checkList(playersIn(section.value, t && t.tid), ((t && t.section === section.value) ? t.memberIds : [])); wrap.replaceChildren(h('b', {}, 'Members'), members); };
   section.addEventListener('change', draw); draw();
   const capBox = t ? h('div', { class: 'card' }, h('b', {}, 'Captain'), h('p', { class: 'muted small' }, 'The captain signs in with a team code to choose and shuffle the line-up for their ties (until a tie starts). They cannot change the team.'),
     (() => { const capSel = sel([['', '— choose captain —']].concat(t.memberIds.map((id) => [id, (byId('players', id) || {}).name || id])), t.captainId || '');
@@ -94,7 +337,7 @@ function teamModal(t, defaultSection) {
   modal(t ? 'Edit team' : 'Create team', h('div', {}, field('Team name', name), field('Section', section), wrap, capBox),
     [t ? { label: 'Delete', cls: 'danger', close: false, fn: (close) => confirmBox('Delete team ' + t.name + '?', async () => { await api('DELETE', '/api/admin/teams/' + t.id); close(); await refresh(); }, 'Delete') } : null,
       { label: 'Save', fn: async () => {
-        const body = { name: name.value, section: section.value, memberIds: members.values() };
+        const body = { name: name.value, section: section.value, memberIds: members.values(), tid: (t && t.tid) || curTid() };
         if (t) await api('PUT', '/api/admin/teams/' + t.id, body); else await api('POST', '/api/admin/teams', body);
         await refresh();
       } }].filter(Boolean));
@@ -201,7 +444,7 @@ function eventModal(ev, defaultSection) {
         format: { type: ff.type.value, groups: ff.groups.value, qualifiers: ff.quals.value, thirdPlace: ff.third.checked, swissRounds: ff.swissR.value || 0, autoAdvance: ff.auto.checked, doubleRR: ff.dbl.checked },
         rubbers: f.sideType.value === 'team' ? rub.filter((x) => x.name.trim()) : [], rubberRules: { clinch: rr.clinch.checked, maxPerPlayer: rr.max.value },
       };
-      if (ev) await api('PUT', '/api/admin/events/' + ev.id, b); else await api('POST', '/api/admin/events', b);
+      if (ev) await api('PUT', '/api/admin/events/' + ev.id, b); else await api('POST', '/api/admin/events', { ...b, tid: curTid() });
       await refresh();
     } }].filter(Boolean));
 }
@@ -214,7 +457,7 @@ function fixtureModal(eventId, match) {
     event: h('select', {}, ['adults', 'kids'].map((sec) => h('optgroup', { label: SEC[sec] }, eventsOf(sec).map((e) => h('option', { value: e.id, selected: ((match && match.eventId) || eventId || evs[0].id) === e.id }, e.name))))),
     stage: sel([['League', 'League (counts in standings)'], ['Quarter-final', 'Quarter-final'], ['Semi-final', 'Semi-final'], ['Final', 'Final'], ['Third place', 'Third-place match'], ['Play-off', 'Play-off (tie-break, not in standings)']], match ? match.stage : 'League'),
     court: inp(match && match.court, { placeholder: 'e.g. Court 1 / Table 2' }), startsAt: inp(match && match.startsAt, { type: 'datetime-local' }),
-    ref: sel([['', 'Any referee']].concat(S.referees.map((r) => [r.id, r.name])), match ? match.refereeId : ''),
+    ref: h('div', {}),
     round: inp(match && match.round || '', { type: 'number', min: 0, max: 99, placeholder: 'e.g. 3' }), total: inp(match && match.totalRounds || '', { type: 'number', min: 0, max: 99, placeholder: 'e.g. 7' }),
     cBest: inp(match && match.cfg && match.cfg.bestOf || '', { type: 'number', min: 1, max: 9, placeholder: 'event default' }), cTarget: inp(match && match.cfg && match.cfg.target || '', { type: 'number', min: 1, placeholder: 'event default' }),
     cWin: inp(match && match.cfg && match.cfg.winBy || '', { type: 'number', min: 1, placeholder: 'event default' }), cCap: inp(match && match.cfg && match.cfg.cap || '', { type: 'number', min: 0, placeholder: 'event default' }),
@@ -226,7 +469,7 @@ function fixtureModal(eventId, match) {
     const ev = byId('events', f.event.value);
     const col = ev.sideType === 'team' ? S.teams : S.players;
     const sameSec = col.filter((x) => (x.section || 'adults') === secOf(ev)).map((x) => x.id);
-    const pool = (ev.participantIds.length ? ev.participantIds : sameSec).map((id) => [id, nameOf(ev, id)]);
+    const pool = (ev.participantIds.length ? ev.participantIds : sameSec.filter((id) => ev.sideType === 'team' || (curT().playerIds || []).includes(id))).map((id) => [id, nameOf(ev, id)]);
     const lineup = (selects, prevIds) => {
       if (ev.sideType !== 'team') return null;
       const box = h('div', {});
@@ -244,16 +487,31 @@ function fixtureModal(eventId, match) {
     const keep = match && match.eventId === ev.id;
     const fa = mk(A, 'Side A', keep ? match.sideA : []); LA = lineup(A, keep ? match.lineupA || [] : []);
     const fb = mk(B, 'Side B', keep ? match.sideB : []); LB = lineup(B, keep ? match.lineupB || [] : []);
+    [...A, ...B].forEach((x) => x.addEventListener('change', drawRefs));
     sides.replaceChildren(...[...fa, LA, h('div', { class: 'center muted' }, 'vs'), ...fb, LB,
       ev.participantIds.length ? null : h('p', { class: 'muted small' }, 'Tip: enrol players in the event (Edit event) to shorten this list. Only ' + SEC[secOf(ev)] + ' section players are listed.')].filter(Boolean));
   };
-  f.event.addEventListener('change', drawSides); drawSides();
+  /* Referees: only people who are not playing in this match (themselves or through their team). Team matches may have several. */
+  let refList = checkList([], []), refTouched = false;
+  const drawRefs = () => {
+    const ev = byId('events', f.event.value); if (!ev) return;
+    const ids = [...A, ...B].map((x) => x.value).filter(Boolean);
+    const playing = new Set(ids.flatMap((id) => [id, ...((byId('teams', id) || {}).memberIds || [])]));
+    const chosen = refTouched ? refList.values() : match && match.eventId === ev.id ? match.refereeIds || [] : ev.refereeIds || [];
+    const free = S.referees.filter((r) => r.status !== 'pending' && r.kind !== 'volunteer' && !(r.playerId && playing.has(r.playerId)));
+    const blocked = S.referees.filter((r) => r.playerId && playing.has(r.playerId));
+    refList = checkList(free.map((r) => ({ id: r.id, name: r.name + (r.kind === 'chief' ? ' (chief)' : '') })), chosen.filter((id) => free.some((r) => r.id === id)));
+    refList.addEventListener('change', () => { refTouched = true; });
+    f.ref.replaceChildren(refList, blocked.length ? h('div', { class: 'muted small' }, 'Not offered because they play in this match: ' + blocked.map((r) => r.name).join(', ')) : null,
+      ev.sideType === 'team' ? h('div', { class: 'muted small' }, 'Team matches can have several referees.') : null);
+  };
+  f.event.addEventListener('change', () => { refTouched = false; drawSides(); drawRefs(); }); drawSides(); drawRefs();
   modal(match ? 'Edit fixture' : 'New fixture', h('div', {}, field('Event', f.event), field('Stage', f.stage), sides,
-    h('div', { class: 'two' }, field('Court / table', f.court), field('Start time', f.startsAt)), field('Referee', f.ref, 'Any signed-in referee can score; this is just who is expected.'),
+    h('div', { class: 'two' }, field('Court / table', f.court), field('Start time', f.startsAt)), field('Referees', f.ref),
     h('div', { class: 'two' }, field('Round', f.round), field('Total rounds', f.total, 'Shown as “Round x of y”')),
     h('details', {}, h('summary', {}, 'Points for this match only (optional)'), h('div', { class: 'two' }, field('Best of', f.cBest), field('Points per game', f.cTarget)), h('div', { class: 'two' }, field('Win by', f.cWin), field('Hard cap', f.cCap)), h('p', { class: 'muted small' }, 'Leave empty to use the event’s settings. Carrom weights can be set per match from Edit event.'))),
   [{ label: 'Save', fn: async () => {
-    const b = { eventId: f.event.value, stage: f.stage.value, court: f.court.value, startsAt: f.startsAt.value, refereeId: f.ref.value, round: f.round.value || 0, totalRounds: f.total.value || 0, cfg: { bestOf: f.cBest.value, target: f.cTarget.value, winBy: f.cWin.value, cap: f.cCap.value }, sideA: A.map((s) => s.value), sideB: B.map((s) => s.value), lineupA: LA ? LA.values() : [], lineupB: LB ? LB.values() : [] };
+    const b = { eventId: f.event.value, stage: f.stage.value, court: f.court.value, startsAt: f.startsAt.value, refereeIds: refList.values(), round: f.round.value || 0, totalRounds: f.total.value || 0, cfg: { bestOf: f.cBest.value, target: f.cTarget.value, winBy: f.cWin.value, cap: f.cCap.value }, sideA: A.map((s) => s.value), sideB: B.map((s) => s.value), lineupA: LA ? LA.values() : [], lineupB: LB ? LB.values() : [] };
     if (b.sideA.includes('') || b.sideB.includes('')) throw new Error('Choose everyone for both sides');
     const submit = (force) => (match ? api('PUT', '/api/admin/matches/' + match.id, { ...b, force }) : api('POST', '/api/admin/matches', { ...b, force }));
     try {
@@ -347,11 +605,24 @@ function scoresModal(m, ev, d, rid) {
 Views.admin = () => {
   if (!isAdmin()) return h('div', {}, h('p', { class: 'empty' }, 'Admins only.'), h('a', { class: 'btn', href: '#/login' }, 'Sign in'));
   const R = S.registration || {};
-  const tabs = [['setup', 'Setup'], ['registration', 'Registration' + (R.pending ? ' (' + R.pending + ')' : '')], ['broadcast', 'Announce'], ['safety', 'Event day'], ['reach', 'Reachability'], ['players', 'Players'], ['teams', 'Teams'], ['referees', 'Referees'], ['events', 'Events'], ['sponsors', 'Sponsors'], ['disputes', 'Reports' + (S.openDisputes ? ' (' + S.openDisputes + ')' : '')], ['trash', 'Trash'], ['data', 'Data']];
-  const t = ui.adminTab;
-  return h('div', {}, h('h1', {}, 'Admin'), h('div', { class: 'seg scroll' }, tabs.map(([k, l]) => h('button', { class: t === k ? 'on' : '', onclick: () => { ui.adminTab = k; render(); } }, l))), adminTabs[t]());
+  const tabs = [['setup', 'Setup'], ['registration', 'Registration' + (R.pending ? ' (' + R.pending + ')' : '')], ['broadcast', 'Announce'], ['safety', 'Event day'], ['reach', 'Reachability'], ['players', 'Players'], ...(isOrganizer() ? [['people', 'People & roles']] : []), ['sponsors', 'Sponsors'], ['disputes', 'Reports' + (S.openDisputes ? ' (' + S.openDisputes + ')' : '')], ['trash', 'Trash'], ['data', 'Data']];
+  const t = tabs.some(([k]) => k === ui.adminTab) ? ui.adminTab : 'setup';
+  return h('div', {}, h('h1', {}, 'Admin'), h('a', { class: 'card tip', href: '#/season' }, '🏆 Games, teams, organizers and referees are set up under ', h('b', {}, 'Event'), ' (' + (S.tournament.seasonName || 'this season') + ') ›'), h('div', { class: 'seg scroll' }, tabs.map(([k, l]) => h('button', { class: t === k ? 'on' : '', onclick: () => { ui.adminTab = k; render(); } }, l))), adminTabs[t]());
 };
 
+function rolesModal(x, done) {
+  const admin = h('input', { type: 'checkbox', checked: x.admin }), ref = sel([['', 'Not a referee'], ['referee', 'Referee – scores matches'], ['chief', 'Chief referee – also corrects scores'], ['volunteer', 'Volunteer – check-in only']], x.referee || '');
+  modal('Roles – ' + x.name, h('div', {}, h('label', { class: 'chk' }, admin, '🛡 Main admin – manages everything, including people and roles'), field('Referee', ref, 'A referee never referees a match they or their team play in.'),
+    h('p', { class: 'muted small' }, 'Organizers are set per event (Event → Organizers). Team captains are set on the team.')),
+  [{ label: 'Save', fn: async () => { const r = await api('POST', '/api/admin/people/' + x.id + '/roles', { admin: admin.checked, referee: ref.value }); if (r.pin) showPin(r.name, r.pin); else toast('Roles saved'); done(); await refresh(); } }]);
+}
+function pinsList(pins) {
+  if (!pins.length) return toast('Everyone already has a PIN');
+  const csv = 'Name,PIN\n' + pins.map((x) => '"' + x.name.replace(/"/g, '""') + '",' + x.pin).join('\n');
+  modal(pins.length + ' new PINs – shown only once', h('div', {}, h('p', { class: 'small' }, 'Share each PIN privately with that person (e.g. WhatsApp). Download the list now – it is not shown again.'),
+    h('div', { class: 'list' }, pins.map((x) => h('div', { class: 'row' }, h('b', { class: 'grow' }, x.name), h('code', {}, x.pin))))),
+  [{ label: '⬇ Download list', cls: 'ghost', close: false, fn: () => { const a = h('a', { href: URL.createObjectURL(new Blob([csv], { type: 'text/csv' })), download: 'pins-' + curT().name.replace(/\W+/g, '-') + '.csv' }); document.body.append(a); a.click(); a.remove(); } }, { label: 'Done', fn: () => {} }]);
+}
 const showPin = (name, pin) => modal('PIN for ' + name, h('div', { class: 'center' }, h('p', {}, 'Give this PIN to ', h('b', {}, name), '. It is shown only once.'), h('div', { class: 'bigpin' }, pin)), [{ label: 'Done', fn: () => {} }]);
 const groupBySection = (items, render1) => ['adults', 'kids'].map((sec) => { const list = items.filter((x) => (x.section || 'adults') === sec); return list.length ? h('div', {}, h('h2', {}, (sec === 'kids' ? '🧒 ' : '🧑 ') + SEC[sec] + ' (' + list.length + ')'), h('div', { class: 'list' }, list.map(render1))) : null; });
 
@@ -376,7 +647,7 @@ function shiftCard() {
 const adminTabs = {
   setup() {
     const T = S.tournament;
-    const f = { name: inp(T.name), tagline: inp(T.tagline), dates: inp(T.dates, { placeholder: 'e.g. 29–30 Nov 2026' }), venue: inp(T.venue), primary: inp(T.primary, { type: 'color' }), tz: inp(T.tz || 'Asia/Kolkata'), sponsorSecs: inp(T.sponsorSeconds || 8, { type: 'number', min: 3, max: 60 }), kidsPhotos: h('input', { type: 'checkbox', checked: !!T.showKidsPhotos }), enforceRef: h('input', { type: 'checkbox', checked: !!T.enforceReferee }) };
+    const f = { season: inp(T.seasonName || '', { placeholder: 'e.g. CSSL - Season 3' }), name: inp(T.name), tagline: inp(T.tagline), dates: inp(T.dates, { placeholder: 'e.g. 29–30 Nov 2026' }), venue: inp(T.venue), primary: inp(T.primary, { type: 'color' }), tz: inp(T.tz || 'Asia/Kolkata'), sponsorSecs: inp(T.sponsorSeconds || 8, { type: 'number', min: 3, max: 60 }), kidsPhotos: h('input', { type: 'checkbox', checked: !!T.showKidsPhotos }), enforceRef: h('input', { type: 'checkbox', checked: !!T.enforceReferee }) };
     let logo = T.logo;
     const prev = h('div', {}, logo ? h('img', { src: logo, class: 'logo big' }) : h('span', { class: 'logo ph big' }, '🏆'));
     const file = h('input', { type: 'file', accept: 'image/*', hidden: true, onchange: guard(async (e) => { if (!e.target.files[0]) return; logo = await uploadImage(e.target.files[0], 400, 'image/png'); prev.replaceChildren(h('img', { src: logo, class: 'logo big' })); }) });
@@ -387,46 +658,45 @@ const adminTabs = {
     });
     const pin = inp('', { type: 'password', inputmode: 'numeric', placeholder: 'New PIN (6–10 digits)', autocomplete: 'new-password' });
     return h('div', {}, linkCard(),
-      h('div', { class: 'card' }, field('Tournament name', f.name), field('Tagline', f.tagline), field('Dates', f.dates), field('Venue', f.venue), field('Brand colour', f.primary), field('Venue time zone', f.tz, 'Used for “starting soon” alerts and the registration deadline. India: Asia/Kolkata'), field('Sponsor rotation (seconds)', f.sponsorSecs),
+      h('div', { class: 'card' }, field('Current season', f.season, 'All games below belong to this season. Start the next season from Admin → Data.'), field('Tournament name', f.name), field('Tagline', f.tagline), field('Dates', f.dates), field('Venue', f.venue), field('Brand colour', f.primary), field('Venue time zone', f.tz, 'Used for “starting soon” alerts and the registration deadline. India: Asia/Kolkata'), field('Sponsor rotation (seconds)', f.sponsorSecs),
         h('div', { class: 'actions' }, prev, file, h('button', { class: 'btn ghost', onclick: () => file.click() }, 'Upload logo')),
         h('label', { class: 'chk' }, f.kidsPhotos, 'Show kids’ photos publicly (off = initials only)'),
         h('label', { class: 'chk' }, f.enforceRef, 'Referees can only score matches assigned to them (matches with no referee stay open to everyone)')),
       sigRows,
-      h('button', { class: 'btn full', onclick: guard(async () => { await api('POST', '/api/admin/tournament', { name: f.name.value, tagline: f.tagline.value, dates: f.dates.value, venue: f.venue.value, primary: f.primary.value, logo, tz: f.tz.value, sponsorSeconds: f.sponsorSecs.value, showKidsPhotos: f.kidsPhotos.checked, enforceReferee: f.enforceRef.checked, signers: signers.map((x) => ({ name: x.name.value, title: x.title.value, image: x.image })) }); toast('Saved'); await refresh(); }) }, 'Save'),
+      h('button', { class: 'btn full', onclick: guard(async () => { await api('POST', '/api/admin/tournament', { seasonName: f.season.value, name: f.name.value, tagline: f.tagline.value, dates: f.dates.value, venue: f.venue.value, primary: f.primary.value, logo, tz: f.tz.value, sponsorSeconds: f.sponsorSecs.value, showKidsPhotos: f.kidsPhotos.checked, enforceReferee: f.enforceRef.checked, signers: signers.map((x) => ({ name: x.name.value, title: x.title.value, image: x.image })) }); toast('Saved'); await refresh(); }) }, 'Save'),
       h('div', { class: 'card' }, h('b', {}, 'Change my admin PIN'), h('p', { class: 'muted small' }, 'Only your other sessions are signed out. Forgot it? Another admin can reset it, or run ./start.command --reset-pin on the Mac.'), pin,
         h('button', { class: 'btn', onclick: guard(async () => { await api('POST', '/api/admin/pin', { pin: pin.value }); pin.value = ''; toast('PIN changed'); }) }, 'Change PIN')),
-      adminsCard());
+      isOrganizer() ? h('a', { class: 'btn ghost', href: '#/season/organizers' }, '👔 Organizers & sign-out of lost phones ›') : null);
   },
   players() {
-    const bulk = h('textarea', { rows: 4, placeholder: 'Paste names, one per line', 'aria-label': 'Names' });
-    const sec = sel(SECTION_OPTS, ui.section);
     return h('div', {},
-      importCard(),
-      h('div', { class: 'card' }, h('b', {}, 'Add many players'), field('Section', sec), bulk, h('div', { class: 'actions' },
-        h('button', { class: 'btn', onclick: guard(async () => { const names = bulk.value.split('\n').map((x) => x.trim()).filter(Boolean); for (const name of names) await api('POST', '/api/admin/players', { name, section: sec.value }); bulk.value = ''; toast(names.length + ' added'); await refresh(); }) }, 'Add'),
-        h('button', { class: 'btn ghost', onclick: () => playerModal(null, sec.value) }, '+ One with details'))),
-      groupBySection(S.players, (p) => h('div', { class: 'row', onclick: () => playerModal(p) }, avatar(p, 32), h('div', { class: 'grow' }, h('b', {}, p.name), p.ageGroup ? h('div', { class: 'muted small' }, p.ageGroup) : null), h('span', { class: 'muted' }, 'Edit'))),
+      h('a', { class: 'card tip', href: '#/season/players' }, '➕ To add players, upload a player list or enrol someone, open ', h('b', {}, '🏆 Event → Players'), ' for ' + curT().name + '. Every player who joins an event stays in this database for good.'),
+      groupBySection(S.players, (p) => h('div', { class: 'row', onclick: () => playerModal(p) }, avatar(p, 32), h('div', { class: 'grow' }, h('b', {}, p.name), h('div', { class: 'muted small' }, [p.ageGroup, realTours().filter((t) => (t.playerIds || []).includes(p.id)).map((t) => t.name).join(', ')].filter(Boolean).join(' • '))), h('span', { class: 'muted' }, 'Edit'))),
       !S.players.length ? h('p', { class: 'empty' }, 'No players yet.') : null);
   },
-  teams() {
-    return h('div', {}, h('button', { class: 'btn', onclick: () => teamModal(null) }, '+ Create team'),
-      groupBySection(S.teams, (t) => h('div', { class: 'row', onclick: () => teamModal(t) }, h('div', { class: 'grow' }, h('b', {}, t.name), h('div', { class: 'muted small' }, t.memberIds.map((i) => (byId('players', i) || {}).name).join(', ') || 'No members')), h('span', { class: 'muted' }, 'Edit'))),
-      !S.teams.length ? h('p', { class: 'empty' }, 'No teams yet. Add players first, then create teams.') : null);
-  },
-  referees() {
-    const name = inp('', { placeholder: 'Name', 'aria-label': 'Name' });
-    const kind = sel([['referee', 'Referee – scores matches'], ['chief', 'Chief referee – scores, corrects, resolves reports'], ['volunteer', 'Volunteer – check-in only, no scoring']], 'referee');
+  people() {
+    if (!isOrganizer()) return h('p', { class: 'empty' }, 'Only a main admin manages people and roles.');
+    const box = h('div', {}, h('p', { class: 'muted' }, 'Loading…'));
+    let q = '';
     const KL = { referee: 'Referee', chief: 'Chief referee', volunteer: 'Volunteer' };
-    return h('div', {}, h('div', { class: 'card' }, h('p', { class: 'muted small' }, 'Only referees change scores; organizers do not. A personal PIN is shown once – give it to the person. They sign in from the Menu.'), name, kind,
-      h('button', { class: 'btn', onclick: guard(async () => { const r = await api('POST', '/api/admin/referees', { name: name.value, kind: kind.value }); await refresh(); showPin(r.name, r.pin); }) }, 'Add person')),
-      h('div', { class: 'list' }, S.referees.map((r) => h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, r.name), h('span', { class: 'muted small' }, '  ' + ({ referee: 'Referee', chief: 'Chief referee', volunteer: 'Volunteer' }[r.kind] || 'Referee'))),
-        h('button', { class: 'btn ghost sm', onclick: guard(async () => { const x = await api('PUT', '/api/admin/referees/' + r.id, { resetPin: true }); showPin(x.name, x.pin); }) }, 'New PIN'),
-        h('button', { class: 'btn danger sm', 'aria-label': 'Remove ' + r.name, onclick: () => confirmBox('Remove ' + r.name + '?', guard(async () => { await api('DELETE', '/api/admin/referees/' + r.id); await refresh(); }), 'Remove') }, '✕')))),
-      !S.referees.length ? h('p', { class: 'empty' }, 'No referees yet.') : null);
-  },
-  events() {
-    return h('div', {}, shiftCard(), h('button', { class: 'btn', onclick: () => eventModal(null) }, '+ New event'),
-      groupBySection(S.events, (ev) => h('div', { class: 'row', onclick: () => eventModal(ev) }, h('div', { class: 'grow' }, h('b', {}, ev.name), h('div', { class: 'muted small' }, (ev.scoring === 'points' ? 'Best of ' + ev.config.bestOf + ' • ' + ev.config.target + ' pts' + (ev.config.winBy > 1 ? ' (win by ' + ev.config.winBy + ')' : '') : 'Result only') + ' • ' + (ev.participantIds || []).length + ' enrolled'), h('div', { class: 'muted small' }, formatSummary(ev))), h('span', { class: 'muted' }, 'Edit'))));
+    const load2 = () => api('GET', '/api/admin/people').then(draw).catch((e) => box.replaceChildren(h('p', { class: 'empty' }, e.message)));
+    const draw = (d) => {
+      const list = h('div', { class: 'list' });
+      const rows = () => list.replaceChildren(...d.people.filter((x) => x.name.toLowerCase().includes(q)).sort((a, b) => (b.admin + b.organizer + !!b.referee) - (a.admin + a.organizer + !!a.referee) || a.name.localeCompare(b.name)).slice(0, 300).map((x) =>
+        h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, x.name),
+          h('div', { class: 'chips' }, [x.admin ? '🛡 Admin' : '', x.organizer ? '👔 Organizer' : '', x.referee ? '🧑‍⚖️ ' + KL[x.referee] : '', x.captain ? '🧢 Captain' : '', x.hasPin ? '🔑 has PIN' : 'no PIN yet'].filter(Boolean).map((c) => h('span', { class: 'chip plain' }, c)))),
+          h('button', { class: 'btn ghost sm', onclick: () => rolesModal(x, load2) }, 'Roles'),
+          h('button', { class: 'btn ghost sm', onclick: () => confirmBox((x.hasPin ? 'Replace ' : 'Make ') + x.name + '’s PIN? ' + (x.hasPin ? 'The old one stops working.' : ''), guard(async () => { const r = await api('POST', '/api/admin/people/' + x.id + '/pin'); showPin(r.name, r.pin); load2(); }), x.hasPin ? 'New PIN' : 'Make PIN') }, x.hasPin ? 'New PIN' : 'Make PIN'))));
+      rows();
+      const missing = d.people.filter((x) => !x.hasPin).length;
+      box.replaceChildren(
+        h('div', { class: 'card' }, h('b', {}, '🔑 One PIN per person'), h('p', { class: 'muted small' }, 'Everyone signs in with just their PIN. Give roles here once – the same PIN then works for playing, refereeing (never in a match they or their team play), organizing and admin. People can change their PIN in My profile.'),
+          missing ? h('button', { class: 'btn', onclick: () => confirmBox('Make PINs for the ' + missing + ' people in ' + curT().name + ' who do not have one?', guard(async () => { const r = await api('POST', '/api/admin/people/pins', { tid: curTid() }); pinsList(r.pins); load2(); }), 'Make PINs') }, '🔑 Make PINs for everyone in ' + curT().name + ' without one') : h('p', { class: 'small' }, 'Everyone has a PIN.')),
+        d.unlinked.length ? h('div', { class: 'card warnbox' }, h('b', {}, 'Older sign-ins not linked to a player'), h('p', { class: 'small' }, 'Link each to the right person so they use one PIN. Their old PIN keeps working until they change it.'),
+          d.unlinked.map((u) => { const s2 = sel([['', '— choose the player —']].concat(d.people.map((x) => [x.id, x.name])), ''); return h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, u.name), h('span', { class: 'muted small' }, ' (' + (u.type === 'admin' ? 'admin / organizer' : 'referee') + ')')), s2, h('button', { class: 'btn ghost sm', onclick: guard(async () => { if (!s2.value) throw new Error('Choose a player'); await api('POST', '/api/admin/people/link', { type: u.type, id: u.id, playerId: s2.value }); toast('Linked'); load2(); await refresh(); }) }, 'Link')); })) : null,
+        h('input', { class: 'search', type: 'search', placeholder: 'Search people…', 'aria-label': 'Search people', oninput: (e) => { q = e.target.value.toLowerCase(); rows(); } }), list);
+    };
+    load2(); return box;
   },
   sponsors() {
     const name = inp('', { placeholder: 'Sponsor name', 'aria-label': 'Sponsor name' }), url = inp('', { placeholder: 'Website (optional)', 'aria-label': 'Website' });
@@ -444,34 +714,36 @@ const adminTabs = {
     } });
     const dl = async (url, name) => { const r = await fetch(url, { headers: { 'x-token': me.token } }); if (!r.ok) throw new Error('Download failed'); const b = await r.blob(); const a = h('a', { href: URL.createObjectURL(b), download: name }); document.body.append(a); a.click(); a.remove(); };
     const newT = () => {
-      const o = { players: h('input', { type: 'checkbox', checked: true }), refs: h('input', { type: 'checkbox', checked: true }), sp: h('input', { type: 'checkbox', checked: true }), name: inp('', { placeholder: 'New tournament name (optional)' }), confirm: inp('', { placeholder: 'Type NEW to confirm' }) };
-      modal('Start a new tournament', h('div', {}, h('p', {}, 'The current tournament is saved as an archive file on the server, then matches, events, teams and gallery are cleared.'),
-        h('label', { class: 'chk' }, o.players, 'Keep players (profiles carry over)'), h('label', { class: 'chk' }, o.refs, 'Keep referees'), h('label', { class: 'chk' }, o.sp, 'Keep sponsors'), field('Name', o.name), o.confirm),
-      [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, { label: 'Start new', cls: 'danger', fn: async () => {
+      const cur = S.tournament.seasonName || '', next = /\d+\s*$/.test(cur) ? cur.replace(/(\d+)\s*$/, (x) => String(Number(x) + 1)) : '';
+      const o = { players: h('input', { type: 'checkbox', checked: true }), games: h('input', { type: 'checkbox', checked: true }), refs: h('input', { type: 'checkbox', checked: true }), sp: h('input', { type: 'checkbox', checked: true }), season: inp(next, { placeholder: 'Next season name' }), confirm: inp('', { placeholder: 'Type NEW to confirm' }) };
+      modal('Start the next season', h('div', {}, h('p', {}, h('b', {}, cur), ' is closed and kept under Seasons (champions and every player’s results, for all-time rankings). An archive file is also saved on the server. Then matches, entries, teams and gallery are cleared.'),
+        field('Next season', o.season),
+        h('label', { class: 'chk' }, o.players, 'Keep players (profiles and all-time rankings carry over)'), h('label', { class: 'chk' }, o.games, 'Keep the same games (without entries or fixtures)'), h('label', { class: 'chk' }, o.refs, 'Keep referees'), h('label', { class: 'chk' }, o.sp, 'Keep sponsors'), o.confirm),
+      [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, { label: 'Start next season', cls: 'danger', fn: async () => {
         if (o.confirm.value.trim() !== 'NEW') throw new Error('Type NEW to confirm');
-        const r = await api('POST', '/api/admin/new-tournament', { keepPlayers: o.players.checked, keepReferees: o.refs.checked, keepSponsors: o.sp.checked, name: o.name.value });
-        toast('Archived as ' + r.archive); await refresh();
+        const r = await api('POST', '/api/admin/new-tournament', { keepPlayers: o.players.checked, keepGames: o.games.checked, keepReferees: o.refs.checked, keepSponsors: o.sp.checked, season: o.season.value });
+        toast(r.season + ' started • previous season saved'); await refresh();
       } }]);
     };
     return h('div', {}, h('div', { class: 'card' }, h('b', {}, 'Backup'), h('p', { class: 'muted small' }, 'Includes photos, logos and sponsor images. Data is saved in the data/ folder of the server and auto-backed-up every 2 minutes (encrypted when a backup passphrase is set). Download a copy before and after the event.'),
       h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: guard(() => dl('/api/admin/backup', 'tournament-backup.json')) }, '⬇ Download backup'), file, h('button', { class: 'btn ghost', onclick: () => file.click() }, '⬆ Restore backup'))),
       h('div', { class: 'card' }, h('b', {}, 'Reports & display'), h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: guard(() => dl('/api/export.xlsx', 'tournament-results.xlsx')) }, '📊 Excel'), h('a', { class: 'btn ghost', href: '#/report' }, '🖨 PDF report'), h('a', { class: 'btn ghost', href: '#/certs' }, '🎖 Certificates'), h('a', { class: 'btn ghost', href: '#/tv' }, '📺 Big screen'))),
       privacyCard(),
-      h('div', { class: 'card' }, h('b', {}, 'Next tournament'), h('p', { class: 'muted small' }, 'Keep your player profiles and start fresh.'), h('button', { class: 'btn danger', onclick: newT }, 'Start a new tournament…')));
+      h('div', { class: 'card' }, h('b', {}, 'Events'), h('p', { class: 'muted small' }, 'Start a new event from Home → “+ New event”. Close an event from its ⚙ Details when it is over; it stays in All events and in the all-time rankings.'), h('a', { class: 'btn ghost', href: '#/seasons' }, '📜 All events')));
   },
 };
 
 /* ------------------------------------------------------- admins & security */
 function adminsCard() {
-  const box = h('div', { class: 'card' }, h('b', {}, 'Admins & security'), h('p', { class: 'muted small' }, 'Loading…'));
+  const box = h('div', { class: 'card' }, h('b', {}, 'Organizers'), h('p', { class: 'muted small' }, 'Loading…'));
   const draw = (list) => {
-    const nm = inp('', { placeholder: 'Name of new admin', 'aria-label': 'New admin name' });
-    const sp = inp('', { placeholder: 'Sport lead for (blank = organizer): badminton, tt, carrom, chess', 'aria-label': 'Sport lead scope' });
-    box.replaceChildren(h('b', {}, 'Admins & security'), h('p', { class: 'muted small' }, 'Each admin has their own PIN, so the activity log shows who did what.'),
-      h('div', { class: 'list' }, list.map((a) => h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, a.name), a.me ? h('span', { class: 'muted small' }, '  (you)') : null, h('div', { class: 'muted small' }, (a.sports || []).length ? 'Sport lead: ' + a.sports.join(', ') : 'Organizer')),
+    const nm = inp('', { placeholder: 'Name of new organizer', 'aria-label': 'New organizer name' });
+    const sp = sel([['main', 'Main organizer – everything'], ['game', 'Game organizer – only the games assigned to them'], ['badminton', 'Sport lead – Badminton'], ['tt', 'Sport lead – Table tennis'], ['carrom', 'Sport lead – Carrom'], ['chess', 'Sport lead – Chess']], 'game');
+    box.replaceChildren(h('b', {}, 'Organizers'), h('p', { class: 'muted small' }, 'Each organizer has their own PIN, so the activity log shows who did what. Assign game organizers on each game (Event → game → Change).'),
+      h('div', { class: 'list' }, list.map((a) => h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, a.name), a.me ? h('span', { class: 'muted small' }, '  (you)') : null, h('div', { class: 'muted small' }, a.limited ? 'Game organizer' + (a.games && a.games.length ? ': ' + a.games.join(', ') : ' – no games yet') : (a.sports || []).length ? 'Sport lead: ' + a.sports.join(', ') : 'Organizer')),
         h('button', { class: 'btn ghost sm', onclick: guard(async () => { const x = await api('PUT', '/api/admin/admins/' + a.id, { resetPin: true }); showPin(x.name, x.pin); }) }, 'New PIN'),
         a.me ? null : h('button', { class: 'btn danger sm', 'aria-label': 'Remove ' + a.name, onclick: () => confirmBox('Remove admin ' + a.name + '?', guard(async () => { await api('DELETE', '/api/admin/admins/' + a.id); load2(); }), 'Remove') }, '✕')))),
-      nm, sp, h('button', { class: 'btn', onclick: guard(async () => { const x = await api('POST', '/api/admin/admins', { name: nm.value, sports: sp.value.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean) }); showPin(x.name, x.pin); load2(); }) }, 'Add admin'),
+      nm, sp, h('button', { class: 'btn', onclick: guard(async () => { const x = await api('POST', '/api/admin/admins', { name: nm.value, limited: sp.value === 'game', sports: ['main', 'game'].includes(sp.value) ? [] : [sp.value] }); showPin(x.name, x.pin); load2(); await refresh(); }) }, 'Add admin'),
       h('hr'), h('b', {}, 'Lost a phone?'), h('p', { class: 'muted small' }, 'Signs out every other admin and referee device. They sign in again with their PIN.'),
       h('button', { class: 'btn danger', onclick: () => confirmBox('Sign out everyone else?', guard(async () => { const r = await api('POST', '/api/admin/revoke-sessions'); toast(r.signedOut + ' session(s) signed out'); }), 'Sign them out') }, 'Sign out all other devices'));
   };
@@ -479,20 +751,83 @@ function adminsCard() {
   load2(); return box;
 }
 
-/* Excel import of players, their games and teams (shared by Registration, Players and Safety screens). */
+/* Excel import of players, their games and teams (shared by Registration, Players and Safety screens).
+   Step 1: the server inspects every sheet. Step 2: the admin picks sheets and checks the column mapping.
+   Step 3: preview (dry run). Step 4: import. */
 function importCard() {
-  const imp = h('input', { type: 'file', accept: '.xlsx', hidden: true, onchange: guard(async (e) => {
+  const imp = h('input', { type: 'file', accept: '.xlsx,.csv,.tsv,.txt', hidden: true, onchange: guard(async (e) => {
     const f = e.target.files[0]; if (!f) return; const buf = await f.arrayBuffer(); e.target.value = '';
-    const post = (q) => fetch('/api/admin/import-players' + q, { method: 'POST', headers: { 'x-token': me.token, 'Content-Type': 'application/octet-stream' }, body: buf }).then(async (r) => { const j = await r.json(); if (!r.ok) throw new Error(j.error); return j; });
-    const dry = await post('?dry=1');
-    modal('Check before importing', h('div', {}, h('p', {}, h('b', {}, dry.created + ' players'), ' will be added' + (dry.flagged ? ' (' + dry.flagged + ' look like possible duplicates and will be flagged)' : '') + '.'),
-      h('p', { class: 'small' }, dry.games + ' game entries will be mapped. Players in teams: teams are created or reused by name. Team events: a player with a team enters that team; a player with no team goes on the interested list.'),
-      dry.errors.length ? h('div', { class: 'warnbox small' }, h('b', {}, dry.errors.length + ' rows will be skipped:'), dry.errors.slice(0, 15).map((x) => h('div', {}, 'Row ' + x.row + ' ' + x.name + ': ' + x.error))) : null),
-    [dry.created ? { label: 'Import ' + dry.created, fn: async () => { const r = await post(''); toast(r.created + ' players imported • ' + r.games + ' game entries' + (r.teamsMade ? ' • ' + r.teamsMade + ' new teams' : '') + (r.teamEntries ? ' • ' + r.teamEntries + ' team entries' : '') + (r.interested ? ' • ' + r.interested + ' on interested lists' : '')); await refresh(); } } : null].filter(Boolean));
+    const send = (path, q, opts) => fetch(path + '?tid=' + encodeURIComponent(curTid()) + (q ? '&' + q.replace(/^\?/, '') : ''), { method: 'POST', headers: { 'x-token': me.token, 'Content-Type': 'application/octet-stream', ...(opts ? { 'x-import-options': JSON.stringify(opts) } : {}) }, body: buf })
+      .then(async (r) => { const j = await r.json(); if (!r.ok) throw new Error(j.error); return j; });
+    const info = await send('/api/admin/import-inspect');
+    chooseSheets(info, send);
   }) });
-  return h('div', { class: 'card' }, h('b', {}, '📥 Upload players, games & teams (Excel)'),
-    h('p', { class: 'muted small' }, 'One row per player with the games they play and, optionally, a team. Games are matched by event name; teams are created if new and entered into their team events. You see a preview first, and possible duplicates are flagged rather than blocked.'),
-    h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: guard(() => downloadWith('/api/admin/import-template.xlsx', 'players-import-template.xlsx')) }, '⬇ Template'), imp, h('button', { class: 'btn', onclick: () => imp.click() }, '⬆ Upload filled sheet')));
+  function chooseSheets(info, send) {
+    const evOpts = [['', '— none (use the Games column) —']].concat(S.events.map((e) => [e.id, e.name + ((e.section || 'adults') === 'kids' ? ' (kids)' : '')]));
+    const blocks = info.sheets.map((sh) => {
+      const KIND = { players: 'Players', games: 'Games', teams: 'Teams', fixtures: 'Fixtures', other: 'Not recognised' };
+      const cb = h('input', { type: 'checkbox', checked: sh.kind !== 'other' && sh.rows > 0, 'aria-label': 'Import sheet ' + sh.name });
+      const kind = sel([['players', 'Players'], ['games', 'Games'], ['teams', 'Teams'], ['fixtures', 'Fixtures']], sh.kind === 'other' ? 'players' : sh.kind);
+      const KC = { name: 'Game', sport: 'Sport', section: 'Category', type: 'Type', team: 'Team', games: 'Game', members: 'Members', member: 'Player columns', game: 'Game', a: 'Side A', b: 'Side B', stage: 'Round', group: 'Group', date: 'Date', time: 'Time', when: 'Date & time', court: 'Court', referee: 'Referee', bestOf: 'Best of', target: 'Points' };
+      const colOpts = [['', '— not in this sheet —']].concat(sh.headers.map((x) => [x.col, x.text]));
+      const maps = info.fields.map((fd) => ({ key: fd.key, label: fd.label, s: sel(colOpts, sh.map[fd.key] || '') }));
+      const ev = sel(evOpts, sh.eventId), sec = sel([['', 'From the sheet (default adults)'], ['adults', 'Adults'], ['kids', 'Kids']], sh.section);
+      const found = maps.filter((m) => sh.map[m.key]).map((m) => m.label).concat((sh.sportCols || []).map((x) => SPORT_LABEL[x.sport] + ' (yes/no)'));
+      const sportSel = [...new Set((sh.sportCols || []).map((x) => x.sport))].flatMap((sp) => ['adults', 'kids'].map((sec) => {
+        const evs = S.events.filter((e) => e.sport === sp && secOf(e) === sec);
+        return { sport: sp, section: sec, s: sel([['', 'Automatic' + (evs.length ? '' : ' (no game yet)')]].concat(evs.map((e) => [e.id, e.name + (e.sideType === 'team' ? ' (team – interested list)' : '')]), [['skip', 'Skip – do not enter']]), '') };
+      }));
+      const details = h('details', {}, h('summary', { class: 'small' }, 'Columns & options'),
+        h('p', { class: 'muted small' }, 'Pick which column of this sheet holds each detail. Header row: ' + sh.headerRow + '.'),
+        maps.map((m) => field(m.label, m.s)),
+        sh.eventCols.length ? h('p', { class: 'small' }, 'Event columns (a "Yes"/✓ enters the player): ' + sh.eventCols.map((x) => x.eventName).join(', ')) : null,
+        sportSel.length ? h('div', {}, h('b', { class: 'small' }, 'Sport columns – which game a "Yes" enters'), h('p', { class: 'muted small' }, 'Automatic picks the game of that sport that fits the player’s section, gender and age (individual games first; for a team game the player goes on its interested list).'),
+          sportSel.map((x) => field(SPORT_ICON[x.sport] + ' ' + SPORT_LABEL[x.sport] + ' – ' + (x.section === 'kids' ? 'kids' : 'adults'), x.s))) : null,
+        field('Players with no games go into', ev, sh.eventId ? 'Guessed from the sheet name.' : 'Useful when each sheet is one event, e.g. a sheet called "Chess".'),
+        field('Section when the sheet has no Section column', sec));
+      const other = h('div', { class: 'muted small' }, sh.kind !== 'players' && sh.kind !== 'other' ? 'Recognised: ' + Object.keys(sh.kindCols || {}).map((k) => KC[k] || k).join(', ') : '');
+      const showKind = () => { details.hidden = kind.value !== 'players'; other.hidden = kind.value === 'players'; };
+      kind.addEventListener('change', showKind);
+      const el = h('div', { class: 'card' },
+        h('label', { class: 'chk' }, cb, h('b', {}, sh.name), h('span', { class: 'muted small' }, ' • ' + (sh.kind === 'other' ? (sh.reason || 'not recognised') : sh.rows + ' ' + KIND[sh.kind].toLowerCase() + ' rows'))),
+        field('This sheet holds', kind),
+        sh.kind === 'players' && sh.sample.length ? h('div', { class: 'muted small' }, 'e.g. ' + sh.sample.join(', ')) : null,
+        sh.kind === 'players' && found.length ? h('div', { class: 'muted small' }, 'Recognised: ' + found.join(', ')) : null,
+        other, details);
+      showKind();
+      return { sh, cb, kind, maps, ev, sec, el, sportSel };
+    });
+    const nothing = info.sheets.every((x) => x.kind === 'other');
+    modal('Which sheets should be imported?', h('div', {},
+      h('p', { class: 'small' }, 'This file has ' + info.sheets.length + ' sheet(s). Recognised sheets are ticked – games are created first, then players, then teams, then fixtures. For a players sheet, open "Columns & options" to check how columns are read.'),
+      nothing ? h('div', { class: 'warnbox small' }, 'No sheet was recognised. Tick a sheet, choose what it holds, and for players choose its Name column under "Columns & options".') : null,
+      blocks.map((b) => b.el)),
+    [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, { label: 'Preview', close: false, fn: async (close) => {
+      const chosen = blocks.filter((b) => b.cb.checked);
+      if (!chosen.length) { toast('Tick at least one sheet', true); return; }
+      const opts = { sheets: chosen.map((b) => ({ index: b.sh.index, kind: b.kind.value, headerRow: b.sh.headerRow, eventId: b.ev.value, section: b.sec.value, map: Object.fromEntries(b.maps.filter((m) => m.s.value).map((m) => [m.key, Number(m.s.value)])), sportMap: Object.fromEntries(b.sportSel.filter((x) => x.s.value).map((x) => [x.sport + '|' + x.section, x.s.value])) })) };
+      const dry = await send('/api/admin/import-players', '?dry=1', opts);
+      close(); preview(dry, () => send('/api/admin/import-players', '', opts));
+    } }]);
+  }
+  function preview(dry, run) {
+    const n = (x) => x || 0, extras = [n(dry.gamesMade) ? dry.gamesMade + ' new games' : '', n(dry.gamesExisting) ? dry.gamesExisting + ' games already exist (skipped)' : '',
+      n(dry.teamsCreated) ? dry.teamsCreated + ' new teams' : '', n(dry.teamsUpdated) ? dry.teamsUpdated + ' teams updated' : '', n(dry.teamEntries) ? dry.teamEntries + ' teams entered in games' : '',
+      n(dry.fixturesMade) ? dry.fixturesMade + ' new fixtures' : '', n(dry.fixturesExisting) ? dry.fixturesExisting + ' fixtures already exist (skipped)' : ''].filter(Boolean);
+    const any = dry.created || dry.updated || n(dry.gamesMade) || n(dry.teamsCreated) || n(dry.teamsUpdated) || n(dry.fixturesMade);
+    modal('Check before importing', h('div', {}, extras.length ? h('p', {}, h('b', {}, extras.join(' • '))) : null,
+      dry.created || !extras.length ? h('p', {}, h('b', {}, dry.created + ' new players'), ' will be added' + (dry.flagged ? ' (' + dry.flagged + ' look like possible duplicates and will be flagged)' : '') + '.') : null,
+      dry.updated ? h('p', {}, h('b', {}, dry.updated + ' players already in the app'), ' are matched' + (dry.changed ? ' – ' + dry.changed + ' of them get the sheet’s newer details' : ' – no details change') + (dry.removedGames ? ' and ' + dry.removedGames + ' game entr' + (dry.removedGames === 1 ? 'y is' : 'ies are') + ' removed because they are no longer ticked' : '') + '. The latest sheet wins for phone, villa, age, gender, category and games; photo, bio and results are kept, and the replaced values are written in each player’s private notes.') : null,
+      dry.sheets && dry.sheets.length ? h('div', { class: 'small' }, dry.sheets.map((x) => h('div', {}, '• ' + x.sheet + ': ' + x.rows + ' ' + (x.kind || 'player') + ' rows' + (x.kind ? '' : ' → ' + x.added + ' new' + (x.updated ? ', ' + x.updated + ' updated' : ''))))) : null,
+      dry.merged ? h('p', { class: 'small' }, dry.merged + ' rows are the same person as another row (same name and phone/email/date of birth) and are merged, so that player is entered in all their events.') : null,
+      dry.created || dry.updated ? h('p', { class: 'small' }, dry.games + ' game entries will be mapped. Players in teams: teams are created or reused by name. Team events: a player with a team enters that team; a player with no team goes on the interested list – build teams from it on the game’s Teams tab.') : null,
+      (dry.warnings || []).length ? h('details', { class: 'small' }, h('summary', {}, (dry.warnings || []).length + ' note(s) – the rest is still imported'), dry.warnings.slice(0, 40).map((x) => h('div', {}, (x.row ? 'Row ' + x.row + ' ' : '') + x.name + ': ' + x.error))) : null,
+      dry.errors.length ? h('div', { class: 'warnbox small' }, h('b', {}, dry.errors.length + ' rows will be skipped:'), dry.errors.slice(0, 20).map((x) => h('div', {}, (x.sheet ? x.sheet + ' ' : '') + 'row ' + x.row + ' ' + x.name + ': ' + x.error))) : null),
+    [any ? { label: 'Import', fn: async () => { const r = await run(); toast([r.gamesMade ? r.gamesMade + ' games' : '', r.teamsCreated ? r.teamsCreated + ' teams' : '', r.fixturesMade ? r.fixturesMade + ' fixtures' : ''].filter(Boolean).concat(['']).join(' • ') + r.created + ' players added' + (r.updated ? ' • ' + r.updated + ' updated' : '') + ' • ' + r.games + ' game entries' + (r.teamsMade ? ' • ' + r.teamsMade + ' new teams' : '') + (r.teamEntries ? ' • ' + r.teamEntries + ' team entries' : '') + (r.interested ? ' • ' + r.interested + ' on interested lists' : '')); await refresh(); } } : null].filter(Boolean));
+  }
+  return h('div', { class: 'card' }, h('b', {}, '📥 Upload to ' + curT().name + ': players, games, teams & fixtures (Excel)'),
+    h('p', { class: 'muted small' }, 'Upload any Excel or CSV file (a Google Forms export works) – one sheet or many. Sheets can hold players, games, teams or fixtures; download the Template to see each layout. Columns like “Select Games to Participate [Badminton]” with Yes, Category (Seniors / Under-16), Villa Number and Age are understood. Players already in the app are not duplicated: the latest sheet updates their details and game choices (upload it every season), and the old values are kept in their private notes. You choose which sheets to import, and columns are matched by their header (Name, Phone, Dept, Games, Team…), so your own layout works. A sheet named after an event (e.g. "Chess") puts its players in that event. You see a preview first, and possible duplicates are flagged rather than blocked.'),
+    h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: guard(() => downloadWith('/api/admin/import-template.xlsx?tid=' + encodeURIComponent(curTid()), 'players-import-template.xlsx')) }, '⬇ Template'), imp, h('button', { class: 'btn', onclick: () => imp.click() }, '⬆ Upload filled sheet')));
 }
 
 adminTabs.registration = function () {
@@ -516,9 +851,9 @@ adminTabs.registration = function () {
       h('label', { class: 'chk' }, f.enabled, 'Registration is open'), field('Closes after (optional)', f.deadline, 'Registration stops at the end of this date (venue time).'),
       field('Public web address', f.pub, 'Every shared link (WhatsApp, QR, profile links) uses this, whatever address you are browsing on. Use your permanent https link; leave empty to use the current address.'),
       field('Join code', f.code, 'Only people who know this code can register. Share it in your invitation, not on the public page.'),
-      h('div', { class: 'actions' }, h('button', { class: 'btn ghost sm', onclick: gen }, 'Make a code'), h('button', { class: 'btn ghost sm', onclick: () => confirmBox('Change the join code now? The old code stops working immediately.', guard(async () => { await api('POST', '/api/admin/registration', { rotateCode: true }); toast('New code created'); await refresh(); }), 'Change code') }, '🔄 Change code now')),
+      h('div', { class: 'actions' }, h('button', { class: 'btn ghost sm', onclick: gen }, 'Make a code'), h('button', { class: 'btn ghost sm', onclick: () => confirmBox('Change the join code now? The old code stops working immediately.', guard(async () => { await api('POST', '/api/admin/registration?tid=' + encodeURIComponent(curTid()), { rotateCode: true }); toast('New code created'); await refresh(); }), 'Change code') }, '🔄 Change code now')),
       field('Notice shown to adults (consent text)', f.notice), field('Consent text for parents / guardians', f.kidsNotice),
-      h('button', { class: 'btn full', onclick: guard(async () => { await api('POST', '/api/admin/registration', { enabled: f.enabled.checked, deadline: f.deadline.value, joinCode: f.code.value.trim(), publicUrl: f.pub.value.trim(), notice: f.notice.value, kidsNotice: f.kidsNotice.value }); toast('Saved'); await refresh(); }) }, 'Save registration settings'),
+      h('button', { class: 'btn full', onclick: guard(async () => { await api('POST', '/api/admin/registration?tid=' + encodeURIComponent(curTid()), { enabled: f.enabled.checked, deadline: f.deadline.value, joinCode: f.code.value.trim(), publicUrl: f.pub.value.trim(), notice: f.notice.value, kidsNotice: f.kidsNotice.value }); toast('Saved'); await refresh(); }) }, 'Save registration settings'),
       h('p', { class: 'muted small' }, 'Every registration waits here for your approval. Set a limit per event under Events → Edit event.'),
       f.enabled.checked ? h('a', { class: 'btn ghost', href: '#/menu' }, 'Show QR / link (Menu)') : null),
     (() => { const te = S.events.filter((e) => e.sideType === 'team' && (e.interestedIds || []).length); return te.length ? h('div', { class: 'card' }, h('b', {}, 'Players interested in team events'),

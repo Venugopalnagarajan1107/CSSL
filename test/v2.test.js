@@ -163,11 +163,13 @@ test('v2 server: security, privacy, sections, clashes, generators, finals, corre
     st = (await call('GET', '/api/state')).body;
     assert.equal(st.matches.length, 0); assert.equal(st.players.length, 16); assert.equal(st.tournament.name, 'Next Year'); assert.equal(st.events.length, 9);
 
-    // public excel hides contact details; admin excel shows them
+    // reports: nobody else can download; referees get the version without contact details; admin link shows them
     const ExcelJS = require('exceljs');
     const read = async (url, hdr) => { const wb = new ExcelJS.Workbook(); await wb.xlsx.load(Buffer.from(await (await fetch(s2.base + url, hdr)).arrayBuffer())); return wb.getWorksheet('Players').getRow(1).values.filter(Boolean); };
-    assert.deepEqual(await read('/api/export.xlsx'), ['ID', 'Name', 'Section', 'Age group', 'Gender']);
-    assert.ok(!(await read('/api/export.xlsx?t=' + admin)).includes('Phone'), 'admin token in the URL no longer unlocks anything');
+    assert.equal((await fetch(s2.base + '/api/export.xlsx')).status, 403, 'public cannot download reports');
+    assert.equal((await fetch(s2.base + '/api/export.xlsx?t=' + admin)).status, 403, 'admin token in the URL does not unlock anything');
+    const refT = await chiefTok({ call }, admin);
+    assert.deepEqual(await read('/api/export.xlsx', { headers: { 'x-token': refT } }), ['ID', 'Name', 'Section', 'Age group', 'Gender']);
     const link = (await call('POST', '/api/admin/export-link', {}, admin)).body.url;
     assert.ok((await read(link)).includes('Phone'), 'one-time link gives the admin export');
     assert.equal((await fetch(s2.base + link)).status, 403, 'link works only once');

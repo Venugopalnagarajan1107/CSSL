@@ -102,6 +102,17 @@ if [ "$MODE" = "public" ]; then
   if command -v tailscale >/dev/null 2>&1; then TS_BIN="$(command -v tailscale)"
   elif [ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]; then TS_BIN="/Applications/Tailscale.app/Contents/MacOS/Tailscale"; fi
   if [ -n "$TS_BIN" ]; then
+    # Start Tailscale if it is stopped / not open, so the permanent link is used.
+    ts_running() { "$TS_BIN" status --json 2>/dev/null | grep -q '"BackendState": *"Running"'; }
+    if ! ts_running; then
+      echo "Starting Tailscale (for the permanent link)..."
+      open -g -a Tailscale 2>/dev/null
+      for i in $(seq 1 15); do "$TS_BIN" status >/dev/null 2>&1 && break; ts_running && break; sleep 1; done
+      ts_running || "$TS_BIN" up >/dev/null 2>&1 &
+      for i in $(seq 1 45); do ts_running && break; sleep 1; done
+      if ts_running; then echo "Tailscale is connected."
+      else echo "Tailscale did not connect (is it signed in? open the Tailscale menu-bar icon)."; fi
+    fi
     OUT="$("$TS_BIN" funnel --bg "$PORT" 2>&1)"
     URL="$(printf "%s" "$OUT" | grep -o 'https://[A-Za-z0-9.-]*\.ts\.net' | head -1)"
     if [ -n "$URL" ]; then USED_TS=1; show_link "$URL"

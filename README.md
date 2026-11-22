@@ -48,6 +48,22 @@ Kids' photos are hidden from the public unless you enable them (Admin → Setup)
 - Only "League" fixtures count in standings. Admin can generate round-robin / rotating-partner doubles fixtures,
   create finals from the standings, correct scores, and see who changed what.
 
+## 🔔 Notify players on WhatsApp
+
+Every match that is still to be played shows a **🔔 Notify** button to organizers and referees (on the match card and on the match page).
+It opens a ready-made message (game, match number, sides, court, time, referee, live-score link) that you can edit.
+`{name}` becomes each player's first name, `{link}` the live-score link. In a team match every member of both teams is included.
+
+* **Default (no setup):** tap **WhatsApp** next to each player. WhatsApp opens with the message ready, so press send there.
+  **Send to a WhatsApp group** posts one message to a group instead.
+  10-digit numbers get the country code `91`. To change it, set `PHONE_COUNTRY_CODE`.
+* **Fully automatic (optional):** set up the WhatsApp Business Cloud API (Meta) and start the app with
+  `WHATSAPP_TOKEN=… WHATSAPP_PHONE_ID=…`. A **Send to all** button then sends every message from the server.
+  WhatsApp only allows messages a player did not start if they use an approved template. Set `WHATSAPP_TEMPLATE=<name>` (and `WHATSAPP_LANG`, default `en`).
+  The template body gets `{{1}}` = first name, `{{2}}` = match line, `{{3}}` = link.
+
+The match records who notified the players and when ("🔔 Notified 5 min ago"). Phone numbers are shown to staff only, and masked.
+
 ## Data & backup
 Everything is in `data/` (db.json, uploads, auto-backups every 10 min; also copied to iCloud Drive > TournamentBackup if you use iCloud).
 Admin → Data downloads a full backup (including photos) and can start a new tournament while keeping player profiles.
