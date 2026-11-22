@@ -1282,7 +1282,8 @@ function importPlan(wb, header, evs) {
   return plan;
 }
 /* Games, teams and fixtures sheets (players have their own, richer path in the import endpoint). Latest sheet wins. */
-function importOthers(sheets, kind, errors, warnings, tid, evs) {
+function importOthers(sheets, kind, errors, warnings, tid, evs, opts) {
+  opts = opts || {};
   const out = { rowsBySheet: {} }, nm = (t) => String(t || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const playerByName = (name, section) => { const hits = db.players.filter((p) => p.status !== 'rejected' && (p.section || 'adults') === section && nm(p.name) === nm(name) && inRoster(tid, p.id)); return hits.length === 1 ? hits[0] : hits.length ? 'many' : null; };
   for (const sh of sheets) {
@@ -1323,11 +1324,19 @@ function importOthers(sheets, kind, errors, warnings, tid, evs) {
       const rows = SheetImport.readFixtures(sh.ws, sh.headerRow, sh.cols); out.rowsBySheet[sh.ws.name] = rows.length;
       rows.forEach((f) => {
         const label = f.sideA.join(' & ') + ' vs ' + f.sideB.join(' & ');
-        const ev = SheetImport.eventByName(f.game, evs); if (!ev) { E(f.row, label, f.game ? 'unknown game "' + f.game + '"' : 'no game given'); return; }
+        /* uploading into one game: the sheet needs no Game column; rows naming another game are skipped */
+        const ev = opts.forEv ? (!f.game || SheetImport.eventByName(f.game, [opts.forEv]) || nm(f.game) === nm(opts.forEv.sport) ? opts.forEv : null) : SheetImport.eventByName(f.game, evs);
+        if (!ev) { E(f.row, label, opts.forEv ? 'this row is for another game ("' + f.game + '")' : f.game ? 'unknown game "' + f.game + '"' : 'no game given'); return; }
         const sec = ev.section || 'adults', team = ev.sideType === 'team';
         const resolve = (names) => names.map((n) => {
           if (team) { const t = db.teams.filter((x) => (x.section || 'adults') === sec && x.tid === tid && nm(x.name) === nm(n)); if (t.length !== 1) throw new Error('team "' + n + '" not found'); return t[0].id; }
-          const p = playerByName(n, sec); if (p === 'many') throw new Error('two players are called "' + n + '"'); if (!p) throw new Error('player "' + n + '" is not registered for this event'); return p.id;
+          let p = playerByName(n, sec); if (p === 'many') throw new Error('two players are called "' + n + '"');
+          if (!p) {   /* short names ("Srinivasan" for "Srinivasan Thoyyeti"): the only player of this game whose name starts with it */
+            const k = nm(n), cand = (ev.participantIds || []).map((id) => find('players', id)).filter((x) => x && k.length >= 3 && (nm(x.name).startsWith(k) || nm(x.name.split(' ')[0]) === k || nm(x.name.replace(/^(dr|mr|mrs|ms)\.?\s+/i, '')).startsWith(k)));
+            if (cand.length > 1) throw new Error('"' + n + '" could be ' + cand.map((x) => x.name).join(' or ') + ' – use the full name');
+            p = cand[0] || null;
+          }
+          if (!p) throw new Error('player "' + n + '" is not registered for this ' + (opts.forEv ? 'game' : 'event')); return p.id;
         });
         try {
           const A = resolve(f.sideA), B = resolve(f.sideB);
@@ -1339,6 +1348,15 @@ function importOthers(sheets, kind, errors, warnings, tid, evs) {
           const m = normMatch({ eventId: ev.id, sideA: A, sideB: B, stage: f.stage, round: f.round, group: f.group, startsAt: f.startsAt, time: f.time, court: f.court, refereeId: ref ? ref.id : '' }, null);
           const c = findClashes(m); if (c.length) W(f.row, label, 'time clash: ' + c[0]);
           db.matches.push(m); out.fixturesMade = (out.fixturesMade || 0) + 1;
+          if (f.score) {   /* "11-2, 10-12, 11-3": results only from a chief referee, like every score in the app */
+            if (!opts.canScore) { W(f.row, label, 'score "' + f.score + '" not entered – only a chief referee can upload results'); out.scoresSkipped = (out.scoresSkipped || 0) + 1; }
+            else if (ev.scoring !== 'points') W(f.row, label, 'enter this result on the match page');
+            else {
+              const games = String(f.score).split(/[,;/]+/).map((x) => x.trim()).filter(Boolean).map((x) => { const q = x.match(/^(\d{1,2})\s*[-–:]\s*(\d{1,2})$/); return q ? { a: Number(q[1]), b: Number(q[2]) } : null; });
+              if (!games.length || games.some((g) => !g)) W(f.row, label, 'score "' + f.score + '" not understood – write each game like 11-2, 10-12, 11-3');
+              else { try { writeGames(m, { games }, opts.by || 'import', 'import'); out.scored = (out.scored || 0) + 1; } catch (e) { W(f.row, label, 'score not entered: ' + e.message); } }
+            }
+          }
         } catch (e) { E(f.row, label, e.message); }
       });
     }
@@ -2990,6 +3008,41 @@ async function route(req, res, url) {
       const gone = new Set(ms.map((x) => x.id)); db.matches = db.matches.filter((x) => !gone.has(x.id));
       audit(user.name, 'deleted matches', ms.length + ' (' + games.join(', ') + ') – in Trash'); save(); broadcast();
       return json(res, 200, { ok: true, removed: ms.length });
+    }
+    /* ---- fixtures of one game from Excel / CSV: Player A, Player B (+ optional Date, Time, Court, Round, Group, Referee, Score) ---- */
+    if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/fixtures-template\.xlsx$/)) && m === 'GET') {
+      const ev = find('events', mm[1]); if (!ev) throw new HttpError(404, 'Game not found');
+      const ExcelJS = require('exceljs'), wb = new ExcelJS.Workbook(), ws = wb.addWorksheet('Fixtures'), team = ev.sideType === 'team';
+      const names = (ev.participantIds || []).map((id) => (find(team ? 'teams' : 'players', id) || {}).name).filter(Boolean);
+      ws.addRow([team ? 'Team A' : 'Player A', team ? 'Team B' : 'Player B', 'Round', 'Date', 'Time', 'Court', 'Referee', 'Score']);
+      const pair = (i) => (ev.sideSize === 2 ? names.slice(i, i + 2).join(' & ') : names[i] || '');
+      if (names.length >= 2) ws.addRow([pair(0), pair(ev.sideSize === 2 ? 2 : 1), 'League', '29/11/2026', '10:30 AM', 'Table 1', '', '']);
+      if (names.length >= 3 && ev.sideSize !== 2) ws.addRow([names[0], names[2], 'League', '', '', '', '', '11-7, 9-11, 11-5']);
+      ws.getRow(1).font = { bold: true }; ws.columns.forEach((c, i) => { c.width = i < 2 ? 28 : 16; });
+      const ps = wb.addWorksheet(team ? 'Teams in this game' : 'Players in this game'); ps.addRow([team ? 'Team' : 'Player']); names.forEach((n) => ps.addRow([n])); ps.getRow(1).font = { bold: true }; ps.getColumn(1).width = 34;
+      const hw = wb.addWorksheet('How it works');
+      [['Fixtures for ' + ev.name + ' – one row per match'], ['• Player A and Player B are required (doubles: "Asha & Meena"). Use the names from the second sheet; a unique first name also works.'],
+        ['• Optional: Round (League, Group A, Quarter final, Semi final, Final), Date, Time, Court, Referee.'], ['• Score (optional): each game as Player A–Player B, e.g. 11-7, 9-11, 11-5. Results are only entered when a chief referee uploads the sheet.'],
+        ['• Matches already in the app are not duplicated. You see a preview before anything is saved.']].forEach((r, k) => { const x = hw.addRow(r); if (!k) x.font = { bold: true }; }); hw.getColumn(1).width = 120;
+      res.writeHead(200, { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': 'attachment; filename="fixtures-template.xlsx"' });
+      return res.end(Buffer.from(await wb.xlsx.writeBuffer()));
+    }
+    if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/import-fixtures$/)) && m === 'POST') {
+      const ev = find('events', mm[1]); if (!ev) throw new HttpError(404, 'Game not found');
+      const T = tour(ev.tid); if (T && T.status === 'closed') throw new HttpError(409, T.name + ' is closed.');
+      const wb = await loadWorkbook(await readBody(req, 5e6));
+      const sheets = wb.worksheets.map((ws) => ({ ws, ...SheetImport.sheetKind(ws) })).filter((x) => x.kind === 'fixtures');
+      if (!sheets.length) throw new HttpError(400, 'No fixtures found – the sheet needs a "Player A" and a "Player B" column (download the template).');
+      const preview = url.searchParams.get('dry') === '1';
+      const snap = preview ? JSON.stringify({ matches: db.matches, events: db.events }) : null;
+      try {
+        const errors = [], warnings = [];
+        const before = db.matches.length;
+        const out = importOthers(sheets, 'fixtures', errors, warnings, ev.tid, [ev], { forEv: ev, canScore: !!(user.refId && user.kind === 'chief'), by: user.name });
+        const made = db.matches.slice(before).map((x) => ({ no: x.no, a: sideName(ev, x.sideA), b: sideName(ev, x.sideB), when: x.startsAt || x.time || '', court: x.court }));
+        if (!preview && out.fixturesMade) { audit(user.name, 'uploaded fixtures', ev.name + ': ' + out.fixturesMade + ' new' + (out.scored ? ', ' + out.scored + ' with scores' : '')); save(); broadcast(); }
+        return json(res, 200, { dryRun: preview, made: out.fixturesMade || 0, existing: out.fixturesExisting || 0, scored: out.scored || 0, scoresSkipped: out.scoresSkipped || 0, rows: Object.values(out.rowsBySheet).reduce((a, b) => a + b, 0), list: made.slice(0, 200), errors, warnings });
+      } finally { if (preview) Object.assign(db, JSON.parse(snap)); }
     }
     if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/reset-draw$/)) && m === 'POST') {
       const ev = find('events', mm[1]); if (!ev) throw new HttpError(404, 'Event not found');

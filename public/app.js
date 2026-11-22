@@ -511,8 +511,15 @@ function gameDashboard(ev, ms) {
   const st = E.standings(ev, ms.map((x) => x.m));
   const pts = ev.scoring === 'points';
   const table = h('div', { class: 'card' }, h('div', { class: 'card-h' }, h('b', {}, '🏆 Standings'), h('span', { class: 'muted small' }, (ev.config.pointsWin || 2) + ' pts per win • ties: ' + (ev.sport === 'tt' || ev.config.tiebreak === 'sets' ? 'points → set difference → sets won' : 'points → point difference'))),
-    h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl' }, h('thead', {}, h('tr', {}, ['#', ev.sideType === 'team' ? 'Team' : 'Player', 'P', 'W', 'L'].concat(pts ? ['Sets', 'Diff'] : ['D'], ['Pts']).map((x, i) => h('th', { class: i === 1 ? 'l' : '' }, x)))),
-      h('tbody', {}, st.map((r) => h('tr', {}, [r.rank, ev.sideType === 'player' ? h('a', { href: '#/player/' + r.id }, nm(r.id)) : nm(r.id), r.played, r.won, r.lost].concat(pts ? [r.gw + '–' + r.gl, (r.gw - r.gl > 0 ? '+' : '') + (r.gw - r.gl)] : [r.drawn], [h('b', {}, r.mp)]).map((c, i) => h('td', { class: i === 1 ? 'l' : '' }, c))))))));
+    /* the usual table; positions 1, 2, 3 show gold, silver, bronze (once the game has started) and the name column is wide */
+    h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl dash-st' },
+      h('thead', {}, h('tr', {}, ['Pos', ev.sideType === 'team' ? 'Team' : 'Player', 'P', 'W', 'L'].concat(pts ? ['Sets', 'Diff'] : ['D'], ['Pts']).map((x, i) => h('th', { class: i === 1 ? 'l nm' : '' }, x)))),
+      h('tbody', {}, st.map((r) => {
+        const medal = st.some((x) => x.played > 0) && r.rank <= 3 ? ['🥇', '🥈', '🥉'][r.rank - 1] : '';
+        return h('tr', { class: medal ? 'top' + r.rank : '' }, [medal ? h('span', { class: 'medal', title: ['Gold', 'Silver', 'Bronze'][r.rank - 1], 'aria-label': 'Position ' + r.rank }, medal) : r.rank,
+          ev.sideType === 'player' ? h('a', { href: '#/player/' + r.id }, nm(r.id)) : nm(r.id), r.played, r.won, r.lost].concat(pts ? [r.gw + '–' + r.gl, (r.gw - r.gl > 0 ? '+' : '') + (r.gw - r.gl)] : [r.drawn], [h('b', {}, r.mp)])
+          .map((c, i) => h('td', { class: i === 0 ? 'pos' : i === 1 ? 'l nm' : '' }, c)));
+      })))));
   /* 3. head-to-head grid (updates live as results come in) */
   const order = st.map((r) => r.id).filter((id) => ids.includes(id)).concat(ids.filter((id) => !st.some((r) => r.id === id)));
   const cell = (a, b) => {
@@ -574,7 +581,7 @@ Views.event = (id) => {
   const body = tab === 'bracket' ? h('div', {}, championBanner(ev), bracketView(ev))
     : tab === 'standings' ? h('div', {}, championBanner(ev), standingsTable(ev), hasKO && fmt.type !== 'knockout' ? h('div', {}, h('h3', {}, 'Knockout'), bracketView(ev)) : null)
     : tab === 'dashboard' ? gameDashboard(ev, ms)
-    : tab === 'fixtures' ? h('div', {}, selectBar(ms.map((x) => x.m)), ms.length ? ms.map((x) => matchCard(x.m)) : h('p', { class: 'empty' }, 'No fixtures yet.'))
+    : tab === 'fixtures' ? h('div', {}, selectBar(ms.map((x) => x.m)), ms.length ? ms.map((x) => matchCard(x.m)) : h('div', {}, h('p', { class: 'empty' }, 'No fixtures yet.'), canManage(ev) ? h('div', { class: 'actions center' }, h('button', { class: 'btn', onclick: () => fixturesUploadModal(ev) }, '⬆ Upload fixtures from Excel / CSV')) : null))
       : ev.sideType === 'team' && canManage(ev) ? teamBuilder(ev)
       : h('div', { class: 'list' }, (ev.participantIds || []).map((pid) => {
         if (ev.sideType === 'team') { const t = byId('teams', pid); return h('div', { class: 'row' }, h('b', {}, t ? t.name : '?'), h('span', { class: 'muted small' }, t ? t.memberIds.map((x) => (byId('players', x) || {}).name).join(', ') : '')); }
@@ -591,6 +598,7 @@ Views.event = (id) => {
       isStaff() ? h('button', { class: 'btn ghost', onclick: () => window.print() }, '🖨 Print / PDF') : null,
       h('button', { class: 'btn ghost', onclick: () => shareText(standingsText(ev)) }, '↗ Share'),
       canManage(ev) ? h('button', { class: 'btn', onclick: () => needStaff(ev, () => fixtureModal(ev.id)) }, '+ Fixture') : null,
+      canManage(ev) ? h('button', { class: 'btn ghost', onclick: () => fixturesUploadModal(ev) }, '⬆ Upload fixtures') : null,
       canManage(ev) ? h('button', { class: 'btn ghost', onclick: () => needStaff(ev, () => generateModal(ev)) }, fmt.type === 'swiss' ? '⚡ Next Swiss round' : fmt.type === 'knockout' ? '⚡ Draw bracket' : fmt.type === 'groups' ? '⚡ Draw groups' : '⚡ Generate fixtures') : null,
       canManage(ev) && canNext ? h('button', { class: 'btn ghost', onclick: () => finalsFlow(ev) }, nextLabel) : null,
       canManage(ev) && hasDraw ? h('button', { class: 'btn ghost danger-t', onclick: () => resetDrawFlow(ev) }, '🗑 Delete all fixtures') : null,
