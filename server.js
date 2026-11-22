@@ -13,6 +13,7 @@ const Engine = require('./public/engine.js');
 const Fx = require('./lib/fixtures.js');
 const SheetImport = require('./lib/sheet-import.js');
 const DocImport = require('./lib/doc-import.js');
+const Scoreboard = require('./lib/scoreboard.js');
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -608,6 +609,88 @@ const nameKey = (n) => String(n || '').toLowerCase().replace(/^(dr|mr|mrs|ms)\.?
 /* No number set and no linked profile: use the player with exactly the same name, if there is only one (phone only – the accounts are not linked). */
 const playerByName = (n) => { const k = nameKey(n); if (!k) return null; const hits = db.players.filter((p) => p.status !== 'rejected' && nameKey(p.name) === k && p.phone); return hits.length === 1 ? hits[0] : null; };
 const orgPhone = (a) => (a && (a.phone || ((a.playerId && find('players', a.playerId)) || {}).phone || (playerByName(a.name) || {}).phone)) || '';
+/* ---------------------------------------------------------- scoreboard sync
+   A game can follow a published scoreboard page (e.g. the CS table tennis one): new results are entered with their set
+   scores, missing fixtures are created. A result already in the app is never overwritten – a different one is listed. */
+const SYNC_DEFAULT_URL = 'https://cs-tt-tournament-2026.netlify.app/';
+const syncDefaults = (ev) => ({ url: SYNC_DEFAULT_URL, category: (ev.section || 'adults') === 'kids' ? 'juniors' : 'seniors', auto: false, aliases: {}, ...(ev.sync || {}) });
+function syncResolver(ev) {
+  const T = tour(ev.tid), key = (n) => String(n || '').toLowerCase().replace(/^(dr|mr|mrs|ms)\.?\s+/, '').replace(/[^a-z0-9]/g, '');
+  const inGame = (ev.participantIds || []).map((id) => find('players', id)).filter(Boolean);
+  const roster = ((T && T.playerIds) || []).map((id) => find('players', id)).filter((p) => p && (p.section || 'adults') === (ev.section || 'adults'));
+  const aliases = (ev.sync && ev.sync.aliases) || {};
+  return (name) => {
+    if (aliases[name] && find('players', aliases[name])) return { id: aliases[name] };
+    const k = key(name); if (!k) return { error: 'no name' };
+    for (const pool of [inGame, roster]) { const hit = pool.filter((p) => key(p.name) === k); if (hit.length === 1) return { id: hit[0].id }; if (hit.length > 1) return { error: 'two players are called "' + name + '"' }; }
+    const pre = inGame.filter((p) => k.length >= 3 && (key(p.name).startsWith(k) || key(p.name.split(' ')[0]) === k));
+    if (pre.length === 1) return { id: pre[0].id };
+    return { error: pre.length ? '"' + name + '" could be ' + pre.map((p) => p.name).join(' or ') : '"' + name + '" is not a player of this game' };
+  };
+}
+/* plan (and, when apply, carry out) a sync of one game from the page's data for one category */
+function syncGame(ev, board, category, apply, by) {
+  const cat = board[category]; if (!cat) throw new HttpError(400, 'The page has no "' + category + '" category (it has: ' + Object.keys(board).join(', ') + ').');
+  const res = syncResolver(ev), out = { enter: [], create: [], same: 0, pending: 0, conflicts: [], appOnly: [], unknown: {}, unreadable: [] };
+  const sideNm = (id) => (find('players', id) || {}).name || '?';
+  for (const m of cat.matches) {
+    const ra = res(m.a), rb = res(m.b);
+    if (!ra.id || !rb.id) { [[m.a, ra], [m.b, rb]].forEach(([n, r]) => { if (!r.id) out.unknown[n] = r.error; }); continue; }
+    const A = ra.id, B = rb.id, label = m.id + ' ' + sideNm(A) + ' v ' + sideNm(B);
+    const pair = db.matches.filter((x) => x.eventId === ev.id && ((x.sideA[0] === A && x.sideB[0] === B) || (x.sideA[0] === B && x.sideB[0] === A)));
+    let x = pair.find((y) => !y.cancelled) || pair[0];
+    const done = m.ga != null && m.gb != null && Number.isFinite(m.ga) && Number.isFinite(m.gb);
+    if (!x) {
+      out.create.push(label);
+      if (apply) {
+        [A, B].forEach((id) => { if (!ev.participantIds.includes(id)) ev.participantIds.push(id); });
+        addRoster(ev.tid, [A, B]);
+        x = normMatch({ eventId: ev.id, sideA: [A], sideB: [B], stage: 'League' }, null); db.matches.push(x);
+      }
+    }
+    if (!done) { if (x && Engine.derive(x, ev).status === 'completed') out.appOnly.push(label); else out.pending++; continue; }
+    const r = Scoreboard.orient(m); if (!r) { out.unreadable.push(label + ' "' + m.detail + '"'); continue; }
+    if (x && x.cancelled) { out.conflicts.push(label + ': cancelled in the app'); continue; }
+    if (x) {
+      const d = Engine.derive(x, ev), flip = x.sideA[0] !== A;
+      if (d.status === 'completed') { const ga = flip ? d.gamesB : d.gamesA, gb = flip ? d.gamesA : d.gamesB; if (ga === m.ga && gb === m.gb) out.same++; else out.conflicts.push(label + ': page ' + m.ga + '-' + m.gb + ', app ' + ga + '-' + gb); continue; }
+    }
+    out.enter.push(label + ' ' + m.ga + '-' + m.gb);
+    if (apply) {
+      const flip = x.sideA[0] !== A;
+      try { writeGames(x, { games: r.games.map(([a, b]) => (flip ? { a: b, b: a } : { a, b })) }, by, 'sync'); }
+      catch (e) { out.enter.pop(); out.unreadable.push(label + ': ' + e.message); }
+    }
+  }
+  out.unknown = Object.entries(out.unknown).map(([name, error]) => ({ name, error }));
+  return out;
+}
+async function runSync(ev, opts, by) {
+  const s = syncDefaults(ev), url = opts.url || s.url, category = opts.category || s.category;
+  let board;
+  try { board = Scoreboard.extract(await Scoreboard.fetchPage(url)); } catch (e) { throw new HttpError(400, 'Could not read the scoreboard: ' + e.message); }
+  const plan = syncGame(ev, board, category, !!opts.apply, by);
+  plan.categories = Object.keys(board); plan.category = category; plan.url = url;
+  plan.players = board[category] ? board[category].players : [];
+  if (opts.apply) {
+    ev.sync = { ...s, url, category, last: { at: Date.now(), by, entered: plan.enter.length, created: plan.create.length, conflicts: plan.conflicts.length } };
+    if (plan.enter.length || plan.create.length) audit(by, 'synced scores', ev.name + ': ' + plan.enter.length + ' results, ' + plan.create.length + ' new fixtures from ' + url);
+    save(); broadcast();
+  }
+  return plan;
+}
+/* auto-sync: every 5 minutes for games that ask for it */
+let syncBusy = false;
+setInterval(async () => {
+  if (syncBusy) return; syncBusy = true;
+  try {
+    for (const ev of db.events.filter((e) => e.sync && e.sync.auto && e.sync.url)) {
+      const T = tour(ev.tid); if (T && T.status === 'closed') continue;
+      try { await runSync(ev, { apply: true }, 'Scoreboard sync'); }
+      catch (e) { ev.sync.last = { at: Date.now(), by: 'Scoreboard sync', error: String(e.message).slice(0, 200) }; save(); }
+    }
+  } finally { syncBusy = false; }
+}, 5 * 60e3).unref();
 /* ---------------------------------------------------------- WhatsApp notify */
 const WA = { token: process.env.WHATSAPP_TOKEN || '', phoneId: process.env.WHATSAPP_PHONE_ID || '', template: process.env.WHATSAPP_TEMPLATE || '', lang: process.env.WHATSAPP_LANG || 'en', cc: String(process.env.PHONE_COUNTRY_CODE || '91').replace(/\D/g, '') || '91' };
 WA.on = !!(WA.token && WA.phoneId);
@@ -809,7 +892,7 @@ function normEvent(b, prev) {
   const rr = b.rubberRules || {}, pr = prev.rubberRules || {};
   const rubberRules = { clinch: rr.clinch != null ? !!rr.clinch : pr.clinch !== false, maxPerPlayer: clampN(rr.maxPerPlayer, 1, 6, pr.maxPerPlayer || 2) };
   return {
-    groups: prev.groups, bracket: prev.bracket, byes: prev.byes || [], format, rubbers, rubberRules, ageMin, ageMax, ...(prev.fixtureDocs ? { fixtureDocs: prev.fixtureDocs } : {}),
+    groups: prev.groups, bracket: prev.bracket, byes: prev.byes || [], format, rubbers, rubberRules, ageMin, ageMax, ...(prev.fixtureDocs ? { fixtureDocs: prev.fixtureDocs } : {}), ...(prev.sync ? { sync: prev.sync } : {}),
     id: prev.id || uid(), name: str(b.name || prev.name || 'Event', 80), sport: str(b.sport || prev.sport || 'other', 20), section,
     scoring: (b.scoring || prev.scoring) === 'result' ? 'result' : 'points', sideType, sideSize,
     note: str(b.note != null ? b.note : prev.note || '', 300), participantIds, config,
@@ -3075,6 +3158,27 @@ async function route(req, res, url) {
         if (!preview && out.fixturesMade) { audit(user.name, 'uploaded fixtures', ev.name + ': ' + out.fixturesMade + ' new' + (out.scored ? ', ' + out.scored + ' with scores' : '')); save(); broadcast(); }
         return json(res, 200, { source, dryRun: preview, made: out.fixturesMade || 0, existing: out.fixturesExisting || 0, scored: out.scored || 0, scoresSkipped: out.scoresSkipped || 0, rows: Object.values(out.rowsBySheet).reduce((a, b) => a + b, 0), list: made.slice(0, 200), errors, warnings });
       } finally { if (preview) Object.assign(db, JSON.parse(snap)); }
+    }
+    /* ---- scoreboard sync of one game: settings, preview (dry) and apply ---- */
+    if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/sync(-settings)?$/))) {
+      const ev = find('events', mm[1]); if (!ev) throw new HttpError(404, 'Game not found');
+      const T = tour(ev.tid);
+      if (mm[2] && m === 'GET') return json(res, 200, syncDefaults(ev));
+      if (mm[2] && m === 'PUT') {
+        const b = await readJson(req, 20000), s = syncDefaults(ev);
+        if (b.url != null) { try { s.url = await Scoreboard.checkUrl(b.url); } catch (e) { throw new HttpError(400, e.message); } }
+        if (b.category != null) s.category = str(b.category, 40);
+        if (b.auto != null) s.auto = !!b.auto;
+        if (b.aliases && typeof b.aliases === 'object') Object.entries(b.aliases).slice(0, 200).forEach(([k, v]) => { const n = str(k, 60); if (!v) delete s.aliases[n]; else if (find('players', String(v))) s.aliases[n] = String(v); });
+        ev.sync = s; audit(user.name, 'scoreboard sync settings', ev.name + (s.auto ? ' (auto)' : '')); save(); broadcast();
+        return json(res, 200, s);
+      }
+      if (!mm[2] && m === 'POST') {
+        if (T && T.status === 'closed') throw new HttpError(409, T.name + ' is closed.');
+        const b = await readJson(req, 4000);
+        return json(res, 200, await runSync(ev, { apply: !b.dry, url: b.url, category: b.category }, user.name));
+      }
+      throw new HttpError(405, 'Method not allowed');
     }
     if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/reset-draw$/)) && m === 'POST') {
       const ev = find('events', mm[1]); if (!ev) throw new HttpError(404, 'Event not found');

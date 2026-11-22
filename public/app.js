@@ -505,6 +505,11 @@ function fixtureDocsCard(ev) {
         h('a', { class: 'btn sm', href: d.url, target: '_blank', rel: 'noopener' }, ['pdf', 'image'].includes(d.kind) ? 'Open' : 'Download'),
         canManage(ev) ? h('button', { class: 'btn ghost sm', 'aria-label': 'Remove ' + d.name, onclick: () => confirmBox('Remove “' + d.name + '” from ' + ev.name + '?', guard(async () => { await api('DELETE', '/api/admin/events/' + ev.id + '/fixture-docs/' + d.id); await refresh(); }), 'Remove') }, '✕') : null))));
 }
+/* "Synced from the scoreboard 5 min ago" – shown to everyone on the dashboard */
+function syncLine(ev) {
+  const L = ev.sync && ev.sync.last; if (!L) return null;
+  return h('div', { class: 'muted small noprint' }, (L.error ? '⚠ Last scoreboard sync failed ' : '🔄 Scores synced from the scoreboard ') + ago(L.at) + (ev.sync.auto ? ' (automatic, every 5 min)' : '') + (L.error && canManage(ev) ? ': ' + L.error : ''));
+}
 function mStatus(m, d) { return d.status === 'cancelled' ? 'cancelled' : d.status === 'completed' ? 'completed' : d.status === 'live' ? 'live' : (m.startsAt || m.time) ? 'scheduled' : 'pending'; }
 const ST_LABEL = { completed: '✅ Completed', live: '● Live', scheduled: '🗓 Scheduled', pending: '⏳ Pending', cancelled: '✕ Cancelled' };
 function gameDashboard(ev, ms) {
@@ -574,7 +579,7 @@ function gameDashboard(ev, ms) {
         h('td', { class: 'l' }, x.st === 'completed' ? (x.d.draw ? 'Draw' : sideLabel(ev, x.d.winner === 'A' ? x.m.sideA : x.m.sideB)) : '—'),
         h('td', {}, h('span', { class: 'chip st-' + x.st }, ST_LABEL[x.st]))))))) : h('p', { class: 'empty' }, 'No matches for this filter.'),
     h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: () => shareText(dashText(ev, st, left, done, live)) }, '📲 Share on WhatsApp')));
-  return h('div', { class: 'dash' }, fixtureDocsCard(ev), summary, table, matrix, remaining, logCard);
+  return h('div', { class: 'dash' }, syncLine(ev), fixtureDocsCard(ev), summary, table, matrix, remaining, logCard);
 }
 function dashText(ev, st, left, done, live) {
   const nm = (id) => nameOf(ev, id);
@@ -614,6 +619,7 @@ Views.event = (id) => {
       h('button', { class: 'btn ghost', onclick: () => shareText(standingsText(ev)) }, '↗ Share'),
       canManage(ev) ? h('button', { class: 'btn', onclick: () => needStaff(ev, () => fixtureModal(ev.id)) }, '+ Fixture') : null,
       canManage(ev) ? h('button', { class: 'btn ghost', onclick: () => fixturesUploadModal(ev) }, '⬆ Upload fixtures') : null,
+      canManage(ev) && (ev.sport === 'tt' || ev.sync) ? h('button', { class: 'btn ghost', onclick: () => syncModal(ev) }, '🔄 Sync scores') : null,
       canManage(ev) ? h('button', { class: 'btn ghost', onclick: () => needStaff(ev, () => generateModal(ev)) }, fmt.type === 'swiss' ? '⚡ Next Swiss round' : fmt.type === 'knockout' ? '⚡ Draw bracket' : fmt.type === 'groups' ? '⚡ Draw groups' : '⚡ Generate fixtures') : null,
       canManage(ev) && canNext ? h('button', { class: 'btn ghost', onclick: () => finalsFlow(ev) }, nextLabel) : null,
       canManage(ev) && hasDraw ? h('button', { class: 'btn ghost danger-t', onclick: () => resetDrawFlow(ev) }, '🗑 Delete all fixtures') : null,
