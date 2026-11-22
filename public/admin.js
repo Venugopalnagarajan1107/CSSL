@@ -1,6 +1,8 @@
 'use strict';
 /* Admin screens: setup, players, teams, referees, events, sponsors, data, fixtures, generators, certificates */
 
+/* Tick the sports a referee covers. */
+const sportChecks = (sel) => checkList(['badminton', 'tt', 'carrom', 'chess'].map((k) => ({ id: k, name: SPORT_ICON[k] + ' ' + SPORT_LABEL[k] })), sel || []);
 const checkList = (items, selected) => {
   const boxes = items.map((it) => ({ it, cb: h('input', { type: 'checkbox', checked: selected.includes(it.id), 'aria-label': it.name }) }));
   const el = h('div', { class: 'checks' },
@@ -57,7 +59,7 @@ function newEventModal() {
   const name = inp('', { placeholder: 'e.g. CSSL - Season 4 or Diwali Kids Cup', maxlength: 80 }), dates = inp('', { placeholder: 'e.g. 29–30 Nov 2026' }), venue = inp('');
   const myRef = me.role === 'referee' ? S.referees.find((r) => r.name === me.name) : null;
   const orgs = checkList((S.organizers || []).map((a) => ({ id: a.id, name: a.name })), isAdmin() ? [me.adminId] : []), newOrgs = staffAdder('New organizer');
-  const refs = checkList(S.referees.filter((r) => r.status !== 'pending').map((r) => ({ id: r.id, name: r.name })), myRef ? [myRef.id] : []), newRefs = staffAdder('New referee');
+  const refs = checkList(S.referees.filter((r) => r.status !== 'pending').map((r) => ({ id: r.id, name: r.name + ' – ' + refSportsTxt(r) })), myRef ? [myRef.id] : []), newRefs = staffAdder('New referee'), newRefSports = sportChecks();
   const copy = sel([['', '— set up games below —']].concat(realTours().map((t) => [t.id, 'Copy the games of ' + t.name])), '');
   const rows = [], box = h('div', {});
   const drawRows = () => box.replaceChildren(...rows.map((r, i) => h('div', { class: 'gamerow' }, r.sport, r.kind, r.section, r.name, h('button', { type: 'button', class: 'btn ghost sm', 'aria-label': 'Remove game', onclick: () => { rows.splice(i, 1); drawRows(); } }, '✕'))));
@@ -67,11 +69,11 @@ function newEventModal() {
   copy.addEventListener('change', () => { box.hidden = addBtn.hidden = !!copy.value; });
   modal('New event', h('div', {}, field('Event name', name), h('div', { class: 'two' }, field('Dates', dates), field('Venue', venue)),
     h('b', {}, '👔 Organizers'), h('p', { class: 'muted small' }, (isAdmin() ? 'You are an organizer of this event. ' : 'Add at least one organizer – add yourself by name to get an organizer PIN. ') + 'Organizers manage the event.'), orgs, newOrgs.el,
-    h('b', {}, '🧑‍⚖️ Referees'), refs, newRefs.el,
+    h('b', {}, '🧑‍⚖️ Referees'), h('p', { class: 'muted small' }, 'Each game only offers the referees mapped to its sport.'), refs, newRefs.el, h('div', { class: 'muted small' }, 'Sports the new referees cover:'), newRefSports,
     h('b', {}, '🏸 Games'), copy, box, addBtn,
     h('p', { class: 'muted small' }, 'Players join by registering for this event, by an uploaded player list, or when an organizer enrols them. Everything can be changed later.')),
   [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, { label: 'Create event', fn: async () => {
-    const r = await api('POST', '/api/staff/tournaments', { name: name.value, dates: dates.value, venue: venue.value, organizerIds: orgs.values(), newOrganizers: newOrgs.values(), refereeIds: refs.values(), newReferees: newRefs.values(),
+    const r = await api('POST', '/api/staff/tournaments', { name: name.value, dates: dates.value, venue: venue.value, organizerIds: orgs.values(), newOrganizers: newOrgs.values(), refereeIds: refs.values(), newReferees: newRefs.values(), newRefereeSports: newRefSports.values(),
       copyFrom: copy.value, games: copy.value ? [] : rows.map((x) => ({ sport: x.sport.value, kind: x.kind.value, section: x.section.value, name: x.name.value })) });
     await refresh(); ui.tid = r.tournament.id; store.set('tid', r.tournament.id); scope(); location.hash = '#/season/games'; showPins(r.pins, () => render());
   } }]);
@@ -85,10 +87,10 @@ function tourDetailsModal(T) {
 }
 function tourStaffModal(T, what) {
   const orgsMode = what === 'organizers';
-  const pool = orgsMode ? (S.organizers || []).map((a) => ({ id: a.id, name: a.name })) : S.referees.filter((r) => r.status !== 'pending').map((r) => ({ id: r.id, name: r.name }));
-  const list = checkList(pool, orgsMode ? T.organizerIds : T.refereeIds), adder = staffAdder(orgsMode ? 'New organizer' : 'New referee');
-  modal((orgsMode ? 'Organizers' : 'Referees') + ' – ' + T.name, h('div', {}, h('p', { class: 'muted small' }, 'Tick existing ' + (orgsMode ? 'organizers' : 'referees') + ', or add new ones by name or from the player list. At least one is needed. New people get a PIN.'), list, adder.el),
-    [{ label: 'Save', fn: async () => { const r = await api('PUT', '/api/staff/tournaments/' + T.id, orgsMode ? { organizerIds: list.values(), newOrganizers: adder.values() } : { refereeIds: list.values(), newReferees: adder.values() }); await refresh(); showPins(r.pins); } }]);
+  const pool = orgsMode ? (S.organizers || []).map((a) => ({ id: a.id, name: a.name })) : S.referees.filter((r) => r.status !== 'pending').map((r) => ({ id: r.id, name: r.name + ' – ' + refSportsTxt(r) }));
+  const list = checkList(pool, orgsMode ? T.organizerIds : T.refereeIds), adder = staffAdder(orgsMode ? 'New organizer' : 'New referee'), adderSports = orgsMode ? null : sportChecks();
+  modal((orgsMode ? 'Organizers' : 'Referees') + ' – ' + T.name, h('div', {}, h('p', { class: 'muted small' }, 'Tick existing ' + (orgsMode ? 'organizers' : 'referees') + ', or add new ones by name or from the player list. At least one is needed. New people get a PIN.'), list, adder.el, adderSports ? h('div', { class: 'muted small' }, 'Sports the new referees cover (each game only offers referees mapped to its sport). Change existing referees’ sports in the Referees tab → Edit.') : null, adderSports),
+    [{ label: 'Save', fn: async () => { const r = await api('PUT', '/api/staff/tournaments/' + T.id, orgsMode ? { organizerIds: list.values(), newOrganizers: adder.values() } : { refereeIds: list.values(), newReferees: adder.values(), newRefereeSports: adderSports.values() }); await refresh(); showPins(r.pins); } }]);
 }
 /* Event → Teams: teams made from the event's players, and the team games each plays. */
 function eventTeams(T) {
@@ -146,13 +148,23 @@ function enrolModal(T) {
 }
 
 /* ---- games (sub-events) with their organizer and referees ---- */
-function staffPicker(ev) {
+function staffPicker(ev, sportSel) {
   const orgs = (S.organizers || []).map((a) => ({ id: a.id, name: a.name + (a.limited ? ' (game organizer)' : (a.sports || []).length ? ' (sport lead)' : ' (main organizer)') }));
-  const refs = S.referees.filter((r) => r.status !== 'pending').map((r) => ({ id: r.id, name: r.name + (r.kind === 'chief' ? ' (chief)' : '') }));
-  const orgList = checkList(orgs, ev ? ev.organizerIds || [] : []), refList = checkList(refs, ev ? ev.refereeIds || [] : curT().refereeIds || []);
-  const newRefs = staffAdder('New referee'), newOrgs = staffAdder('Extra organizer');
+  const orgList = checkList(orgs, ev ? ev.organizerIds || [] : []), newRefs = staffAdder('New referee'), newOrgs = staffAdder('Extra organizer');
+  const refBox = h('div', {}); let refList = checkList([], []);
+  const drawRefs = () => {
+    const g = { sport: sportSel ? sportSel.value : ev.sport, id: ev ? ev.id : '' }, label = SPORT_ICON[g.sport] ? SPORT_ICON[g.sport] + ' ' + SPORT_LABEL[g.sport] : 'this sport';
+    const all = S.referees.filter((r) => r.status !== 'pending' && r.kind !== 'volunteer'), ok = all.filter((r) => refFor(r, g)), hidden = all.filter((r) => !refFor(r, g));
+    const was = refList.values(), chosen = was.length ? was : ev ? ev.refereeIds || [] : curT().refereeIds || [];
+    refList = checkList(ok.map((r) => ({ id: r.id, name: r.name + (r.kind === 'chief' ? ' (chief)' : '') })), chosen.filter((id) => ok.some((r) => r.id === id)));
+    const stale = ev ? (ev.refereeIds || []).map((id) => byId('referees', id)).filter((r) => r && !refFor(r, g)) : [];
+    refBox.replaceChildren(...[h('div', { class: 'muted small' }, 'Only referees mapped to ' + label + ' are listed.'), refList,
+      hidden.length ? h('div', { class: 'muted small' }, 'Not mapped to ' + label + ': ' + hidden.map((r) => r.name).join(', ') + ' – map sports in Event → Referees → Edit.') : null,
+      stale.length ? h('div', { class: 'warnbox small' }, stale.map((r) => r.name).join(', ') + ' will be removed from this game on Save (not mapped to ' + label + ').') : null].filter(Boolean));
+  };
+  drawRefs(); if (sportSel) sportSel.addEventListener('change', () => { refList = checkList([], []); drawRefs(); });
   const el = h('div', {},
-    h('b', {}, '🧑‍⚖️ Referees for this game (at least one)'), refList, h('div', { class: 'muted small' }, '…or add new ones – type a name or pick a player:'), newRefs.el,
+    h('b', {}, '🧑‍⚖️ Referees for this game (at least one)'), refBox, h('div', { class: 'muted small' }, '…or add new ones – type a name or pick a player (they are mapped to this sport):'), newRefs.el,
     h('details', {}, h('summary', { class: 'small' }, 'Extra organizer just for this game (optional – the event’s organizers already manage it)'), orgList, newOrgs.el));
   return { el, values: () => ({ organizerIds: orgList.values(), refereeIds: refList.values(), newOrganizers: newOrgs.values(), newReferees: newRefs.values() }) };
 }
@@ -166,7 +178,7 @@ function newGameModal() {
   const sport = sel([['badminton', '🏸 Badminton'], ['tt', '🏓 Table tennis'], ['carrom', '🎯 Carrom'], ['chess', '♟️ Chess'], ['other', '🏅 Other']], me.sports && me.sports[0] || 'badminton');
   const section = sel(SECTION_OPTS, ui.section), kind = sel([['singles', 'Individual – singles'], ['doubles', 'Individual – doubles (pairs)'], ['team', 'Team event']], 'singles');
   const name = inp('', { placeholder: 'Optional, e.g. Men’s Doubles', maxlength: 80 });
-  const staff = staffPicker(null);
+  const staff = staffPicker(null, sport);
   modal('New game – ' + (S.tournament.seasonName || 'this season'), h('div', {}, field('Sport', sport), field('Who plays', kind), field('Section', section), field('Name', name, 'Leave empty to name it after the sport.'), staff.el,
     h('p', { class: 'muted small' }, 'Scoring rules start from the usual rules for the sport – change them later under ⚙ Game settings.')),
   [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, { label: 'Create game', fn: async () => {
@@ -498,12 +510,13 @@ function fixtureModal(eventId, match) {
     const ids = [...A, ...B].map((x) => x.value).filter(Boolean);
     const playing = new Set(ids.flatMap((id) => [id, ...((byId('teams', id) || {}).memberIds || [])]));
     const chosen = refTouched ? refList.values() : match && match.eventId === ev.id ? match.refereeIds || [] : ev.refereeIds || [];
-    const free = S.referees.filter((r) => r.status !== 'pending' && r.kind !== 'volunteer' && !(r.playerId && playing.has(r.playerId)));
-    const blocked = S.referees.filter((r) => r.playerId && playing.has(r.playerId));
+    const free = S.referees.filter((r) => r.status !== 'pending' && r.kind !== 'volunteer' && refFor(r, ev) && !(r.playerId && playing.has(r.playerId)));
+    const blocked = S.referees.filter((r) => r.playerId && playing.has(r.playerId) && refFor(r, ev)), unmapped = S.referees.filter((r) => r.status !== 'pending' && r.kind !== 'volunteer' && !refFor(r, ev));
     refList = checkList(free.map((r) => ({ id: r.id, name: r.name + (r.kind === 'chief' ? ' (chief)' : '') })), chosen.filter((id) => free.some((r) => r.id === id)));
     refList.addEventListener('change', () => { refTouched = true; });
-    f.ref.replaceChildren(refList, blocked.length ? h('div', { class: 'muted small' }, 'Not offered because they play in this match: ' + blocked.map((r) => r.name).join(', ')) : null,
-      ev.sideType === 'team' ? h('div', { class: 'muted small' }, 'Team matches can have several referees.') : null);
+    f.ref.replaceChildren(...[refList, blocked.length ? h('div', { class: 'muted small' }, 'Not offered because they play in this match: ' + blocked.map((r) => r.name).join(', ')) : null,
+      unmapped.length ? h('div', { class: 'muted small' }, 'Not mapped to ' + (SPORT_LABEL[ev.sport] || 'this sport') + ': ' + unmapped.map((r) => r.name).join(', ')) : null,
+      ev.sideType === 'team' ? h('div', { class: 'muted small' }, 'Team matches can have several referees.') : null].filter(Boolean));
   };
   f.event.addEventListener('change', () => { refTouched = false; drawSides(); drawRefs(); }); drawSides(); drawRefs();
   modal(match ? 'Edit fixture' : 'New fixture', h('div', {}, field('Event', f.event), field('Stage', f.stage), sides,
@@ -585,9 +598,10 @@ async function finalsFlow(ev) {
 
 function resetDrawFlow(ev) {
   const go = (force) => api('POST', '/api/admin/events/' + ev.id + '/reset-draw', { force }).then(async (r) => { toast(r.removed + ' fixtures removed'); await refresh(); });
-  confirmBox('Delete ALL fixtures of ' + ev.name + ' and its groups / bracket so you can draw again?', guard(async () => {
-    try { await go(false); } catch (e) { if (e.data && e.data.needForce) confirmBox(e.message + ' Delete everything anyway?', guard(() => go(true)), 'Delete everything'); else throw e; }
-  }), 'Reset draw');
+  const n = S.matches.filter((m) => m.eventId === ev.id).length;
+  confirmBox('Delete all ' + n + ' fixture' + (n === 1 ? '' : 's') + ' of ' + ev.name + ' (and its groups / bracket)? They go to Admin → Trash, where you can restore them for 30 days.', guard(async () => {
+    try { await go(false); } catch (e) { if (e.data && e.data.needForce) confirmBox(e.message + ' Delete them anyway? (They can still be restored from Trash.)', guard(() => go(true)), 'Delete all'); else throw e; }
+  }), 'Delete all');
 }
 
 function scoresModal(m, ev, d, rid) {
@@ -612,9 +626,11 @@ Views.admin = () => {
 
 function rolesModal(x, done) {
   const admin = h('input', { type: 'checkbox', checked: x.admin }), ref = sel([['', 'Not a referee'], ['referee', 'Referee – scores matches'], ['chief', 'Chief referee – also corrects scores'], ['volunteer', 'Volunteer – check-in only']], x.referee || '');
-  modal('Roles – ' + x.name, h('div', {}, h('label', { class: 'chk' }, admin, '🛡 Main admin – manages everything, including people and roles'), field('Referee', ref, 'A referee never referees a match they or their team play in.'),
+  const sports = sportChecks(x.refSports || []), sBox = h('div', { hidden: !ref.value }, h('div', { class: 'muted small' }, 'Sports they referee – they are only offered for games of these sports (chief referees cover all):'), sports);
+  ref.addEventListener('change', () => { sBox.hidden = !ref.value; });
+  modal('Roles – ' + x.name, h('div', {}, h('label', { class: 'chk' }, admin, '🛡 Main admin – manages everything, including people and roles'), field('Referee', ref, 'A referee never referees a match they or their team play in.'), sBox,
     h('p', { class: 'muted small' }, 'Organizers are set per event (Event → Organizers). Team captains are set on the team.')),
-  [{ label: 'Save', fn: async () => { const r = await api('POST', '/api/admin/people/' + x.id + '/roles', { admin: admin.checked, referee: ref.value }); if (r.pin) showPin(r.name, r.pin); else toast('Roles saved'); done(); await refresh(); } }]);
+  [{ label: 'Save', fn: async () => { const r = await api('POST', '/api/admin/people/' + x.id + '/roles', { admin: admin.checked, referee: ref.value, ...(ref.value ? { sports: sports.values() } : {}) }); if (r.pin) showPin(r.name, r.pin); else toast('Roles saved'); done(); await refresh(); } }]);
 }
 function pinsList(pins) {
   if (!pins.length) return toast('Everyone already has a PIN');
@@ -939,7 +955,7 @@ adminTabs.disputes = function () {
 
 adminTabs.trash = function () {
   const box = h('div', {}, h('p', { class: 'muted' }, 'Loading…'));
-  const KIND = { players: 'Player', teams: 'Team', events: 'Event', referees: 'Referee', matches: 'Match', sponsors: 'Sponsor' };
+  const KIND = { players: 'Player', teams: 'Team', events: 'Event', referees: 'Referee', matches: 'Match', sponsors: 'Sponsor', fixtures: 'Fixtures' };
   const draw = (list) => box.replaceChildren(h('p', { class: 'muted small' }, 'Deleted items are kept for 30 days so a mistake can be undone.'), list.length ? h('div', { class: 'list' }, list.map((x) => h('div', { class: 'row' },
     h('div', { class: 'grow' }, h('b', {}, (KIND[x.col] || x.col) + ': ' + (x.name || '—')), h('div', { class: 'muted small' }, 'Deleted ' + new Date(x.at).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }) + (x.matches ? ' • with ' + x.matches + ' match(es)' : ''))),
     h('button', { class: 'btn sm', onclick: guard(async () => { await api('POST', '/api/admin/trash/' + x.id + '/restore'); toast('Restored'); await refresh(); }) }, 'Restore')))) : h('p', { class: 'empty' }, 'Trash is empty.'),

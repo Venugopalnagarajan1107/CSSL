@@ -14,7 +14,7 @@ test('events side by side: create with structure, roster-only entries, teams, ma
     const dbPlayer = (await call('POST', '/api/admin/players', { name: 'Old Timer' }, admin)).body;   // enrolled in Season 3 only
 
     // a referee may create an event and name its organizers / referees (typed or from the player list)
-    const ref = (await call('POST', '/api/admin/referees', { name: 'Ref Maker', pin: '4321' }, admin)).body;
+    const ref = (await call('POST', '/api/admin/referees', { name: 'Ref Maker', pin: '4321', sports: ['badminton', 'tt', 'carrom', 'chess'] }, admin)).body;
     const rt = (await call('POST', '/api/login', { role: 'referee', refereeId: ref.id, pin: '4321' })).body.token;
     assert.equal((await call('POST', '/api/staff/tournaments', { name: 'Diwali Cup' })).status, 401, 'needs a PIN');
     assert.match((await call('POST', '/api/staff/tournaments', { name: 'Diwali Cup', refereeIds: [ref.id] }, rt)).body.error, /organizer/);

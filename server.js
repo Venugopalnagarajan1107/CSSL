@@ -484,13 +484,21 @@ function refScope(r) {
   if (!r || (!r.sports.length && !r.eventIds.length)) return '';
   return [...r.sports.map((x) => SPORT_NAMES[x] || x), ...r.eventIds.map((id) => (find('events', id) || {}).name).filter(Boolean)].join(', ');
 }
+/* A referee is offered for a game only when mapped to its sport (or to that game). Chief referees cover every sport. */
+const refFor = (r, ev) => !!(r && ev) && (r.kind === 'chief' || (r.sports || []).includes(ev.sport) || (r.eventIds || []).includes(ev.id));
+const sportName = (k) => ({ badminton: 'Badminton', tt: 'Table tennis', carrom: 'Carrom', chess: 'Chess' }[k] || 'this sport');
+function mappedRefs(ids, ev, strict) {
+  const bad = ids.map((id) => find('referees', id)).filter((r) => r && !refFor(r, ev));
+  if (bad.length && strict) throw new HttpError(400, bad.map((r) => r.name).join(', ') + (bad.length > 1 ? ' are' : ' is') + ' not mapped to ' + sportName(ev.sport) + '. Map the sport in Event → Referees first.');
+  return ids.filter((id) => !bad.some((r) => r.id === id));
+}
 function checkRef(user, match) {
   if (!user.refId) return;
   if (user.personId && inMatch(user.personId, match)) throw new HttpError(403, 'You (or your team) play in this match, so you cannot referee it.');
   if (user.kind === 'chief') return;
   if (db.tournament.enforceReferee && (match.refereeIds || []).length && !match.refereeIds.includes(user.refId)) throw new HttpError(403, 'This match is assigned to another referee.');
   const r = find('referees', user.refId), ev = find('events', match.eventId);
-  if (r && ev && (r.sports.length || r.eventIds.length) && !r.eventIds.includes(ev.id) && !r.sports.includes(ev.sport) && !(ev.refereeIds || []).includes(r.id)) throw new HttpError(403, 'You are set up to referee ' + refScope(r) + ' only. Ask the organizer to change this.');
+  if (r && ev && (r.sports.length || r.eventIds.length) && !refFor(r, ev) && !(ev.refereeIds || []).includes(r.id) && !(match.refereeIds || []).includes(r.id)) throw new HttpError(403, 'You are set up to referee ' + refScope(r) + ' only. Ask the organizer to change this.');
 }
 const SPORT_NAMES = { badminton: 'Badminton', tt: 'Table tennis', carrom: 'Carrom', chess: 'Chess', other: 'Other' };
 /* Per-season records for all-time rankings (past seasons are frozen when the next season starts). */
@@ -824,7 +832,8 @@ function normMatch(b, prev) {
     court: str(b.court != null ? b.court : prev.court || '', 30), time: str(b.time != null ? b.time : prev.time || '', 30), startsAt,
     round: Math.max(0, Math.round(num(b.round, prev.round || 0))), totalRounds: Math.max(0, Math.min(99, Math.round(num(b.totalRounds, prev.totalRounds || 0)))), ...matchCfg(b, prev), refereeIds: (() => {
       const ids = Array.isArray(b.refereeIds) ? b.refereeIds.map(String) : b.refereeId !== undefined ? (b.refereeId ? [str(b.refereeId, 20)] : []) : prev.refereeIds || (prev.refereeId ? [prev.refereeId] : []);
-      const ok = [...new Set(ids)].filter((id) => find('referees', id)).slice(0, ev.sideType === 'team' ? 6 : 2);
+      const explicit = Array.isArray(b.refereeIds) && JSON.stringify(b.refereeIds) !== JSON.stringify(prev.refereeIds || []);
+      const ok = mappedRefs([...new Set(ids)].filter((id) => find('referees', id)), ev, explicit).slice(0, ev.sideType === 'team' ? 6 : 2);
       const clash = ok.map((id) => find('referees', id)).filter((r) => r.playerId && inMatch(r.playerId, { sideA, sideB }));
       if (clash.length && (Array.isArray(b.refereeIds) || b.refereeId !== undefined)) throw new HttpError(400, clash.map((r) => r.name).join(', ') + ' play' + (clash.length > 1 ? '' : 's') + ' in this match and cannot referee it.');
       return ok.filter((id) => !clash.some((r) => r.id === id));
@@ -970,6 +979,18 @@ function pushTrash(sn) {
 }
 function restoreTrash(sn) {
   const col = sn.col, it = sn.item;
+  if (col === 'fixtures') {   /* "Delete all fixtures" of one game: bring them all back, with its groups / bracket */
+    const ev = it.eventId ? find('events', it.eventId) : null;
+    if (it.eventId && !ev) throw new HttpError(409, 'Its game no longer exists. Restore the game first.');
+    const back = (sn.matches || []).filter((m) => !find('matches', m.id) && find('events', m.eventId));
+    if (!back.length) throw new HttpError(409, 'These matches already exist again, or their games were deleted.');
+    back.forEach((m) => db.matches.push(m));
+    if (!ev) return;
+    if (sn.groups && !ev.groups) ev.groups = sn.groups;
+    if (sn.bracket && !ev.bracket) ev.bracket = sn.bracket;
+    if (sn.byes && !(ev.byes || []).length) ev.byes = sn.byes;
+    return;
+  }
   if (db[col].some((x) => x.id === it.id)) throw new HttpError(409, 'This item already exists again.');
   if (col === 'matches' && !find('events', it.eventId)) throw new HttpError(409, 'Its event no longer exists. Restore the event first.');
   if (col === 'players' && it.status === 'pending') { /* stays pending */ }
@@ -1308,7 +1329,8 @@ function tourStaff(b, pins, creator) {
   if (creator && creator.role === 'admin' && !orgIds.includes(creator.adminId)) orgIds.push(creator.adminId);
   const refIds = (Array.isArray(b.refereeIds) ? b.refereeIds : []).map(String).filter((id) => { const r = find('referees', id); return r && r.status !== 'pending'; });
   staffNames(b.newOrganizers).forEach((x) => { const a = newOrganizer(x.name, { sports: [], limited: true }); if (x.playerId) a.playerId = x.playerId; pins.push({ role: 'Organizer', name: a.name, pin: a._pin }); delete a._pin; orgIds.push(a.id); });
-  staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee' }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: r._plain }); delete r._plain; db.referees.push(r); refIds.push(r.id); });
+  const newSports = (Array.isArray(b.newRefereeSports) ? b.newRefereeSports : []).filter((k) => SPORTS.includes(k));
+  staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee', sports: newSports }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: r._plain }); delete r._plain; db.referees.push(r); refIds.push(r.id); });
   if (!orgIds.length) throw new HttpError(400, 'An event needs at least one organizer – choose one or add a new one.');
   if (!refIds.length) throw new HttpError(400, 'An event needs at least one referee – choose one or add a new one.');
   return { organizerIds: [...new Set(orgIds)], refereeIds: [...new Set(refIds)] };
@@ -1881,8 +1903,8 @@ async function route(req, res, url) {
     const made = [];
     games.forEach((g) => {
       try {
-        if (g.copy) { const c = JSON.parse(JSON.stringify(g.copy)); Object.assign(c, { id: uid(), tid: T.id, participantIds: [], withdrawn: [], interestedIds: [], organizerIds: staff.organizerIds, refereeIds: staff.refereeIds }); delete c.frozenCount; delete c.groups; delete c.bracket; delete c.byes; db.events.push(c); made.push(c); return; }
-        made.push(makeGame(T.id, g, staff));
+        if (g.copy) { const c = JSON.parse(JSON.stringify(g.copy)); Object.assign(c, { id: uid(), tid: T.id, participantIds: [], withdrawn: [], interestedIds: [], organizerIds: staff.organizerIds, refereeIds: mappedRefs(staff.refereeIds, { sport: c.sport, id: '' }) }); delete c.frozenCount; delete c.groups; delete c.bracket; delete c.byes; db.events.push(c); made.push(c); return; }
+        made.push(makeGame(T.id, g, { ...staff, refereeIds: mappedRefs(staff.refereeIds, { sport: SPORTS.includes(g.sport) ? g.sport : 'other', id: '' }) }));
       } catch (e) { /* skip a bad row, the rest is created */ }
     });
     audit(user.name, 'created event', name + ' (' + made.length + ' games)'); save(); broadcast();
@@ -1896,7 +1918,7 @@ async function route(req, res, url) {
     if (b.dates != null) T.dates = str(b.dates, 60);
     if (b.venue != null) T.venue = str(b.venue, 120);
     if (b.status === 'closed' || b.status === 'open') T.status = b.status;
-    if (b.organizerIds || b.refereeIds || b.newOrganizers || b.newReferees) Object.assign(T, tourStaff({ organizerIds: b.organizerIds || T.organizerIds, refereeIds: b.refereeIds || T.refereeIds, newOrganizers: b.newOrganizers, newReferees: b.newReferees }, pins, null));
+    if (b.organizerIds || b.refereeIds || b.newOrganizers || b.newReferees) Object.assign(T, tourStaff({ organizerIds: b.organizerIds || T.organizerIds, refereeIds: b.refereeIds || T.refereeIds, newOrganizers: b.newOrganizers, newReferees: b.newReferees, newRefereeSports: b.newRefereeSports }, pins, null));
     if (T.kind === 'friendly') T.status = 'open';
     if (!db.tournaments.some((x) => x.status !== 'closed' && x.kind !== 'friendly')) { T.status = 'open'; throw new HttpError(400, 'At least one event must stay open.'); }
     audit(user.name, 'edited event', T.name); save(); broadcast();
@@ -2517,7 +2539,7 @@ async function route(req, res, url) {
       return json(res, 200, {
         people: db.players.filter((x) => x.status !== 'rejected').map((x) => ({ id: x.id, name: x.name, section: x.section, hasPin: !!x.pinHash,
           admin: db.admins.some((a) => a.playerId === x.id && !a.limited && !(a.sports || []).length), organizer: db.admins.some((a) => a.playerId === x.id && (a.limited || (a.sports || []).length)),
-          referee: (db.referees.find((r) => r.playerId === x.id && r.status !== 'pending') || {}).kind || '', captain: db.teams.some((t) => t.captainId === x.id) })),
+          referee: (db.referees.find((r) => r.playerId === x.id && r.status !== 'pending') || {}).kind || '', refSports: (db.referees.find((r) => r.playerId === x.id && r.status !== 'pending') || {}).sports || [], captain: db.teams.some((t) => t.captainId === x.id) })),
         unlinked: [...db.admins.filter((a) => !a.playerId).map((a) => ({ type: 'admin', id: a.id, name: a.name })), ...db.referees.filter((r) => !r.playerId && r.status !== 'pending').map((r) => ({ type: 'referee', id: r.id, name: r.name }))],
       });
     }
@@ -2540,8 +2562,9 @@ async function route(req, res, url) {
       if (b.referee != null) {
         const r = db.referees.find((x) => x.playerId === pl.id);
         const kind = ['referee', 'chief', 'volunteer'].includes(b.referee) ? b.referee : '';
-        if (kind && !r) { db.referees.push({ id: uid(), name: pl.name, kind, sports: [], eventIds: [], status: 'active', phone: '', note: '', signedUpAt: 0, pinHash: '', playerId: pl.id }); out.referee = 'added'; }
-        else if (kind && r) { r.kind = kind; r.status = 'active'; out.referee = kind; }
+        const sp = Array.isArray(b.sports) ? b.sports.filter((k) => SPORTS.includes(k)) : null;
+        if (kind && !r) { db.referees.push({ id: uid(), name: pl.name, kind, sports: sp || [], eventIds: [], status: 'active', phone: '', note: '', signedUpAt: 0, pinHash: '', playerId: pl.id }); out.referee = 'added'; }
+        else if (kind && r) { r.kind = kind; r.status = 'active'; if (sp) r.sports = sp; out.referee = kind; }
         else if (!kind && r) { cascadeDelete('referees', r.id); db.referees = db.referees.filter((x) => x !== r); Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].refId === r.id) delete db.sessions[t]; }); out.referee = 'removed'; }
       }
       let pin = null; if (!pl.pinHash && (b.admin || b.referee)) pin = givePin(pl);   // a role needs a way to sign in
@@ -2588,13 +2611,15 @@ async function route(req, res, url) {
       return json(res, 200, { ok: true, added: add.length, removed });
     }
     /* ---- a game (sub-event) always has an organizer and a referee: create both inline if needed ---- */
-    const gameStaff = (b, pins) => {
+    const gameStaff = (b, pins, ev) => {
       const orgIds = (Array.isArray(b.organizerIds) ? b.organizerIds : []).map(String).filter((id) => db.admins.some((a) => a.id === id));
       const refIds = (Array.isArray(b.refereeIds) ? b.refereeIds : []).map(String).filter((id) => { const r = find('referees', id); return r && r.status !== 'pending'; });
       staffNames(b.newOrganizers).forEach((x) => { const a = newOrganizer(x.name, { sports: [], limited: true }); if (x.playerId) a.playerId = x.playerId; pins.push({ role: 'Organizer', name: a.name, pin: a._pin }); delete a._pin; orgIds.push(a.id); });
       if (b.newOrganizer && str(b.newOrganizer, 40).trim()) { const a = newOrganizer(str(b.newOrganizer, 40).trim(), { sports: [], limited: true }); pins.push({ role: 'Organizer', name: a.name, pin: a._pin }); delete a._pin; orgIds.push(a.id); }
-      staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee' }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: r._plain }); delete r._plain; db.referees.push(r); refIds.push(r.id); });
-      if (!refIds.length) throw new HttpError(400, 'Every game needs at least one referee – choose one or add a new one.');
+      const picked = mappedRefs(refIds, ev, !b.byDefault);
+      staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee', sports: [ev.sport] }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: r._plain }); delete r._plain; db.referees.push(r); picked.push(r.id); });
+      refIds.length = 0; refIds.push(...picked);
+      if (!refIds.length) throw new HttpError(400, 'Every game needs at least one referee mapped to ' + sportName(ev.sport) + ' – choose one or add a new one.');
       return { organizerIds: [...new Set(orgIds)], refereeIds: [...new Set(refIds)] };
     };
     if (p === '/api/admin/games' && m === 'POST') {
@@ -2606,8 +2631,8 @@ async function route(req, res, url) {
       const kind = ['singles', 'doubles', 'team'].includes(b.kind) ? b.kind : 'singles';
       const name = str(b.name, 80).trim() || ({ badminton: 'Badminton', tt: 'Table Tennis', carrom: 'Carrom', chess: 'Chess' }[sport] || 'Game') + (kind === 'doubles' ? ' – Doubles' : kind === 'team' ? ' – Team Event' : '') + (section === 'kids' ? ' (Kids)' : '');
       if (db.events.some((e) => e.tid === tid && e.name.toLowerCase() === name.toLowerCase() && (e.section || 'adults') === section)) throw new HttpError(409, 'A game called "' + name + '" already exists in ' + tour(tid).name + '.');
-      if (!(Array.isArray(b.refereeIds) && b.refereeIds.length) && !(b.newReferees && b.newReferees.length)) b.refereeIds = tour(tid).refereeIds;   // the event's referees by default
-      const pins = [], staff = gameStaff(b, pins);
+      if (!(Array.isArray(b.refereeIds) && b.refereeIds.length) && !(b.newReferees && b.newReferees.length)) { b.refereeIds = tour(tid).refereeIds; b.byDefault = true; }   // the event's referees for this sport by default
+      const pins = [], staff = gameStaff(b, pins, { sport, id: '' });
       const like = db.events.find((e) => e.sport === sport && (e.section || 'adults') === section && (e.sideType === 'team') === (kind === 'team')) || db.events.find((e) => e.sport === sport)
         || [...seedEvents(), ...seedKidsEvents()].find((e) => e.sport === sport && e.section === section) || seedEvents().find((e) => e.sport === sport);
       const ev = normEvent({ name, sport, section, sideType: kind === 'team' ? 'team' : 'player', sideSize: kind === 'doubles' ? 2 : 1, scoring: like ? like.scoring : 'points', config: like ? like.config : {}, participantIds: [], tid, ...staff }, null);
@@ -2616,7 +2641,7 @@ async function route(req, res, url) {
     }
     if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/staff$/)) && m === 'PUT') {
       const ev = find('events', mm[1]); if (!ev) throw new HttpError(404, 'Game not found');
-      const pins = [], staff = gameStaff(await readJson(req, 20000), pins);
+      const pins = [], staff = gameStaff(await readJson(req, 20000), pins, ev);
       ev.organizerIds = staff.organizerIds; ev.refereeIds = staff.refereeIds;
       audit(user.name, 'set organizer & referees', ev.name); save(); broadcast();
       return json(res, 200, { ok: true, pins });
@@ -2800,15 +2825,29 @@ async function route(req, res, url) {
       save(); broadcast();
       return json(res, 200, { created: plan.length, stage: plan[0].stage });
     }
+    /* Delete the matches an organizer ticked (one, several or all) – one Trash item restores them all. */
+    if (p === '/api/admin/matches/bulk-delete' && m === 'POST') {
+      const b = await readJson(req, 200000);
+      const ids = [...new Set((Array.isArray(b.ids) ? b.ids : []).map(String))].slice(0, 2000), ms = ids.map((id) => find('matches', id)).filter(Boolean);
+      if (!ms.length) throw new HttpError(400, 'Select at least one match.');
+      for (const x of ms) { const ev = find('events', x.eventId); if (!sportOk(user, ev)) throw new HttpError(403, 'You can only delete matches of games you organize.'); if (ev && ev.tid && (tour(ev.tid) || {}).status === 'closed') throw new HttpError(409, tour(ev.tid).name + ' is closed.'); }
+      const games = [...new Set(ms.map((x) => (find('events', x.eventId) || {}).name).filter(Boolean))];
+      pushTrash({ id: uid(), col: 'fixtures', item: { id: uid(), eventId: '' }, at: Date.now(), links: {}, name: ms.length + ' match' + (ms.length === 1 ? '' : 'es') + ' – ' + games.slice(0, 3).join(', ') + (games.length > 3 ? ' +' + (games.length - 3) : ''), matches: ms.map(clone) });
+      const gone = new Set(ms.map((x) => x.id)); db.matches = db.matches.filter((x) => !gone.has(x.id));
+      audit(user.name, 'deleted matches', ms.length + ' (' + games.join(', ') + ') – in Trash'); save(); broadcast();
+      return json(res, 200, { ok: true, removed: ms.length });
+    }
     if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/reset-draw$/)) && m === 'POST') {
       const ev = find('events', mm[1]); if (!ev) throw new HttpError(404, 'Event not found');
       const b = await readJson(req);
       const mine = db.matches.filter((x) => x.eventId === ev.id);
       const played = mine.filter((x) => Engine.derive(x, ev).status !== 'scheduled').length;
       if (played && !b.force) throw new HttpError(409, played + ' match(es) already have scores. Resetting deletes ALL ' + mine.length + ' fixtures of this event.', { needForce: true });
+      if (mine.length || ev.groups || ev.bracket) pushTrash({ id: uid(), col: 'fixtures', item: { id: ev.id, eventId: ev.id }, at: Date.now(), links: {}, name: ev.name + ' – all ' + mine.length + ' fixtures',
+        matches: mine.map(clone), groups: ev.groups ? clone(ev.groups) : null, bracket: ev.bracket ? clone(ev.bracket) : null, byes: clone(ev.byes || []) });
       db.matches = db.matches.filter((x) => x.eventId !== ev.id);
       delete ev.groups; delete ev.bracket; ev.byes = [];
-      audit(user.name, 'reset draw', ev.name + ': ' + mine.length + ' fixtures removed'); save(); broadcast();
+      audit(user.name, 'deleted all fixtures', ev.name + ': ' + mine.length + ' fixtures (in Trash)'); save(); broadcast();
       return json(res, 200, { ok: true, removed: mine.length });
     }
     if (p === '/api/admin/shift' && m === 'POST') {

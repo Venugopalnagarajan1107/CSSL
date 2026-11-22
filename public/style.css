@@ -177,3 +177,10 @@ a.card,a.row,a.grow,a.chip,.list a,.ev-top a,.tbl.rank td a{color:inherit;text-d
 .btn.wa { background: #25d366; color: #fff; border-color: #25d366; }
 .actions.center { justify-content: center; }
 .warn{color:#b54708}
+.mc-btns { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.btn.danger-t { color: var(--bad); }
+.selbar { position: sticky; top: 56px; z-index: 5; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; margin: 8px 0; background: var(--card, #fff); border: 1px solid var(--line, #e5e7eb); border-radius: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.08); }
+.selbar b { margin-right: auto; }
+.card.match.picking { cursor: pointer; }
+.card.match.picked { outline: 2px solid var(--brand); outline-offset: -2px; }
+.pickbox { font-size: 20px; line-height: 1; margin-right: 6px; }

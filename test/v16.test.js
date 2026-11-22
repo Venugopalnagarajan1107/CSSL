@@ -18,7 +18,7 @@ test('one PIN per person: roles, referee never in own match, my profile, admins 
     const P = {}; for (const n of ['Ravi', 'Asha', 'Kiran', 'Meena', 'Dev', 'Lata']) P[n] = (await call('POST', '/api/admin/players', { name: n }, admin)).body.id;
 
     // the main admin gives Ravi referee + admin roles; one PIN carries both
-    const roles = (await call('POST', '/api/admin/people/' + P.Ravi + '/roles', { admin: true, referee: 'referee' }, admin)).body;
+    const roles = (await call('POST', '/api/admin/people/' + P.Ravi + '/roles', { admin: true, referee: 'referee', sports: ['badminton', 'tt', 'carrom', 'chess'] }, admin)).body;
     assert.match(roles.pin, /^\d{6}$/);
     const ravi = (await call('POST', '/api/login', { pin: roles.pin })).body;
     assert.equal(ravi.role, 'admin'); assert.ok(ravi.refId && ravi.adminId); assert.equal(ravi.personId, P.Ravi);
@@ -36,7 +36,7 @@ test('one PIN per person: roles, referee never in own match, my profile, admins 
     const mk = async (name, ids) => (await call('POST', '/api/admin/teams', { name, memberIds: ids }, admin)).body.id;
     const tA = await mk('A', [P.Ravi, P.Asha]), tB = await mk('B', [P.Kiran, P.Meena]), tC = await mk('C', [P.Dev, P.Lata]);
     await call('PUT', '/api/admin/events/' + team.id, { participantIds: [tA, tB, tC] }, admin);
-    const devRole = (await call('POST', '/api/admin/people/' + P.Dev + '/roles', { referee: 'referee' }, admin)).body;
+    const devRole = (await call('POST', '/api/admin/people/' + P.Dev + '/roles', { referee: 'referee', sports: ['badminton', 'tt', 'carrom', 'chess'] }, admin)).body;
     const devRef = (await call('GET', '/api/state', null, admin)).body.referees.find((r) => r.playerId === P.Dev).id;
     const tieAB = await call('POST', '/api/admin/matches', { eventId: team.id, sideA: [tA], sideB: [tB], refereeIds: [devRef] }, admin);
     assert.equal(tieAB.status, 200);

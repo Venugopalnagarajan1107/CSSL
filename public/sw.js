@@ -1,5 +1,5 @@
 /* Service worker: offline app shell + push notifications */
-const CACHE = 'tournament-shell-v7';
+const CACHE = 'tournament-shell-v9';
 const SHELL = ['/', '/style.css', '/engine.js', '/i18n.js', '/app.js', '/admin.js', '/manifest.webmanifest', '/icon-192.png'];
 
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting())); });

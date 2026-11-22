@@ -15,7 +15,9 @@ test('games need an organizer and a referee; game organizers manage only their g
     assert.equal(g.status, 200);
     assert.equal(g.body.event.sideSize, 2); assert.equal(g.body.event.sport, 'badminton'); assert.equal(g.body.event.refereeIds.length, 2);
     assert.deepEqual(g.body.pins.map((x) => x.role), ['Organizer', 'Referee', 'Referee']);
-    const team = (await call('POST', '/api/admin/games', { sport: 'chess', kind: 'team', section: 'kids', organizerIds: [me.id], refereeIds: g.body.event.refereeIds.slice(0, 1) }, admin)).body.event;
+    // a badminton umpire is not offered for chess
+    assert.match((await call('POST', '/api/admin/games', { sport: 'chess', kind: 'team', section: 'kids', organizerIds: [me.id], refereeIds: g.body.event.refereeIds.slice(0, 1) }, admin)).body.error, /not mapped to Chess/);
+    const team = (await call('POST', '/api/admin/games', { sport: 'chess', kind: 'team', section: 'kids', organizerIds: [me.id], newReferees: ['Arbiter'] }, admin)).body.event;
     assert.equal(team.sideType, 'team'); assert.equal(team.section, 'kids'); assert.equal(team.name, 'Chess – Team Event (Kids)'); assert.equal(team.scoring, 'result');
 
     // the new organizer manages Mixed Doubles only

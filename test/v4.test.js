@@ -172,7 +172,7 @@ test('v4 server: team rubbers, line-ups, referee assignment, schedule shift, age
     assert.equal((await lineup([{ id: rid('Mixed doubles'), sideA: [m1.id, w1.id], sideB: [n1.id, x1.id] }, { id: rid("Men's singles"), sideA: [m1.id], sideB: [n1.id] }])).status, 200, 'two rubbers per player is allowed');
 
     /* referees: assignment can be enforced */
-    const ref1 = (await A('POST', '/referees', { name: 'Ref One', pin: '1111' })).body, ref2 = (await A('POST', '/referees', { name: 'Ref Two', pin: '2222' })).body;
+    const ref1 = (await A('POST', '/referees', { name: 'Ref One', pin: '1111', sports: ['badminton', 'tt', 'carrom', 'chess'] })).body, ref2 = (await A('POST', '/referees', { name: 'Ref Two', pin: '2222', sports: ['badminton', 'tt', 'carrom', 'chess'] })).body;
     await A('PUT', '/matches/' + tie.id, { refereeId: ref1.id });
     const tok1 = (await call('POST', '/api/login', { role: 'referee', refereeId: ref1.id, pin: '1111' })).body.token;
     const tok2 = (await call('POST', '/api/login', { role: 'referee', refereeId: ref2.id, pin: '2222' })).body.token;
