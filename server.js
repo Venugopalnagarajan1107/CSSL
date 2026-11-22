@@ -263,7 +263,7 @@ function numberMatches() {
     let top = Math.max(0, ...ms.map((m) => m.plannedNo || 0));
     ms.filter((m) => !m.plannedNo).sort(byCreated).forEach((m) => { m.plannedNo = ++top; });
     /* lock the start order the first time a match is seen started; a reset match goes back to the queue */
-    const started = (m) => !!(m.log && m.log.length) || !!m.result || !!m.walkover || !!m.retired || !!m.paper || (!!ev && Engine.derive(m, ev).status !== 'scheduled');
+    const started = (m) => !m.cancelled && (!!(m.log && m.log.length) || !!m.result || !!m.walkover || !!m.retired || !!m.paper || (!!ev && Engine.derive(m, ev).status !== 'scheduled'));
     const st = [], q = [];
     ms.forEach((m) => (started(m) ? st : q).push(m));
     q.forEach((m) => { delete m.startSeq; });
@@ -514,8 +514,8 @@ function publicState(mode) {
     players: db.players.filter((p) => isAdmin || p.status !== 'pending').map((p) => publicPlayer(p, mode, names)),
     teams: db.teams.map(({ captainHash, ...t }) => ({ ...t, hasCode: !!captainHash })), referees: db.referees.filter((r) => isAdmin || r.status !== 'pending').map((r) => ({ id: r.id, name: mode === 'public' ? refDisplay(r) : r.name, kind: r.kind, sports: r.sports, eventIds: r.eventIds, status: r.status, playerId: r.playerId || '', ...(isAdmin ? { phone: r.phone, note: r.note, signedUpAt: r.signedUpAt } : {}) })),
     seasons: db.seasons.map((x) => seasonPublic(x, mode)),
-    tournaments: db.tournaments.map((T) => ({ id: T.id, kind: T.kind || '', name: T.name, dates: T.dates, venue: T.venue, status: T.status, createdAt: T.createdAt, createdBy: isAdmin ? T.createdBy : '', organizerIds: T.organizerIds, refereeIds: T.refereeIds, playerIds: T.playerIds })),
-    organizers: db.admins.map((a) => (isAdmin ? { id: a.id, name: a.name, sports: a.sports || [], limited: !!a.limited, playerId: a.playerId || '' } : { id: a.id, name: a.name, main: !a.limited && !(a.sports || []).length })),   /* organizers are named in full on Contact us */ events: db.events,
+    tournaments: db.tournaments.map((T) => ({ id: T.id, kind: T.kind || '', name: T.name, dates: T.dates, venue: T.venue, status: T.status, createdAt: T.createdAt, createdBy: isAdmin ? T.createdBy : '', organizerIds: T.organizerIds, refereeIds: T.refereeIds, playerIds: T.playerIds, guidelines: T.guidelines || [] })),
+    organizers: db.admins.map((a) => (isAdmin ? { id: a.id, name: a.name, sports: a.sports || [], limited: !!a.limited, playerId: a.playerId || '', phone: orgPhone(a), ownPhone: a.phone || '' } : { id: a.id, name: a.name, main: !a.limited && !(a.sports || []).length, phone: orgPhone(a) })),   /* organizers are named in full, with their contact number, on Contact us */ events: db.events,
     matches: db.matches.map(({ cids, lock, ...m00 }) => { const m0 = mode === 'public' ? (panic().hideScoreboard ? blankScores(m00) : paperPublic(m00)) : m00; const m = mode === 'public' && !tieRevealed(m0) ? hideLineups(m0) : m0; const o = flaggedSet.has(m.id) ? { ...m, flagged: true } : m; return m.rubbers ? { ...o, rubbers: m.rubbers.map(({ cids: c2, ...r }) => r) } : o; }),
     sponsors: db.sponsors, gallery: (mode === 'public' ? db.gallery.filter((g) => g.consent !== false && (!g.minors || db.tournament.showKidsPhotos)) : db.gallery.filter((g) => isAdmin || !g.minors || db.tournament.showKidsPhotos)).map(({ delHash, ...g }) => g),
     feed: (db.feed || []).slice(-60).reverse(),
@@ -602,6 +602,11 @@ async function notify(m, title, body) {
   await pushTo((s) => !s.approvalOnly && (!(s.follow && s.follow.length) || s.follow.some((f) => ids.has(f))), title, body, '/#/match/' + m.id);
 }
 
+/* An organizer's contact number: the one set for them, else their player profile's. Shown on Contact us. */
+const nameKey = (n) => String(n || '').toLowerCase().replace(/^(dr|mr|mrs|ms)\.?\s+/, '').replace(/[^a-z0-9]/g, '');
+/* No number set and no linked profile: use the player with exactly the same name, if there is only one (phone only – the accounts are not linked). */
+const playerByName = (n) => { const k = nameKey(n); if (!k) return null; const hits = db.players.filter((p) => p.status !== 'rejected' && nameKey(p.name) === k && p.phone); return hits.length === 1 ? hits[0] : null; };
+const orgPhone = (a) => (a && (a.phone || ((a.playerId && find('players', a.playerId)) || {}).phone || (playerByName(a.name) || {}).phone)) || '';
 /* ---------------------------------------------------------- WhatsApp notify */
 const WA = { token: process.env.WHATSAPP_TOKEN || '', phoneId: process.env.WHATSAPP_PHONE_ID || '', template: process.env.WHATSAPP_TEMPLATE || '', lang: process.env.WHATSAPP_LANG || 'en', cc: String(process.env.PHONE_COUNTRY_CODE || '91').replace(/\D/g, '') || '91' };
 WA.on = !!(WA.token && WA.phoneId);
@@ -628,7 +633,7 @@ function matchPeople(m, ev) {
   const pids = ev.sideType === 'team' ? ids.flatMap((t) => (find('teams', t) || {}).memberIds || []) : ids;
   return [...new Set(pids)].map((id) => find('players', id)).filter(Boolean);
 }
-function notifyPlan(m, ev, base, custom) {
+function notifyPlan(m, ev, base, custom, customRef) {
   const T = tour(ev.tid), title = ev.name + (m.no ? ' – Match #' + m.no : '');
   const vs = sideName(ev, m.sideA) + ' vs ' + sideName(ev, m.sideB);
   const refs = (m.refereeIds || []).map((id) => (find('referees', id) || {}).name).filter(Boolean);
@@ -637,15 +642,27 @@ function notifyPlan(m, ev, base, custom) {
   const def = 'Hi {name}, your ' + (T && T.kind !== 'friendly' ? T.name + ' ' : '') + 'match is coming up.\n' +
     '🏅 ' + title + '\n' + vs + (when ? '\n🕒 ' + when : '') + (m.court ? '\n📍 ' + m.court : '') + (refs.length ? '\nReferee: ' + refs.join(', ') : '') +
     '\nPlease report on time. Live score: {link}';
-  const template = str(custom, 1500) || def;
+  const refDef = 'Hi {name}, you are the referee for this ' + (T && T.kind !== 'friendly' ? T.name + ' ' : '') + 'match.\n' +
+    '🏅 ' + title + '\n' + vs + (when ? '\n🕒 ' + when : '') + (m.court ? '\n📍 ' + m.court : '') + '\nPlease be there a few minutes early and score it in the app: {link}';
+  const template = str(custom, 1500) || def, refTemplate = str(customRef, 1500) || refDef;
   const recipients = [], missing = [];
+  const fill = (t, first) => t.replace(/\{name\}/g, first).replace(/\{link\}/g, link);
   for (const pl of matchPeople(m, ev)) {
     const phone = waPhone(pl.phone) || waPhone(pl.guardianPhone);
     const first = String(pl.name || '').split(' ')[0] || 'there';
     if (!phone) { missing.push(pl.name); continue; }
-    recipients.push({ id: pl.id, name: pl.name, first, phone, text: template.replace(/\{name\}/g, first).replace(/\{link\}/g, link) });
+    recipients.push({ id: pl.id, name: pl.name, first, phone, role: 'player', text: fill(template, first) });
   }
-  return { template, recipients, missing, line, link, title };
+  /* the match's referees too – their own number, else their player profile's */
+  for (const r of (m.refereeIds || []).map((id) => find('referees', id)).filter(Boolean)) {
+    const pl = r.playerId ? find('players', r.playerId) : null;
+    const phone = waPhone(r.phone) || waPhone(pl && pl.phone);
+    const first = String(r.name || '').split(' ')[0] || 'there';
+    if (!phone) { missing.push(r.name + ' (referee)'); continue; }
+    if (recipients.some((x) => x.phone === phone)) continue;
+    recipients.push({ id: 'ref:' + r.id, name: r.name, first, phone, role: 'referee', text: fill(refTemplate, first) });
+  }
+  return { template, refTemplate, recipients, missing, line, link, title };
 }
 /* WhatsApp Cloud API (Meta). Messages a player did not start need an approved template:
    set WHATSAPP_TEMPLATE to its name; its body gets {{1}} = first name, {{2}} = match line, {{3}} = link. */
@@ -844,6 +861,7 @@ function normMatch(b, prev) {
     ...(prev.notified ? { notified: prev.notified } : {}),
     ...(prev.eventId === ev.id ? { ...(prev.no ? { no: prev.no } : {}), ...(prev.plannedNo ? { plannedNo: prev.plannedNo } : {}), ...(prev.startSeq ? { startSeq: prev.startSeq } : {}) } : {}),
     ...(prev.paper ? { paper: prev.paper } : {}),
+    ...(prev.cancelled ? { cancelled: prev.cancelled } : {}),
   };
 }
 
@@ -1032,6 +1050,7 @@ const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json',
   '.webmanifest': 'application/manifest+json', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon',
   '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
+  '.pdf': 'application/pdf', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
 };
 const VIDEO_EXT = { 'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm' };
 /* ISO media (mp4 / mov: "ftyp" at byte 4) or Matroska/WebM (EBML header). */
@@ -1097,6 +1116,7 @@ function writeGames(match, b, who, tag) {
 /* ---------------------------------------------------- panic controls */
 const panic = () => (db.tournament.panic = db.tournament.panic || { freezeScoring: false, lockedEvents: [], hideScoreboard: false });
 function assertOpen(match) {
+  if (match && match.cancelled) throw new HttpError(409, 'This match is cancelled. Restore it first to record scores.');
   const T = match && tour((find('events', match.eventId) || {}).tid);
   if (T && T.status === 'closed') throw new HttpError(423, T.name + ' is closed – scores can no longer change.');
   const pc = panic();
@@ -1851,6 +1871,68 @@ async function route(req, res, url) {
     return json(res, 200, { ok: true });
   }
   /* ---- events: anyone signed in (organizer or referee) may create one and set its organizers and referees ---- */
+  /* Organizers set contact numbers themselves: their own, and those of fellow organizers of an event they run. Main admins: anyone. */
+  if ((mt = p.match(/^\/api\/staff\/organizers\/([\w-]+)\/contact$/)) && m === 'PUT') {
+    if (!user || user.role !== 'admin' || !user.adminId) throw new HttpError(401, 'Sign in as an organizer.');
+    const a = db.admins.find((x) => x.id === mt[1]); if (!a) throw new HttpError(404, 'Organizer not found');
+    const fellow = db.tournaments.some((t) => (t.organizerIds || []).includes(user.adminId) && (t.organizerIds || []).includes(a.id));
+    if (isLead(user) && a.id !== user.adminId && !fellow) throw new HttpError(403, 'You can set your own number, or those of organizers of events you run.');
+    const b = await readJson(req, 1000), phone = str(b.phone, 30);
+    if (phone && !/^[+\d][\d\s()-]{5,}$/.test(phone)) throw new HttpError(400, 'Enter a phone number (digits, spaces and + only).');
+    a.phone = phone; audit(user.name, 'organizer contact number', a.name + (a.id === user.adminId ? ' (own)' : '')); save(); broadcast();
+    return json(res, 200, { ok: true, phone: orgPhone(a) });
+  }
+  /* ---- Guidelines per event and sport: a document (PDF, Word or picture) and/or text. Organizers of the event manage them. ---- */
+  if ((mt = p.match(/^\/api\/staff\/tournaments\/([\w-]+)\/guidelines(?:\/(file|copy|[\w-]+))?$/))) {
+    const T = tour(mt[1]); if (!T || T.kind === 'friendly') throw new HttpError(404, 'Event not found');
+    if (!user || !canTour(user, T.id)) throw new HttpError(user ? 403 : 401, 'Only this event’s organizers manage its guidelines.');
+    T.guidelines = T.guidelines || [];
+    const GSPORTS = ['general', ...SPORTS];
+    if (mt[2] === 'file' && m === 'POST') {   /* upload the document first; the reply's url goes into the guideline */
+      const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+      const ext = { 'application/pdf': '.pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx', 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp' }[type];
+      if (!ext) throw new HttpError(400, 'Upload a PDF, a Word file (.docx) or a picture (JPG, PNG, WEBP).');
+      const name = uid() + uid() + ext, file = path.join(UPLOAD_DIR, name);
+      const size = await readBodyToFile(req, file, 20e6);
+      const head = Buffer.alloc(16); const fd = fs.openSync(file, 'r'); fs.readSync(fd, head, 0, 16, 0); fs.closeSync(fd);
+      const ok = ext === '.pdf' ? head.toString('latin1', 0, 5) === '%PDF-' : ext === '.docx' ? head[0] === 0x50 && head[1] === 0x4b && head[2] === 3 && head[3] === 4 : looksLike(head, ext);
+      if (!ok || !size) { fs.unlink(file, () => {}); throw new HttpError(400, 'That file does not look like a real ' + ext.slice(1).toUpperCase() + ' file.'); }
+      return json(res, 200, { url: '/uploads/' + name, size, kind: ext === '.pdf' ? 'pdf' : ext === '.docx' ? 'docx' : 'image' });
+    }
+    if (mt[2] === 'copy' && m === 'POST') {   /* bring over the guidelines of an earlier event (same files, new copies of the entries) */
+      const b = await readJson(req, 2000), src = tour(String(b.from || ''));
+      if (!src || src.id === T.id) throw new HttpError(400, 'Choose another event to copy from.');
+      const want = Array.isArray(b.sports) ? b.sports.filter((k) => GSPORTS.includes(k)) : null;
+      const items = (src.guidelines || []).filter((g) => !want || want.includes(g.sport));
+      items.forEach((g) => T.guidelines.push({ ...JSON.parse(JSON.stringify(g)), id: uid(), updatedAt: Date.now(), by: user.name }));
+      audit(user.name, 'copied guidelines', items.length + ' from ' + src.name + ' to ' + T.name); save(); broadcast();
+      return json(res, 200, { ok: true, copied: items.length });
+    }
+    if (!mt[2] && m === 'POST') {
+      const b = await readJson(req, 60000);
+      const sport = GSPORTS.includes(b.sport) ? b.sport : 'general';
+      const file = b.file && /^\/uploads\/[\w.-]+\.(pdf|docx|jpg|png|webp)$/.test(String(b.file.url || '')) ? { url: b.file.url, name: str(b.file.name, 120) || 'Guidelines', kind: ['pdf', 'docx', 'image'].includes(b.file.kind) ? b.file.kind : 'pdf', size: Math.max(0, Number(b.file.size) || 0) } : null;
+      const text = str(b.text, 20000), title = str(b.title, 100);
+      if (!file && !text) throw new HttpError(400, 'Upload a document or type the guidelines.');
+      const g = { id: uid(), sport, title, text, file, updatedAt: Date.now(), by: user.name };
+      T.guidelines.push(g); audit(user.name, 'added guidelines', T.name + ' – ' + sport); save(); broadcast();
+      return json(res, 200, g);
+    }
+    const g = mt[2] && T.guidelines.find((x) => x.id === mt[2]); if (!g) throw new HttpError(404, 'Guideline not found');
+    if (m === 'PUT') {
+      const b = await readJson(req, 60000);
+      if (b.sport != null && GSPORTS.includes(b.sport)) g.sport = b.sport;
+      if (b.title != null) g.title = str(b.title, 100);
+      if (b.text != null) g.text = str(b.text, 20000);
+      if (b.file === null) g.file = null;
+      else if (b.file && /^\/uploads\/[\w.-]+\.(pdf|docx|jpg|png|webp)$/.test(String(b.file.url || ''))) g.file = { url: b.file.url, name: str(b.file.name, 120) || 'Guidelines', kind: ['pdf', 'docx', 'image'].includes(b.file.kind) ? b.file.kind : 'pdf', size: Math.max(0, Number(b.file.size) || 0) };
+      if (!g.file && !g.text) throw new HttpError(400, 'Keep a document or some text.');
+      g.updatedAt = Date.now(); g.by = user.name; audit(user.name, 'updated guidelines', T.name + ' – ' + g.sport); save(); broadcast();
+      return json(res, 200, g);
+    }
+    if (m === 'DELETE') { T.guidelines = T.guidelines.filter((x) => x !== g); audit(user.name, 'removed guidelines', T.name + ' – ' + g.sport); save(); broadcast(); return json(res, 200, { ok: true }); }
+    throw new HttpError(405, 'Method not allowed');
+  }
   if (p === '/api/staff/friendly' && m === 'POST') {
     if (!isStaffU(user)) throw new HttpError(401, 'Sign in to start a match.');
     const b = await readJson(req, 4000);
@@ -1883,7 +1965,7 @@ async function route(req, res, url) {
     if (Engine.derive(match, ev).status !== 'scheduled') throw new HttpError(409, 'This match has already started or finished.');
     const b = await readJson(req, 6000);
     const given = String(b.base || '').replace(/\/+$/, ''), base = db.registration.publicUrl || (/^https?:\/\/[\w.-]+(:\d+)?$/.test(given) ? given : 'https://' + String(req.headers.host || 'localhost').replace(/[^\w.:-]/g, ''));
-    const out = notifyPlan(match, ev, base, b.message);
+    const out = notifyPlan(match, ev, base, b.message, b.refMessage);
     if (b.send) {
       if (!WA.on) throw new HttpError(400, 'Automatic WhatsApp sending is not set up on this server – use the WhatsApp buttons.');
       for (const r of out.recipients) {
@@ -2083,6 +2165,7 @@ async function route(req, res, url) {
       if (b.enforceReferee != null) t.enforceReferee = !!b.enforceReferee;
       if (b.refSignupOpen != null) t.refSignupOpen = !!b.refSignupOpen;
       if (b.seasonName != null && str(b.seasonName, 80).trim()) t.seasonName = str(b.seasonName, 80).trim();
+      if (b.rankPtsSport && typeof b.rankPtsSport === 'object') { t.rankPtsSport = t.rankPtsSport || {}; Object.keys(Engine.RANK_SPORT).forEach((sp) => { const x = b.rankPtsSport[sp]; if (x && typeof x === 'object') t.rankPtsSport[sp] = Object.fromEntries(['win', 'draw', 'loss'].map((k) => [k, Math.max(0, Math.min(100, Math.round(num(x[k], Engine.RANK_SPORT[sp][k]))))])); }); }
       if (b.rankPts && typeof b.rankPts === 'object') { t.rankPts = {}; Object.keys(Engine.RANK_POINTS).forEach((k) => { t.rankPts[k] = Math.max(0, Math.min(100, Math.round(num(b.rankPts[k], Engine.RANK_POINTS[k])))); }); }
       if (b.tz != null) { try { new Intl.DateTimeFormat('en-GB', { timeZone: String(b.tz) }); t.tz = String(b.tz); } catch (e) { throw new HttpError(400, 'Unknown time zone (use a name like Asia/Kolkata)'); } }
       if (b.sponsorSeconds != null) t.sponsorSeconds = Math.max(3, Math.min(60, Math.round(num(b.sponsorSeconds, 8))));
@@ -2098,7 +2181,7 @@ async function route(req, res, url) {
       Object.keys(db.sessions).forEach((t) => { const x = db.sessions[t]; if (x.role === 'admin' && (x.adminId || me().id) === me().id && t !== user.token) delete db.sessions[t]; });
       audit(user.name, 'pin changed'); save(); return json(res, 200, { ok: true });
     }
-    if (p === '/api/admin/admins' && m === 'GET') return json(res, 200, db.admins.map((a) => ({ id: a.id, name: a.name, sports: a.sports || [], limited: !!a.limited, games: db.events.filter((e) => (e.organizerIds || []).includes(a.id)).map((e) => e.name), me: a.id === me().id })));
+    if (p === '/api/admin/admins' && m === 'GET') return json(res, 200, db.admins.map((a) => ({ id: a.id, name: a.name, phone: orgPhone(a), sports: a.sports || [], limited: !!a.limited, games: db.events.filter((e) => (e.organizerIds || []).includes(a.id)).map((e) => e.name), me: a.id === me().id })));
     if (p === '/api/admin/admins' && m === 'POST') {
       const b = await readJson(req, 2000); const name = str(b.name, 40);
       if (!name) throw new HttpError(400, 'Enter a name for the new admin');
@@ -2112,6 +2195,7 @@ async function route(req, res, url) {
       if (m === 'PUT') {
         const b = await readJson(req, 2000); let pin = null;
         if (b.name) a.name = str(b.name, 40);
+        if (b.phone != null) a.phone = str(b.phone, 30);
         if (Array.isArray(b.sports)) { a.sports = normSports(b.sports); Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].adminId === a.id) db.sessions[t].sports = a.sports; }); }
         if (b.resetPin) { do { pin = pinN(8); } while (db.admins.some((x) => checkPin(pin, x.pinHash))); a.pinHash = hashPin(pin); Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].adminId === a.id && t !== user.token) delete db.sessions[t]; }); }
         audit(user.name, b.resetPin ? 'reset admin PIN' : 'renamed admin', a.name); save();
@@ -2172,7 +2256,7 @@ async function route(req, res, url) {
     if (p === '/api/admin/purge' && m === 'POST') {
       const b = await readJson(req, 2000); const out = [];
       const used = () => { const u = new Set(); const add = (x) => { const k = String(x || '').match(/^\/uploads\/([\w.-]+)$/); if (k) u.add(k[1]); };
-        add(db.tournament.logo); (db.tournament.signers || []).forEach((x) => add(x.image)); db.players.forEach((x) => add(x.photo)); db.sponsors.forEach((x) => add(x.image)); db.gallery.forEach((x) => add(x.url)); return u; };
+        add(db.tournament.logo); (db.tournament.signers || []).forEach((x) => add(x.image)); db.players.forEach((x) => add(x.photo)); db.sponsors.forEach((x) => add(x.image)); db.gallery.forEach((x) => add(x.url)); db.tournaments.forEach((t) => (t.guidelines || []).forEach((g) => add(g.file && g.file.url))); return u; };
       if (b.contacts) { db.players.forEach((x) => { x.phone = ''; x.email = ''; x.emergency = ''; x.tshirt = ''; x.notes = ''; x.guardianName = ''; x.guardianPhone = ''; x.editTokenHash = ''; }); db.disputes.forEach((d) => { d.contact = ''; d.name = ''; }); out.push('contact details'); }
       if (b.kidsPhotos) { db.players.forEach((x) => { if (x.section === 'kids') x.photo = ''; }); db.gallery = db.gallery.filter((g) => !g.minors); out.push('children’s photos'); }
       if (b.trash) { db.trash = []; out.push('trash'); }
@@ -2779,8 +2863,22 @@ async function route(req, res, url) {
       (match.rubbers || []).forEach((r) => { r.log = []; r.cids = []; r.result = null; r.walkover = null; r.outcome = ''; });
       audit(user.name, 'reset scores', '', match.id); save(); broadcast(); return json(res, 200, { ok: true });
     }
+    /* Cancel a match (it stays visible, greyed, and counts for nothing) – or restore it. */
+    if ((mm = p.match(/^\/api\/admin\/matches\/([\w-]+)\/(cancel|uncancel)$/)) && m === 'POST') {
+      const match = find('matches', mm[1]); if (!match) throw new HttpError(404, 'Match not found');
+      const ev = find('events', match.eventId), T = ev && tour(ev.tid);
+      if (T && T.status === 'closed') throw new HttpError(409, T.name + ' is closed.');
+      if (mm[2] === 'cancel') {
+        if (Engine.derive(match, ev).status === 'completed') throw new HttpError(409, 'This match is already completed. Reset its scores first if it should not count.');
+        const b = await readJson(req, 2000);
+        match.cancelled = { at: Date.now(), by: user.name, reason: str(b.reason, 120) };
+        audit(user.name, 'cancelled match', match.cancelled.reason, match.id);
+      } else { delete match.cancelled; audit(user.name, 'restored match', '', match.id); }
+      save(); broadcast(); return json(res, 200, { ok: true });
+    }
     if ((mm = p.match(/^\/api\/admin\/matches\/([\w-]+)\/scores$/)) && m === 'POST') {
       const match = find('matches', mm[1]); if (!match) throw new HttpError(404, 'Match not found');
+      if (match.cancelled) throw new HttpError(409, 'This match is cancelled. Restore it first to record scores.');
       const b = await readJson(req);
       const games = writeGames(match, b, user.name, 'admin-edit');
       delete match.paper;
@@ -2968,7 +3066,9 @@ async function route(req, res, url) {
 
   /* ---- static ---- */
   if (p.startsWith('/uploads/')) {
-    return serveFile(req, res, path.join(UPLOAD_DIR, path.basename(p)), 'public, max-age=31536000, immutable', { 'Content-Security-Policy': "default-src 'none'; sandbox" });
+    const ext = path.extname(p).toLowerCase();
+    const extra = ext === '.pdf' ? { 'X-Content-Type-Options': 'nosniff' } : ext === '.docx' ? { 'Content-Disposition': 'attachment', 'X-Content-Type-Options': 'nosniff' } : { 'Content-Security-Policy': "default-src 'none'; sandbox" };
+    return serveFile(req, res, path.join(UPLOAD_DIR, path.basename(p)), 'public, max-age=31536000, immutable', extra);
   }
   const rel = p === '/' ? 'index.html' : decodeURIComponent(p).replace(/^\/+/, '');
   const file = path.normalize(path.join(PUBLIC_DIR, rel));

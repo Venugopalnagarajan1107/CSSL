@@ -65,6 +65,39 @@ function masterPlayers(inAdmin) {
     admin ? pickBar(shown, [{ label: '➕ Add to event', cls: 'ghost', fn: addToEvent }, main ? { label: '🗑 Delete', fn: del } : null]) : null,
     rows.length ? h('div', { class: 'list' }, rows) : h('p', { class: 'empty' }, SA.players.length ? 'No players match.' : 'No players yet.'));
 }
+/* Add or change a sponsor: name, website and logo / banner (JPG, PNG, WEBP, GIF or SVG – converted to PNG). */
+function sponsorModal(sp) {
+  sp = sp || {};
+  const name = inp(sp.name || '', { placeholder: 'e.g. Green Villa Stores', maxlength: 80 }), url = inp(sp.url || '', { placeholder: 'https://… (optional)', type: 'url', autocapitalize: 'off' });
+  let image = sp.image || '';
+  const prev = h('div', { class: 'sp-prev' }), draw = () => prev.replaceChildren(image ? h('img', { src: image, alt: '' }) : h('span', { class: 'muted small' }, 'No logo yet – the name is shown instead'));
+  const busyTxt = h('span', { class: 'muted small' });
+  const file = h('input', { type: 'file', accept: 'image/*,.svg', hidden: true, onchange: guard(async (e) => {
+    const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+    busyTxt.textContent = 'Uploading…';
+    try { image = await uploadLogo(f); draw(); busyTxt.textContent = 'Logo ready ✓'; } catch (err) { busyTxt.textContent = ''; throw err; }
+  }) });
+  draw();
+  modal(sp.id ? 'Edit sponsor' : 'Add sponsor', h('div', {}, field('Sponsor name', name), field('Website', url, 'Tapping the logo opens it.'),
+    h('div', { class: 'field' }, h('span', {}, 'Logo or banner'), prev, h('div', { class: 'actions' }, file, h('button', { type: 'button', class: 'btn ghost', onclick: () => file.click() }, image ? '🖼 Change image' : '🖼 Upload image'), image ? h('button', { type: 'button', class: 'btn ghost', onclick: () => { image = ''; draw(); } }, 'Remove image') : null, busyTxt),
+      h('small', {}, 'A wide logo works best (about 3 : 1). JPG, PNG, WEBP, GIF or SVG.'))),
+  [sp.id ? { label: 'Delete', cls: 'danger', close: false, fn: (close) => confirmBox('Remove ' + (sp.name || 'this sponsor') + '?', guard(async () => { await api('DELETE', '/api/admin/sponsors/' + sp.id); close(); await refresh(); }), 'Remove') } : { label: 'Cancel', cls: 'ghost', fn: () => {} },
+    { label: sp.id ? 'Save' : 'Add sponsor', fn: async () => {
+      if (!name.value.trim() && !image) throw new Error('Give a name or upload a logo');
+      const b = { name: name.value.trim(), url: url.value.trim(), image };
+      if (sp.id) await api('PUT', '/api/admin/sponsors/' + sp.id, b); else await api('POST', '/api/admin/sponsors', b);
+      toast(sp.id ? 'Saved' : 'Sponsor added'); await refresh();
+    } }]);
+}
+/* Any picture the browser can show becomes a PNG of at most 900 px (SVG and GIF included), so the server only stores safe image files. */
+async function uploadLogo(f) {
+  const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('This file could not be read as a picture. Try a PNG or JPG (on iPhone: share the photo as JPG).')); i.src = URL.createObjectURL(f); });
+  let w = img.naturalWidth || img.width || 900, hh = img.naturalHeight || img.height || 300;
+  const k = Math.min(1, 900 / Math.max(w, hh)); w = Math.max(1, Math.round(w * k)); hh = Math.max(1, Math.round(hh * k));
+  const c = document.createElement('canvas'); c.width = w; c.height = hh; c.getContext('2d').drawImage(img, 0, 0, w, hh); URL.revokeObjectURL(img.src);
+  const blob = await new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error('Could not convert the picture'))), 'image/png'));
+  return (await api('POST', '/api/upload', blob, 'image/png')).url;
+}
 const checkList = (items, selected) => {
   const boxes = items.map((it) => ({ it, cb: h('input', { type: 'checkbox', checked: selected.includes(it.id), 'aria-label': it.name }) }));
   const el = h('div', { class: 'checks' },
@@ -346,8 +379,10 @@ function refereeModal(r, approving) {
 function rankPtsModal() {
   const P = rankPts(), L = { win: 'Win', draw: 'Draw', loss: 'Loss', gold: 'Champion bonus', silver: 'Runner-up bonus', bronze: 'Third place bonus' };
   const f = Object.keys(L).map((k) => ({ k, i: inp(P[k], { type: 'number', min: 0, max: 100, inputmode: 'numeric' }) }));
-  modal('Ranking points', h('div', {}, h('p', { class: 'muted small' }, 'Points each player gets. Changing them recalculates every ranking, including past seasons.'), f.map((x) => field(L[x.k], x.i))),
-    [{ label: 'Save', fn: async () => { await api('POST', '/api/admin/tournament', { rankPts: Object.fromEntries(f.map((x) => [x.k, x.i.value])) }); toast('Points saved'); await refresh(); } }]);
+  const T = rankPtsSport().tt, tf = ['win', 'loss'].map((k) => ({ k, i: inp(T[k], { type: 'number', min: 0, max: 100, inputmode: 'numeric' }) }));
+  modal('Ranking points', h('div', {}, h('p', { class: 'muted small' }, 'Points each player gets. Changing them recalculates every ranking, including past seasons.'), f.map((x) => field(L[x.k], x.i)),
+    h('b', {}, '🏓 Table tennis'), h('p', { class: 'muted small' }, 'A match win counts once, whatever the number of sets.'), tf.map((x) => field(x.k === 'win' ? 'Match win' : 'Match loss', x.i))),
+    [{ label: 'Save', fn: async () => { await api('POST', '/api/admin/tournament', { rankPts: Object.fromEntries(f.map((x) => [x.k, x.i.value])), rankPtsSport: { tt: Object.fromEntries(tf.map((x) => [x.k, x.i.value])) } }); toast('Points saved'); await refresh(); } }]);
 }
 
 async function playerModal(p, defaultSection) {
@@ -781,13 +816,15 @@ const adminTabs = {
     load2(); return box;
   },
   sponsors() {
-    const name = inp('', { placeholder: 'Sponsor name', 'aria-label': 'Sponsor name' }), url = inp('', { placeholder: 'Website (optional)', 'aria-label': 'Website' });
-    let image = '';
-    const status = h('span', { class: 'muted small' });
-    const file = h('input', { type: 'file', accept: 'image/*', hidden: true, onchange: guard(async (e) => { if (!e.target.files[0]) return; image = await uploadImage(e.target.files[0], 800, 'image/png'); status.textContent = 'Banner uploaded ✓'; }) });
-    return h('div', {}, h('div', { class: 'card' }, name, url, h('div', { class: 'actions' }, file, h('button', { class: 'btn ghost', onclick: () => file.click() }, 'Upload banner/logo'), status),
-      h('button', { class: 'btn', onclick: guard(async () => { await api('POST', '/api/admin/sponsors', { name: name.value, url: url.value, image }); await refresh(); }) }, 'Add sponsor')),
-      h('div', { class: 'list' }, S.sponsors.map((s) => h('div', { class: 'row' }, s.image ? h('img', { src: s.image, class: 'sp-thumb', alt: '' }) : null, h('b', { class: 'grow' }, s.name || 'Sponsor'), h('button', { class: 'btn danger sm', 'aria-label': 'Remove sponsor', onclick: guard(async () => { await api('DELETE', '/api/admin/sponsors/' + s.id); await refresh(); }) }, '✕')))));
+    const speed = inp(S.tournament.sponsorSeconds || 8, { type: 'number', min: 3, max: 60, inputmode: 'numeric', 'aria-label': 'Seconds per sponsor' });
+    return h('div', {},
+      h('p', { class: 'muted small' }, 'Sponsors roll across the top of the Home page, as many as you like. Tap a logo there or here to change it.'),
+      h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: () => sponsorModal(null) }, '+ Add sponsor')),
+      S.sponsors.length ? h('div', { class: 'list' }, S.sponsors.map((s) => h('div', { class: 'row', onclick: () => sponsorModal(s) },
+        s.image ? h('img', { src: s.image, class: 'sp-thumb', alt: '' }) : h('span', { class: 'sp-thumb ph' }, 'no logo'), h('div', { class: 'grow' }, h('b', {}, s.name || 'Sponsor'), s.url ? h('div', { class: 'muted small' }, s.url) : null),
+        h('span', { class: 'muted' }, '✏️ Edit')))) : h('p', { class: 'empty' }, 'No sponsors yet.'),
+      h('div', { class: 'card' }, field('Rolling speed – seconds each sponsor is on screen', speed),
+        h('button', { class: 'btn ghost', onclick: guard(async () => { await api('POST', '/api/admin/tournament', { sponsorSeconds: speed.value }); toast('Saved'); await refresh(); }) }, 'Save speed')));
   },
   data() {
     const file = h('input', { type: 'file', accept: 'application/json', hidden: true, onchange: (e) => {
