@@ -1608,7 +1608,7 @@ function navKey(name, arg) {
   return { season: 'season', seasons: 'season', matches: 'matches', rankings: 'rankings', players: 'players', player: 'players', gallery: 'gallery', contact: 'contact', dashboard: 'dashboard' }[name] || null;
 }
 function renderNav(name) {
-  const items = [['', 'home', 'Home'], ['season', 'event', 'Event'], ['matches', 'matches', 'Matches'], ['rankings', 'rankings', 'Rankings'], ['players', 'players', 'Players'], ['gallery', 'gallery', 'Gallery'], ['dashboard', 'dash', 'Dashboard'], ['contact', 'contact', 'Contact us']];
+  const items = [['', 'home', 'Home'], ['dashboard', 'dash', 'Dashboard'], ['season', 'event', 'Event'], ['matches', 'matches', 'Matches'], ['rankings', 'rankings', 'Rankings'], ['players', 'players', 'Players'], ['gallery', 'gallery', 'Gallery'], ['contact', 'contact', 'Contact us']];
   const key = navKey(name, location.hash.replace(/^#\/?/, '').split('/')[1]);
   $('#nav').replaceChildren(...items.map(([r, i, l]) => h('a', { href: '#/' + r, class: key === r ? 'on' : '', 'aria-current': key === r ? 'page' : null }, icon(i), h('span', { class: 'lbl' }, l))));
   const bar = $('#bar'); if (bar) document.documentElement.style.setProperty('--barh', bar.offsetHeight + 'px');
@@ -1698,6 +1698,14 @@ function contactRow(a) {
     a.phone ? h('a', { class: 'btn sm wa', href: waHref(a.phone), target: '_blank', rel: 'noopener', 'aria-label': 'WhatsApp ' + a.name }, 'WhatsApp') : null,
     canEditOrg(a) ? h('button', { class: 'btn ghost sm', 'aria-label': 'Edit contact number of ' + a.name, onclick: () => orgPhoneModal(a) }, '✏️') : null);
 }
+/* The sign-in's roles as the server knows them now (roles linked after signing in show up without signing in again) */
+function refreshMe() {
+  return api('GET', '/api/me').then((r) => {
+    if (!r.role) { me = { role: null }; store.set('me', me); render(); return; }
+    const keys = ['role', 'name', 'kind', 'sports', 'limited', 'adminId', 'refId', 'personId', 'teamId'], changed = keys.some((k) => JSON.stringify(me[k] || '') !== JSON.stringify(r[k] || ''));
+    if (changed) { keys.forEach((k) => { me[k] = r[k]; }); store.set('me', me); render(); }
+  }).catch(() => {});
+}
 /* ---- Dashboard: personal – "My matches" as a player, "My refereeing" as a referee (toggle when you are both) ---- */
 const playsInM = (pid, m) => !!pid && [...(m.sideA || []), ...(m.sideB || [])].some((id) => id === pid || ((byId('teams', id) || {}).memberIds || []).includes(pid));
 const mySide = (pid, m) => ([...(m.sideA || [])].some((id) => id === pid || ((byId('teams', id) || {}).memberIds || []).includes(pid)) ? 'A' : 'B');
@@ -1725,10 +1733,18 @@ function dashSection(title, rows, empty) {
 }
 Views.dashboard = () => {
   const head = h('h1', {}, 'My dashboard');
+  if (me.role && !Views.dashboard.checked) { Views.dashboard.checked = true; refreshMe(); }
   if (!me.role) return h('div', {}, head, h('div', { class: 'card' }, h('p', {}, 'Your own matches, results, standings and – for referees – the matches you referee.'), h('a', { class: 'btn', href: '#/login' }, 'Sign in with your PIN')));
   const pid = me.personId && byId('players', me.personId) ? me.personId : '', rid = me.refId || '';
   const roles = [pid ? ['player', '🏓 Player'] : null, rid ? ['referee', '🧑‍⚖️ Referee'] : null].filter(Boolean);
-  if (!roles.length) return h('div', {}, head, h('div', { class: 'card' }, h('p', {}, 'Your sign-in is not linked to a player or referee, so there are no personal matches to show.'), isOrganizer() ? h('p', { class: 'muted small' }, 'Link it in Admin → People & roles.') : null, h('a', { class: 'btn ghost', href: '#/' }, '🏠 Home')));
+  if (!roles.length) {
+    /* an admin sign-in that is not a player yet: say which player you are, once */
+    const pick = h('select', { 'aria-label': 'Which player are you?' }, [h('option', { value: '' }, '— choose your name —')].concat(SA.players.filter((x) => x.status !== 'pending').sort(byName).map((x) => h('option', { value: x.id }, x.name))));
+    return h('div', {}, head, h('div', { class: 'card' }, h('p', {}, 'Your sign-in is not linked to a player profile, so there are no personal matches to show yet.'),
+      me.adminId && isOrganizer() ? h('div', {}, field('Which player are you?', pick, 'Your PIN then opens your player and referee views as well – one PIN for everything.'),
+        h('button', { class: 'btn', onclick: guard(async () => { if (!pick.value) throw new Error('Choose your name'); await api('POST', '/api/admin/people/link', { type: 'admin', id: me.adminId, playerId: pick.value }); toast('Linked – your dashboard is ready'); await refreshMe(); await refresh(); }) }, 'Link me')) : h('p', { class: 'muted small' }, 'Ask a main admin to link it in Admin → People & roles.'),
+      h('a', { class: 'btn ghost', href: '#/' }, '🏠 Home')));
+  }
   let role = store.get('dashRole', roles[0][0]); if (!roles.some((r) => r[0] === role)) role = roles[0][0];
   const toggle = roles.length > 1 ? h('div', { class: 'seg' }, roles.map(([k, l]) => h('button', { class: role === k ? 'on' : '', 'aria-pressed': String(role === k), onclick: () => { store.set('dashRole', k); render(); } }, l))) : null;
   const rows = SA.matches.map((m) => { const ev = evOf(m); return ev ? { m, ev, d: E.derive(liveMatch(m), ev) } : null; }).filter(Boolean).map((x) => ({ ...x, st: mStatus(x.m, x.d) }));
@@ -1824,7 +1840,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   render();
   await load(); render();
   flush();
-  if (me.role) api('GET', '/api/me').then((r) => { if (!r.role) { me = { role: null }; store.set('me', me); render(); } }).catch(() => {});
+  if (me.role) refreshMe();
   const es = new EventSource('/api/stream');
   let sseT = null;
   es.onmessage = () => { if (sseT) return; sseT = setTimeout(async () => { sseT = null; await load(); if (!busy()) render(); }, 150 + Math.random() * 600); };

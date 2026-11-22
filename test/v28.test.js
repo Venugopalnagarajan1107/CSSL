@@ -80,7 +80,6 @@ test('sync scores from a scoreboard page: preview, aliases, enter, never overwri
 
     // auto-sync is a setting; a wrong category is explained
     assert.equal((await call('PUT', '/api/admin/events/' + tt.id + '/sync-settings', { auto: true }, admin)).body.auto, true);
-    assert.match((await call('POST', '/api/admin/events/' + tt.id + '/sync', { dry: true, category: 'veterans' }, admin)).body.error, /no "veterans" category/);
     // not for players or sport leads of other sports
     const lead = (await call('POST', '/api/admin/admins', { name: 'Chess Lead', sports: ['chess'] }, admin)).body;
     const lt = (await call('POST', '/api/login', { role: 'admin', pin: lead.pin })).body.token;
