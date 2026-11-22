@@ -585,6 +585,7 @@ Views.event = (id) => {
     ev.note ? h('p', { class: 'muted small' }, ev.note) : null,
     h('p', { class: 'muted small' }, formatSummary(ev)),
     staffLine(ev),
+    guidelineLink(ev),
     h('div', { class: 'seg' }, [(fmt.type === 'knockout' ? ['bracket', 'Bracket'] : null), (rr ? ['dashboard', 'Dashboard'] : null), ['standings', fmt.type === 'knockout' ? 'Table' : 'Standings'], ['fixtures', 'Fixtures (' + ms.length + ')'], ['people', ev.sideType === 'team' ? 'Teams' : 'Players']].filter(Boolean).map(([k, l]) => h('button', { class: tab === k || (!ui.eventTab[id] && k === 'bracket') ? 'on' : '', onclick: () => setTab(k) }, l))),
     h('div', { class: 'actions noprint' },
       isStaff() ? h('button', { class: 'btn ghost', onclick: () => window.print() }, '🖨 Print / PDF') : null,
@@ -911,7 +912,7 @@ Views.season = (sub) => {
   const T = curT(), tab = sub || ui.seasonTab || 'games', mine = canManageTour(T), closed = T.status === 'closed';
   const setTab = (k) => { ui.seasonTab = k; location.hash = '#/season/' + k; };
   const roster = new Set(T.playerIds || []);
-  const tabs = [['games', 'Games'], ['matches', 'Matches'], ['teams', 'Teams'], ['players', 'Players (' + roster.size + ')'], ['referees', 'Referees'], ['organizers', 'Organizers']];
+  const tabs = [['games', 'Games'], ['matches', 'Matches'], ['teams', 'Teams'], ['players', 'Players (' + roster.size + ')'], ['referees', 'Referees'], ['organizers', 'Organizers'], ['guidelines', '📘 Guidelines']];
   const games = (sec) => eventsOf(sec).map((ev) => {
     const miss = staffMissing(ev), waiting = ev.sideType === 'team' ? (ev.interestedIds || []).filter((id) => !(ev.participantIds || []).some((tid) => ((byId('teams', tid) || {}).memberIds || []).includes(id))).length : 0;
     return h('a', { class: 'card ev', href: '#/event/' + ev.id },
@@ -928,6 +929,7 @@ Views.season = (sub) => {
       h('div', { class: 'card' }, h('b', {}, '🧑‍⚖️ Referees of ' + T.name), h('div', { class: 'chips' }, names(T.refereeIds, refName).map((n) => h('span', { class: 'chip plain' }, n))),
         mine ? h('button', { class: 'btn ghost sm', onclick: () => tourStaffModal(T, 'referees') }, '+ Add / change referees') : null),
       isOrganizer() ? h('details', {}, h('summary', {}, 'All referee accounts, PINs and referee sign-up'), Views.referees(true)) : null)
+    : tab === 'guidelines' ? eventGuidelines(T, mine && !closed)
     : tab === 'organizers' ? h('div', {},
       h('div', { class: 'card' }, h('b', {}, '👔 Organizers of ' + T.name), h('p', { class: 'muted small' }, 'The person who created the event and anyone added here manage everything in it: games, teams, players, fixtures and referees.' + (T.createdBy ? ' Created by ' + T.createdBy + '.' : '')),
         h('div', { class: 'list' }, (T.organizerIds || []).map((id) => (SA.organizers || []).find((a) => a.id === id)).filter(Boolean).map((a) => h('div', { class: 'row' }, icon('players'),
@@ -1581,6 +1583,75 @@ function renderNav(name) {
   $('#nav').replaceChildren(...items.map(([r, i, l]) => h('a', { href: '#/' + r, class: key === r ? 'on' : '', 'aria-current': key === r ? 'page' : null }, icon(i), h('span', { class: 'lbl' }, l))));
   const bar = $('#bar'); if (bar) document.documentElement.style.setProperty('--barh', bar.offsetHeight + 'px');
 }
+/* ---- Guidelines: per event, per sport (plus General) – an uploaded document and/or text ---- */
+const G_SPORTS = [['general', '📘', 'General'], ['badminton', '🏸', 'Badminton'], ['tt', '🏓', 'Table tennis'], ['carrom', '🎯', 'Carrom'], ['chess', '♟️', 'Chess'], ['other', '🏅', 'Other']];
+const gLabel = (k) => { const x = G_SPORTS.find((y) => y[0] === k) || G_SPORTS[0]; return x[1] + ' ' + x[2]; };
+const fileSize = (n) => (n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : n ? Math.max(1, Math.round(n / 1e3)) + ' KB' : '');
+function guidelineLink(ev) {
+  const T = tourById(ev.tid), n = ((T && T.guidelines) || []).filter((g) => g.sport === ev.sport || g.sport === 'general').length;
+  return n ? h('a', { class: 'card tip noprint', href: '#/season/guidelines', onclick: () => { ui.gSport = ev.sport; } }, '📘 ' + (SPORT_LABEL[ev.sport] || 'Game') + ' guidelines for ' + T.name + ' ›') : null;
+}
+function guidelineCard(T, g, can) {
+  const f = g.file;
+  const doc = !f ? null : f.kind === 'image' ? h('a', { href: f.url, target: '_blank', rel: 'noopener' }, h('img', { class: 'g-img', src: f.url, alt: g.title || 'Guidelines', loading: 'lazy' }))
+    : h('div', { class: 'g-file' }, h('span', { class: 'g-ic', 'aria-hidden': 'true' }, f.kind === 'pdf' ? '📄' : '📝'), h('div', { class: 'grow' }, h('b', {}, f.name), h('div', { class: 'muted small' }, (f.kind === 'pdf' ? 'PDF' : 'Word document') + (f.size ? ' • ' + fileSize(f.size) : ''))),
+      h('a', { class: 'btn sm', href: f.url, target: '_blank', rel: 'noopener' }, f.kind === 'pdf' ? 'Open' : 'Download'));
+  const pdfView = f && f.kind === 'pdf' && window.innerWidth >= 700 ? h('iframe', { class: 'g-pdf', src: f.url + '#view=FitH', title: g.title || 'Guidelines' }) : null;
+  return h('div', { class: 'card' },
+    h('div', { class: 'card-h' }, h('b', {}, g.title || gLabel(g.sport) + ' guidelines'), can ? h('button', { class: 'btn ghost sm', onclick: () => guidelineModal(T, g) }, '✏️ Edit') : null),
+    g.text ? h('div', { class: 'g-text' }, g.text) : null, doc, pdfView,
+    h('div', { class: 'muted small' }, 'Updated ' + new Date(g.updatedAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) + (g.by ? ' by ' + g.by : '')));
+}
+function eventGuidelines(T, can) {
+  const all = T.guidelines || [];
+  const used = new Set(['general', ...S.events.map((e) => e.sport)]);
+  const sports = G_SPORTS.filter(([k]) => used.has(k) || all.some((g) => g.sport === k));
+  const cur = ui.gSport && sports.some(([k]) => k === ui.gSport) ? ui.gSport : '';
+  const shown = sports.filter(([k]) => !cur || k === cur);
+  return h('div', {},
+    h('p', { class: 'muted small' }, 'Rules and guidelines for ' + T.name + ' – for each sport, and general ones for everybody.'),
+    can ? h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: () => guidelineModal(T, null) }, '+ Add guidelines'),
+      realTours().some((t) => t.id !== T.id && (t.guidelines || []).length) ? h('button', { class: 'btn ghost', onclick: () => copyGuidelinesModal(T) }, '⧉ Copy from another event') : null) : null,
+    h('div', { class: 'sportchips', role: 'group', 'aria-label': 'Sport' }, [['', '📚', 'All']].concat(sports).map(([k, i, l]) => h('button', { type: 'button', class: 'pill sp' + (cur === k ? ' on' : ''), 'aria-pressed': String(cur === k), onclick: () => { ui.gSport = k; render(); } }, i + ' ' + l))),
+    shown.map(([k]) => { const items = all.filter((g) => g.sport === k);
+      return h('section', {}, h('h2', {}, gLabel(k)), items.length ? items.map((g) => guidelineCard(T, g, can))
+        : h('p', { class: 'empty' }, 'No ' + (k === 'general' ? 'general' : SPORT_LABEL[k] || '') + ' guidelines yet.' + (can ? ' Tap “+ Add guidelines”.' : ''))); }));
+}
+function guidelineModal(T, g) {
+  g = g || {};
+  const sport = h('select', { 'aria-label': 'Sport' }, G_SPORTS.map(([k, i, l]) => h('option', { value: k, selected: (g.sport || ui.gSport || 'general') === k }, i + ' ' + l)));
+  const title = h('input', { value: g.title || '', placeholder: 'e.g. Table tennis rules 2026 (optional)', maxlength: 100 });
+  const text = h('textarea', { rows: 8, placeholder: 'Type or paste the rules here (optional if you upload a document)', maxlength: 20000 }, g.text || '');
+  let file = g.file || null;
+  const info = h('div', {}), busyT = h('span', { class: 'muted small' });
+  const draw = () => info.replaceChildren(file ? h('div', { class: 'g-file' }, h('span', { class: 'g-ic' }, file.kind === 'pdf' ? '📄' : file.kind === 'docx' ? '📝' : '🖼'), h('div', { class: 'grow' }, h('b', {}, file.name), h('div', { class: 'muted small' }, fileSize(file.size))),
+    h('button', { type: 'button', class: 'btn ghost sm', onclick: () => { file = null; draw(); } }, 'Remove')) : h('p', { class: 'muted small' }, 'No document yet.'));
+  const pick = h('input', { type: 'file', hidden: true, accept: '.pdf,.docx,image/jpeg,image/png,image/webp,application/pdf', onchange: guard(async (e) => {
+    const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+    const type = f.type || (/\.pdf$/i.test(f.name) ? 'application/pdf' : /\.docx$/i.test(f.name) ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' : '');
+    if (f.size > 20e6) throw new Error('That file is too large (max 20 MB).');
+    busyT.textContent = 'Uploading…';
+    try { const r = await api('POST', '/api/staff/tournaments/' + T.id + '/guidelines/file', f, type); file = { url: r.url, name: f.name, kind: r.kind, size: r.size }; draw(); busyT.textContent = 'Uploaded ✓'; } catch (err) { busyT.textContent = ''; throw err; }
+  }) });
+  draw();
+  modal(g.id ? 'Edit guidelines' : 'Add guidelines – ' + T.name, h('div', {}, field('Sport', sport), field('Title', title),
+    h('div', { class: 'field' }, h('span', {}, 'Document'), info, h('div', { class: 'actions' }, pick, h('button', { type: 'button', class: 'btn ghost', onclick: () => pick.click() }, file ? '⬆ Replace document' : '⬆ Upload document'), busyT),
+      h('small', {}, 'PDF, Word (.docx) or a picture – up to 20 MB. A PDF opens right in the app; a Word file is downloaded.')),
+    field('Text', text)),
+  [g.id ? { label: 'Delete', cls: 'danger', close: false, fn: (close) => confirmBox('Delete these guidelines?', guard(async () => { await api('DELETE', '/api/staff/tournaments/' + T.id + '/guidelines/' + g.id); close(); toast('Deleted'); await refresh(); }), 'Delete') } : { label: 'Cancel', cls: 'ghost', fn: () => {} },
+    { label: 'Save', fn: async () => {
+      const b = { sport: sport.value, title: title.value.trim(), text: text.value.trim(), file };
+      if (!b.file && !b.text) throw new Error('Upload a document or type the guidelines.');
+      if (g.id) await api('PUT', '/api/staff/tournaments/' + T.id + '/guidelines/' + g.id, b); else await api('POST', '/api/staff/tournaments/' + T.id + '/guidelines', b);
+      ui.gSport = b.sport; toast('Guidelines saved'); await refresh();
+    } }]);
+}
+function copyGuidelinesModal(T) {
+  const others = realTours().filter((t) => t.id !== T.id && (t.guidelines || []).length);
+  const from = h('select', {}, others.map((t) => h('option', { value: t.id }, t.name + ' (' + t.guidelines.length + ')')));
+  modal('Copy guidelines', h('div', {}, field('From event', from), h('p', { class: 'muted small' }, 'All its guidelines are copied into ' + T.name + '. Change or delete any of them afterwards – the other event is not affected.')),
+    [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, { label: 'Copy', fn: async () => { const r = await api('POST', '/api/staff/tournaments/' + T.id + '/guidelines/copy', { from: from.value }); toast(r.copied + ' copied'); await refresh(); } }]);
+}
 /* Set the contact number shown for an organizer on Contact us (main admins). Empty = use their player profile's number. */
 /* Who may change an organizer's contact number: main admins; the organizer; fellow organizers of one of their events. */
 const canEditOrg = (a) => isAdmin() && (isOrganizer() || a.id === me.adminId || realTours().some((t) => (t.organizerIds || []).includes(me.adminId) && (t.organizerIds || []).includes(a.id)));
@@ -1629,6 +1700,8 @@ function render() {
   $('#app').replaceChildren(...(banner ? [banner, el] : [el]));
   document.body.dataset.view = name;
   if (render.last === location.hash) window.scrollTo(0, y); else window.scrollTo(0, 0);
+  /* tab rows that scroll sideways: keep the selected tab in view */
+  document.querySelectorAll('#app .seg.scroll button.on, #app .sportchips .on').forEach((b) => { const row = b.parentElement; if (row.scrollWidth > row.clientWidth) row.scrollLeft = Math.max(0, b.offsetLeft - row.clientWidth / 2 + b.offsetWidth / 2); });
   render.last = location.hash;
 }
 

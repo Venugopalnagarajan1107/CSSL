@@ -249,3 +249,12 @@ a.card,a.row,a.grow,a.chip,.list a,.ev-top a,.tbl.rank td a{color:inherit;text-d
 @media (prefers-color-scheme:dark){:root:not([data-theme=light]){--on-solid:#0b1220;--link:#5eead4}}
 :root[data-theme=dark]{--on-solid:#0b1220;--link:#5eead4}
 .sp-prev span{color:#475467}
+/* Guidelines */
+.g-text{white-space:pre-wrap;line-height:1.55;margin:6px 0 10px}
+.g-file{display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--line);border-radius:12px;background:var(--bg);margin:6px 0}
+.g-ic{font-size:26px}
+.g-img{max-width:100%;border-radius:10px;border:1px solid var(--line);display:block;margin:6px 0}
+.g-pdf{width:100%;height:70vh;border:1px solid var(--line);border-radius:10px;margin:6px 0;background:#fff}
+.seg.scroll{scrollbar-width:none;-webkit-overflow-scrolling:touch;-webkit-mask-image:linear-gradient(90deg,#000 90%,transparent);mask-image:linear-gradient(90deg,#000 90%,transparent)}
+.seg.scroll::-webkit-scrollbar{display:none}
+.seg.scroll button{flex:0 0 auto}

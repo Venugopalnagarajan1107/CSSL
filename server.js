@@ -514,7 +514,7 @@ function publicState(mode) {
     players: db.players.filter((p) => isAdmin || p.status !== 'pending').map((p) => publicPlayer(p, mode, names)),
     teams: db.teams.map(({ captainHash, ...t }) => ({ ...t, hasCode: !!captainHash })), referees: db.referees.filter((r) => isAdmin || r.status !== 'pending').map((r) => ({ id: r.id, name: mode === 'public' ? refDisplay(r) : r.name, kind: r.kind, sports: r.sports, eventIds: r.eventIds, status: r.status, playerId: r.playerId || '', ...(isAdmin ? { phone: r.phone, note: r.note, signedUpAt: r.signedUpAt } : {}) })),
     seasons: db.seasons.map((x) => seasonPublic(x, mode)),
-    tournaments: db.tournaments.map((T) => ({ id: T.id, kind: T.kind || '', name: T.name, dates: T.dates, venue: T.venue, status: T.status, createdAt: T.createdAt, createdBy: isAdmin ? T.createdBy : '', organizerIds: T.organizerIds, refereeIds: T.refereeIds, playerIds: T.playerIds })),
+    tournaments: db.tournaments.map((T) => ({ id: T.id, kind: T.kind || '', name: T.name, dates: T.dates, venue: T.venue, status: T.status, createdAt: T.createdAt, createdBy: isAdmin ? T.createdBy : '', organizerIds: T.organizerIds, refereeIds: T.refereeIds, playerIds: T.playerIds, guidelines: T.guidelines || [] })),
     organizers: db.admins.map((a) => (isAdmin ? { id: a.id, name: a.name, sports: a.sports || [], limited: !!a.limited, playerId: a.playerId || '', phone: orgPhone(a), ownPhone: a.phone || '' } : { id: a.id, name: a.name, main: !a.limited && !(a.sports || []).length, phone: orgPhone(a) })),   /* organizers are named in full, with their contact number, on Contact us */ events: db.events,
     matches: db.matches.map(({ cids, lock, ...m00 }) => { const m0 = mode === 'public' ? (panic().hideScoreboard ? blankScores(m00) : paperPublic(m00)) : m00; const m = mode === 'public' && !tieRevealed(m0) ? hideLineups(m0) : m0; const o = flaggedSet.has(m.id) ? { ...m, flagged: true } : m; return m.rubbers ? { ...o, rubbers: m.rubbers.map(({ cids: c2, ...r }) => r) } : o; }),
     sponsors: db.sponsors, gallery: (mode === 'public' ? db.gallery.filter((g) => g.consent !== false && (!g.minors || db.tournament.showKidsPhotos)) : db.gallery.filter((g) => isAdmin || !g.minors || db.tournament.showKidsPhotos)).map(({ delHash, ...g }) => g),
@@ -1050,6 +1050,7 @@ const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json',
   '.webmanifest': 'application/manifest+json', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon',
   '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
+  '.pdf': 'application/pdf', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
 };
 const VIDEO_EXT = { 'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm' };
 /* ISO media (mp4 / mov: "ftyp" at byte 4) or Matroska/WebM (EBML header). */
@@ -1881,6 +1882,57 @@ async function route(req, res, url) {
     a.phone = phone; audit(user.name, 'organizer contact number', a.name + (a.id === user.adminId ? ' (own)' : '')); save(); broadcast();
     return json(res, 200, { ok: true, phone: orgPhone(a) });
   }
+  /* ---- Guidelines per event and sport: a document (PDF, Word or picture) and/or text. Organizers of the event manage them. ---- */
+  if ((mt = p.match(/^\/api\/staff\/tournaments\/([\w-]+)\/guidelines(?:\/(file|copy|[\w-]+))?$/))) {
+    const T = tour(mt[1]); if (!T || T.kind === 'friendly') throw new HttpError(404, 'Event not found');
+    if (!user || !canTour(user, T.id)) throw new HttpError(user ? 403 : 401, 'Only this event’s organizers manage its guidelines.');
+    T.guidelines = T.guidelines || [];
+    const GSPORTS = ['general', ...SPORTS];
+    if (mt[2] === 'file' && m === 'POST') {   /* upload the document first; the reply's url goes into the guideline */
+      const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+      const ext = { 'application/pdf': '.pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx', 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp' }[type];
+      if (!ext) throw new HttpError(400, 'Upload a PDF, a Word file (.docx) or a picture (JPG, PNG, WEBP).');
+      const name = uid() + uid() + ext, file = path.join(UPLOAD_DIR, name);
+      const size = await readBodyToFile(req, file, 20e6);
+      const head = Buffer.alloc(16); const fd = fs.openSync(file, 'r'); fs.readSync(fd, head, 0, 16, 0); fs.closeSync(fd);
+      const ok = ext === '.pdf' ? head.toString('latin1', 0, 5) === '%PDF-' : ext === '.docx' ? head[0] === 0x50 && head[1] === 0x4b && head[2] === 3 && head[3] === 4 : looksLike(head, ext);
+      if (!ok || !size) { fs.unlink(file, () => {}); throw new HttpError(400, 'That file does not look like a real ' + ext.slice(1).toUpperCase() + ' file.'); }
+      return json(res, 200, { url: '/uploads/' + name, size, kind: ext === '.pdf' ? 'pdf' : ext === '.docx' ? 'docx' : 'image' });
+    }
+    if (mt[2] === 'copy' && m === 'POST') {   /* bring over the guidelines of an earlier event (same files, new copies of the entries) */
+      const b = await readJson(req, 2000), src = tour(String(b.from || ''));
+      if (!src || src.id === T.id) throw new HttpError(400, 'Choose another event to copy from.');
+      const want = Array.isArray(b.sports) ? b.sports.filter((k) => GSPORTS.includes(k)) : null;
+      const items = (src.guidelines || []).filter((g) => !want || want.includes(g.sport));
+      items.forEach((g) => T.guidelines.push({ ...JSON.parse(JSON.stringify(g)), id: uid(), updatedAt: Date.now(), by: user.name }));
+      audit(user.name, 'copied guidelines', items.length + ' from ' + src.name + ' to ' + T.name); save(); broadcast();
+      return json(res, 200, { ok: true, copied: items.length });
+    }
+    if (!mt[2] && m === 'POST') {
+      const b = await readJson(req, 60000);
+      const sport = GSPORTS.includes(b.sport) ? b.sport : 'general';
+      const file = b.file && /^\/uploads\/[\w.-]+\.(pdf|docx|jpg|png|webp)$/.test(String(b.file.url || '')) ? { url: b.file.url, name: str(b.file.name, 120) || 'Guidelines', kind: ['pdf', 'docx', 'image'].includes(b.file.kind) ? b.file.kind : 'pdf', size: Math.max(0, Number(b.file.size) || 0) } : null;
+      const text = str(b.text, 20000), title = str(b.title, 100);
+      if (!file && !text) throw new HttpError(400, 'Upload a document or type the guidelines.');
+      const g = { id: uid(), sport, title, text, file, updatedAt: Date.now(), by: user.name };
+      T.guidelines.push(g); audit(user.name, 'added guidelines', T.name + ' – ' + sport); save(); broadcast();
+      return json(res, 200, g);
+    }
+    const g = mt[2] && T.guidelines.find((x) => x.id === mt[2]); if (!g) throw new HttpError(404, 'Guideline not found');
+    if (m === 'PUT') {
+      const b = await readJson(req, 60000);
+      if (b.sport != null && GSPORTS.includes(b.sport)) g.sport = b.sport;
+      if (b.title != null) g.title = str(b.title, 100);
+      if (b.text != null) g.text = str(b.text, 20000);
+      if (b.file === null) g.file = null;
+      else if (b.file && /^\/uploads\/[\w.-]+\.(pdf|docx|jpg|png|webp)$/.test(String(b.file.url || ''))) g.file = { url: b.file.url, name: str(b.file.name, 120) || 'Guidelines', kind: ['pdf', 'docx', 'image'].includes(b.file.kind) ? b.file.kind : 'pdf', size: Math.max(0, Number(b.file.size) || 0) };
+      if (!g.file && !g.text) throw new HttpError(400, 'Keep a document or some text.');
+      g.updatedAt = Date.now(); g.by = user.name; audit(user.name, 'updated guidelines', T.name + ' – ' + g.sport); save(); broadcast();
+      return json(res, 200, g);
+    }
+    if (m === 'DELETE') { T.guidelines = T.guidelines.filter((x) => x !== g); audit(user.name, 'removed guidelines', T.name + ' – ' + g.sport); save(); broadcast(); return json(res, 200, { ok: true }); }
+    throw new HttpError(405, 'Method not allowed');
+  }
   if (p === '/api/staff/friendly' && m === 'POST') {
     if (!isStaffU(user)) throw new HttpError(401, 'Sign in to start a match.');
     const b = await readJson(req, 4000);
@@ -2204,7 +2256,7 @@ async function route(req, res, url) {
     if (p === '/api/admin/purge' && m === 'POST') {
       const b = await readJson(req, 2000); const out = [];
       const used = () => { const u = new Set(); const add = (x) => { const k = String(x || '').match(/^\/uploads\/([\w.-]+)$/); if (k) u.add(k[1]); };
-        add(db.tournament.logo); (db.tournament.signers || []).forEach((x) => add(x.image)); db.players.forEach((x) => add(x.photo)); db.sponsors.forEach((x) => add(x.image)); db.gallery.forEach((x) => add(x.url)); return u; };
+        add(db.tournament.logo); (db.tournament.signers || []).forEach((x) => add(x.image)); db.players.forEach((x) => add(x.photo)); db.sponsors.forEach((x) => add(x.image)); db.gallery.forEach((x) => add(x.url)); db.tournaments.forEach((t) => (t.guidelines || []).forEach((g) => add(g.file && g.file.url))); return u; };
       if (b.contacts) { db.players.forEach((x) => { x.phone = ''; x.email = ''; x.emergency = ''; x.tshirt = ''; x.notes = ''; x.guardianName = ''; x.guardianPhone = ''; x.editTokenHash = ''; }); db.disputes.forEach((d) => { d.contact = ''; d.name = ''; }); out.push('contact details'); }
       if (b.kidsPhotos) { db.players.forEach((x) => { if (x.section === 'kids') x.photo = ''; }); db.gallery = db.gallery.filter((g) => !g.minors); out.push('children’s photos'); }
       if (b.trash) { db.trash = []; out.push('trash'); }
@@ -3014,7 +3066,9 @@ async function route(req, res, url) {
 
   /* ---- static ---- */
   if (p.startsWith('/uploads/')) {
-    return serveFile(req, res, path.join(UPLOAD_DIR, path.basename(p)), 'public, max-age=31536000, immutable', { 'Content-Security-Policy': "default-src 'none'; sandbox" });
+    const ext = path.extname(p).toLowerCase();
+    const extra = ext === '.pdf' ? { 'X-Content-Type-Options': 'nosniff' } : ext === '.docx' ? { 'Content-Disposition': 'attachment', 'X-Content-Type-Options': 'nosniff' } : { 'Content-Security-Policy': "default-src 'none'; sandbox" };
+    return serveFile(req, res, path.join(UPLOAD_DIR, path.basename(p)), 'public, max-age=31536000, immutable', extra);
   }
   const rel = p === '/' ? 'index.html' : decodeURIComponent(p).replace(/^\/+/, '');
   const file = path.normalize(path.join(PUBLIC_DIR, rel));
