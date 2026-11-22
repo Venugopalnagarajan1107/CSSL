@@ -12,6 +12,7 @@ const QRCode = require('qrcode');
 const Engine = require('./public/engine.js');
 const Fx = require('./lib/fixtures.js');
 const SheetImport = require('./lib/sheet-import.js');
+const DocImport = require('./lib/doc-import.js');
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -808,7 +809,7 @@ function normEvent(b, prev) {
   const rr = b.rubberRules || {}, pr = prev.rubberRules || {};
   const rubberRules = { clinch: rr.clinch != null ? !!rr.clinch : pr.clinch !== false, maxPerPlayer: clampN(rr.maxPerPlayer, 1, 6, pr.maxPerPlayer || 2) };
   return {
-    groups: prev.groups, bracket: prev.bracket, byes: prev.byes || [], format, rubbers, rubberRules, ageMin, ageMax,
+    groups: prev.groups, bracket: prev.bracket, byes: prev.byes || [], format, rubbers, rubberRules, ageMin, ageMax, ...(prev.fixtureDocs ? { fixtureDocs: prev.fixtureDocs } : {}),
     id: prev.id || uid(), name: str(b.name || prev.name || 'Event', 80), sport: str(b.sport || prev.sport || 'other', 20), section,
     scoring: (b.scoring || prev.scoring) === 'result' ? 'result' : 'points', sideType, sideSize,
     note: str(b.note != null ? b.note : prev.note || '', 300), participantIds, config,
@@ -1051,6 +1052,7 @@ const MIME = {
   '.webmanifest': 'application/manifest+json', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon',
   '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
   '.pdf': 'application/pdf', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 };
 const VIDEO_EXT = { 'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm' };
 /* ISO media (mp4 / mov: "ftyp" at byte 4) or Matroska/WebM (EBML header). */
@@ -2274,7 +2276,7 @@ async function route(req, res, url) {
     if (p === '/api/admin/purge' && m === 'POST') {
       const b = await readJson(req, 2000); const out = [];
       const used = () => { const u = new Set(); const add = (x) => { const k = String(x || '').match(/^\/uploads\/([\w.-]+)$/); if (k) u.add(k[1]); };
-        add(db.tournament.logo); (db.tournament.signers || []).forEach((x) => add(x.image)); db.players.forEach((x) => add(x.photo)); db.sponsors.forEach((x) => add(x.image)); db.gallery.forEach((x) => add(x.url)); db.tournaments.forEach((t) => (t.guidelines || []).forEach((g) => add(g.file && g.file.url))); return u; };
+        add(db.tournament.logo); (db.tournament.signers || []).forEach((x) => add(x.image)); db.players.forEach((x) => add(x.photo)); db.sponsors.forEach((x) => add(x.image)); db.gallery.forEach((x) => add(x.url)); db.tournaments.forEach((t) => (t.guidelines || []).forEach((g) => add(g.file && g.file.url))); db.events.forEach((e) => (e.fixtureDocs || []).forEach((d) => add(d.url))); return u; };
       if (b.contacts) { db.players.forEach((x) => { x.phone = ''; x.email = ''; x.emergency = ''; x.tshirt = ''; x.notes = ''; x.guardianName = ''; x.guardianPhone = ''; x.editTokenHash = ''; }); db.disputes.forEach((d) => { d.contact = ''; d.name = ''; }); out.push('contact details'); }
       if (b.kidsPhotos) { db.players.forEach((x) => { if (x.section === 'kids') x.photo = ''; }); db.gallery = db.gallery.filter((g) => !g.minors); out.push('children’s photos'); }
       if (b.trash) { db.trash = []; out.push('trash'); }
@@ -3027,10 +3029,40 @@ async function route(req, res, url) {
       res.writeHead(200, { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': 'attachment; filename="fixtures-template.xlsx"' });
       return res.end(Buffer.from(await wb.xlsx.writeBuffer()));
     }
+    /* Fixture charts: the original schedule (picture, PDF, Word, PowerPoint or Excel) shown to everyone on the game's Fixtures tab and dashboard */
+    if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/fixture-docs(?:\/([\w-]+))?$/))) {
+      const ev = find('events', mm[1]); if (!ev) throw new HttpError(404, 'Game not found');
+      ev.fixtureDocs = ev.fixtureDocs || [];
+      if (!mm[2] && m === 'POST') {
+        if (ev.fixtureDocs.length >= 20) throw new HttpError(400, 'Up to 20 fixture charts per game – remove an old one first.');
+        const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+        const ext = { 'application/pdf': '.pdf', 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+          'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx' }[type];
+        if (!ext) throw new HttpError(400, 'Attach a picture (JPG, PNG, WEBP), a PDF, or a Word / PowerPoint / Excel file (.docx, .pptx, .xlsx).');
+        const name = uid() + uid() + ext, file = path.join(UPLOAD_DIR, name);
+        const size = await readBodyToFile(req, file, 25e6), buf = fs.readFileSync(file);
+        const ok = ext === '.pdf' ? buf.toString('latin1', 0, 5) === '%PDF-' : ['.docx', '.pptx', '.xlsx'].includes(ext) ? (await DocImport.officeKind(buf)) === ext.slice(1) : looksLike(buf, ext);
+        if (!ok || !size) { fs.unlink(file, () => {}); throw new HttpError(400, 'That file does not look like a real ' + ext.slice(1).toUpperCase() + ' file.'); }
+        const d = { id: uid(), url: '/uploads/' + name, name: str(url.searchParams.get('name'), 120) || 'Fixtures' + ext, kind: ext === '.pdf' ? 'pdf' : ['.jpg', '.png', '.webp'].includes(ext) ? 'image' : ext.slice(1), size, by: user.name, at: Date.now() };
+        ev.fixtureDocs.push(d); audit(user.name, 'attached fixture chart', ev.name + ': ' + d.name); save(); broadcast();
+        return json(res, 200, d);
+      }
+      if (mm[2] && m === 'DELETE') { const d = ev.fixtureDocs.find((x) => x.id === mm[2]); if (!d) throw new HttpError(404, 'Not found'); ev.fixtureDocs = ev.fixtureDocs.filter((x) => x !== d); audit(user.name, 'removed fixture chart', ev.name + ': ' + d.name); save(); broadcast(); return json(res, 200, { ok: true }); }
+      throw new HttpError(405, 'Method not allowed');
+    }
     if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/import-fixtures$/)) && m === 'POST') {
       const ev = find('events', mm[1]); if (!ev) throw new HttpError(404, 'Game not found');
       const T = tour(ev.tid); if (T && T.status === 'closed') throw new HttpError(409, T.name + ' is closed.');
-      const wb = await loadWorkbook(await readBody(req, 5e6));
+      const raw = await readBody(req, 15e6), office = await DocImport.officeKind(raw);
+      if (raw.toString('latin1', 0, 5) === '%PDF-' || looksLike(raw, '.jpg') || looksLike(raw, '.png') || looksLike(raw, '.webp'))
+        throw new HttpError(400, 'Pictures and PDFs cannot be read into matches reliably. Attach it as a fixture chart so everyone can see it, and add the matches with “+ Fixture” or a sheet.', { chart: true });
+      let wb, source = 'sheet';
+      if (office === 'docx' || office === 'pptx') {
+        const doc = office === 'docx' ? await DocImport.readDocx(raw) : await DocImport.readPptx(raw);
+        const fx = doc ? DocImport.fixturesOf(doc) : [];
+        if (!fx.length) throw new HttpError(400, 'No fixtures found in that ' + (office === 'docx' ? 'Word' : 'PowerPoint') + ' file. It needs a table with Player A / Player B columns, or lines like “Raja vs Manjesh”. You can attach it as a fixture chart instead.', { chart: true });
+        const ExcelJS = require('exceljs'); wb = new ExcelJS.Workbook(); const ws = wb.addWorksheet(office === 'docx' ? 'Word file' : 'Slides'); DocImport.asRows(fx).forEach((r) => ws.addRow(r)); source = office;
+      } else wb = await loadWorkbook(raw);
       const sheets = wb.worksheets.map((ws) => ({ ws, ...SheetImport.sheetKind(ws) })).filter((x) => x.kind === 'fixtures');
       if (!sheets.length) throw new HttpError(400, 'No fixtures found – the sheet needs a "Player A" and a "Player B" column (download the template).');
       const preview = url.searchParams.get('dry') === '1';
@@ -3041,7 +3073,7 @@ async function route(req, res, url) {
         const out = importOthers(sheets, 'fixtures', errors, warnings, ev.tid, [ev], { forEv: ev, canScore: !!(user.refId && user.kind === 'chief'), by: user.name });
         const made = db.matches.slice(before).map((x) => ({ no: x.no, a: sideName(ev, x.sideA), b: sideName(ev, x.sideB), when: x.startsAt || x.time || '', court: x.court }));
         if (!preview && out.fixturesMade) { audit(user.name, 'uploaded fixtures', ev.name + ': ' + out.fixturesMade + ' new' + (out.scored ? ', ' + out.scored + ' with scores' : '')); save(); broadcast(); }
-        return json(res, 200, { dryRun: preview, made: out.fixturesMade || 0, existing: out.fixturesExisting || 0, scored: out.scored || 0, scoresSkipped: out.scoresSkipped || 0, rows: Object.values(out.rowsBySheet).reduce((a, b) => a + b, 0), list: made.slice(0, 200), errors, warnings });
+        return json(res, 200, { source, dryRun: preview, made: out.fixturesMade || 0, existing: out.fixturesExisting || 0, scored: out.scored || 0, scoresSkipped: out.scoresSkipped || 0, rows: Object.values(out.rowsBySheet).reduce((a, b) => a + b, 0), list: made.slice(0, 200), errors, warnings });
       } finally { if (preview) Object.assign(db, JSON.parse(snap)); }
     }
     if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/reset-draw$/)) && m === 'POST') {
@@ -3120,7 +3152,7 @@ async function route(req, res, url) {
   /* ---- static ---- */
   if (p.startsWith('/uploads/')) {
     const ext = path.extname(p).toLowerCase();
-    const extra = ext === '.pdf' ? { 'X-Content-Type-Options': 'nosniff' } : ext === '.docx' ? { 'Content-Disposition': 'attachment', 'X-Content-Type-Options': 'nosniff' } : { 'Content-Security-Policy': "default-src 'none'; sandbox" };
+    const extra = ext === '.pdf' ? { 'X-Content-Type-Options': 'nosniff' } : ['.docx', '.pptx', '.xlsx'].includes(ext) ? { 'Content-Disposition': 'attachment', 'X-Content-Type-Options': 'nosniff' } : { 'Content-Security-Policy': "default-src 'none'; sandbox" };
     return serveFile(req, res, path.join(UPLOAD_DIR, path.basename(p)), 'public, max-age=31536000, immutable', extra);
   }
   const rel = p === '/' ? 'index.html' : decodeURIComponent(p).replace(/^\/+/, '');

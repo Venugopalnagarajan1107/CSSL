@@ -162,6 +162,9 @@ function pickEvent(tid) { ui.tid = tid; store.set('tid', tid); scope(); render()
 const canManageTour = (t) => isAdmin() && !!t && (isOrganizer() || (t.organizerIds || []).includes(me.adminId));
 const evOf = (m) => byId('events', m.eventId);
 const nameOf = (ev, id) => { const x = byId(ev.sideType === 'team' ? 'teams' : 'players', id); return x ? x.name : '?'; };
+/* A–Z by name, ignoring case and titles like Dr / Mr */
+const nameKey = (n) => String(n || '').replace(/^(dr|mr|mrs|ms)\.?\s+/i, '').toLowerCase();
+const byName = (a, b) => nameKey(a && a.name).localeCompare(nameKey(b && b.name), undefined, { sensitivity: 'base', numeric: true });
 const sideLabel = (ev, ids) => ids.map((i) => nameOf(ev, i)).join(' & ');
 const isStaff = () => !!(me.adminId || me.refId || me.role === 'admin' || me.role === 'referee');
 const isAdmin = () => me.role === 'admin';
@@ -490,6 +493,18 @@ setInterval(() => {
 
 /* ---- Round-robin dashboard: progress, standings, head-to-head grid, who still has to play whom, and a filtered match log ---- */
 /* completed / live / scheduled (date or time set) / pending (no time yet) / cancelled */
+/* The game's fixture charts (pictures, PDFs, documents of the schedule) */
+function fixtureDocsCard(ev) {
+  const docs = ev.fixtureDocs || []; if (!docs.length) return null;
+  const KL = { pdf: 'PDF', docx: 'Word', pptx: 'PowerPoint', xlsx: 'Excel', image: 'Picture' };
+  return h('div', { class: 'card' }, h('div', { class: 'card-h' }, h('b', {}, '📎 Fixture chart' + (docs.length > 1 ? 's' : '')), h('span', { class: 'muted small' }, 'as shared by the organizers')),
+    docs.map((d) => h('div', {},
+      d.kind === 'image' ? h('a', { href: d.url, target: '_blank', rel: 'noopener' }, h('img', { class: 'g-img', src: d.url, alt: d.name, loading: 'lazy' })) : null,
+      h('div', { class: 'g-file' }, h('span', { class: 'g-ic', 'aria-hidden': 'true' }, { pdf: '📄', docx: '📝', pptx: '📊', xlsx: '📗', image: '🖼' }[d.kind] || '📎'),
+        h('div', { class: 'grow' }, h('b', {}, d.name), h('div', { class: 'muted small' }, [KL[d.kind], fileSize(d.size)].filter(Boolean).join(' • '))),
+        h('a', { class: 'btn sm', href: d.url, target: '_blank', rel: 'noopener' }, ['pdf', 'image'].includes(d.kind) ? 'Open' : 'Download'),
+        canManage(ev) ? h('button', { class: 'btn ghost sm', 'aria-label': 'Remove ' + d.name, onclick: () => confirmBox('Remove “' + d.name + '” from ' + ev.name + '?', guard(async () => { await api('DELETE', '/api/admin/events/' + ev.id + '/fixture-docs/' + d.id); await refresh(); }), 'Remove') }, '✕') : null))));
+}
 function mStatus(m, d) { return d.status === 'cancelled' ? 'cancelled' : d.status === 'completed' ? 'completed' : d.status === 'live' ? 'live' : (m.startsAt || m.time) ? 'scheduled' : 'pending'; }
 const ST_LABEL = { completed: '✅ Completed', live: '● Live', scheduled: '🗓 Scheduled', pending: '⏳ Pending', cancelled: '✕ Cancelled' };
 function gameDashboard(ev, ms) {
@@ -521,7 +536,7 @@ function gameDashboard(ev, ms) {
           .map((c, i) => h('td', { class: i === 0 ? 'pos' : i === 1 ? 'l nm' : '' }, c)));
       })))));
   /* 3. head-to-head grid (updates live as results come in) */
-  const order = st.map((r) => r.id).filter((id) => ids.includes(id)).concat(ids.filter((id) => !st.some((r) => r.id === id)));
+  const order = ids.slice().sort((x, y) => byName({ name: nm(x) }, { name: nm(y) }));   /* grid, filter and still-to-play: A–Z by name */
   const cell = (a, b) => {
     if (a === b) return h('td', { class: 'mx-self' }, '—');
     const hits = rows.filter((x) => (x.m.sideA.includes(a) && x.m.sideB.includes(b)) || (x.m.sideA.includes(b) && x.m.sideB.includes(a)));
@@ -537,7 +552,7 @@ function gameDashboard(ev, ms) {
       h('tbody', {}, order.map((a) => h('tr', {}, h('th', { class: 'l' }, nm(a)), order.map((b) => cell(a, b))))))),
     h('div', { class: 'muted small mx-key' }, h('span', { class: 'mx-win' }, '2-1'), ' won  ', h('span', { class: 'mx-loss' }, '1-2'), ' lost  ● live  🗓 scheduled  · pending  ✕ cancelled')) : null;
   /* 4. who still has to play */
-  const left = order.map((id) => ({ id, ms: rows.filter((x) => ['live', 'scheduled', 'pending'].includes(x.st) && sideOf(x.m, id)) })).filter((x) => x.ms.length).sort((a, b) => b.ms.length - a.ms.length || nm(a.id).localeCompare(nm(b.id)));
+  const left = order.map((id) => ({ id, ms: rows.filter((x) => ['live', 'scheduled', 'pending'].includes(x.st) && sideOf(x.m, id)) })).filter((x) => x.ms.length);
   const remaining = single && left.length ? h('div', { class: 'card' }, h('div', { class: 'card-h' }, h('b', {}, '⏳ Still to play, by player'), h('span', { class: 'muted small' }, 'Tap a name to see only their matches')),
     h('div', { class: 'list' }, left.map((x) => h('div', { class: 'row', onclick: () => { f.player = x.id; f.status = 'open'; render(); setTimeout(() => { const el = document.getElementById('dash-log'); if (el) el.scrollIntoView({ behavior: 'smooth' }); }, 50); } },
       h('div', { class: 'grow' }, h('b', {}, nm(x.id) + ' – ' + x.ms.length + ' left'), h('div', { class: 'muted small' }, x.ms.map((y) => { const o = sideOf(y.m, x.id) === 'A' ? y.m.sideB : y.m.sideA; return sideLabel(ev, o) + (y.st === 'scheduled' ? ' (' + fmtSlot(y.m) + ')' : y.st === 'live' ? ' (live)' : ''); }).join(', ')))))) ) : null;
@@ -559,7 +574,7 @@ function gameDashboard(ev, ms) {
         h('td', { class: 'l' }, x.st === 'completed' ? (x.d.draw ? 'Draw' : sideLabel(ev, x.d.winner === 'A' ? x.m.sideA : x.m.sideB)) : '—'),
         h('td', {}, h('span', { class: 'chip st-' + x.st }, ST_LABEL[x.st]))))))) : h('p', { class: 'empty' }, 'No matches for this filter.'),
     h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: () => shareText(dashText(ev, st, left, done, live)) }, '📲 Share on WhatsApp')));
-  return h('div', { class: 'dash' }, summary, table, matrix, remaining, logCard);
+  return h('div', { class: 'dash' }, fixtureDocsCard(ev), summary, table, matrix, remaining, logCard);
 }
 function dashText(ev, st, left, done, live) {
   const nm = (id) => nameOf(ev, id);
@@ -581,9 +596,9 @@ Views.event = (id) => {
   const body = tab === 'bracket' ? h('div', {}, championBanner(ev), bracketView(ev))
     : tab === 'standings' ? h('div', {}, championBanner(ev), standingsTable(ev), hasKO && fmt.type !== 'knockout' ? h('div', {}, h('h3', {}, 'Knockout'), bracketView(ev)) : null)
     : tab === 'dashboard' ? gameDashboard(ev, ms)
-    : tab === 'fixtures' ? h('div', {}, selectBar(ms.map((x) => x.m)), ms.length ? ms.map((x) => matchCard(x.m)) : h('div', {}, h('p', { class: 'empty' }, 'No fixtures yet.'), canManage(ev) ? h('div', { class: 'actions center' }, h('button', { class: 'btn', onclick: () => fixturesUploadModal(ev) }, '⬆ Upload fixtures from Excel / CSV')) : null))
+    : tab === 'fixtures' ? h('div', {}, fixtureDocsCard(ev), selectBar(ms.map((x) => x.m)), ms.length ? ms.map((x) => matchCard(x.m)) : h('div', {}, h('p', { class: 'empty' }, 'No fixtures yet.'), canManage(ev) ? h('div', { class: 'actions center' }, h('button', { class: 'btn', onclick: () => fixturesUploadModal(ev) }, '⬆ Upload fixtures from Excel / CSV')) : null))
       : ev.sideType === 'team' && canManage(ev) ? teamBuilder(ev)
-      : h('div', { class: 'list' }, (ev.participantIds || []).map((pid) => {
+      : h('div', { class: 'list' }, (ev.participantIds || []).slice().sort((x, y) => byName({ name: nameOf(ev, x) }, { name: nameOf(ev, y) })).map((pid) => {
         if (ev.sideType === 'team') { const t = byId('teams', pid); return h('div', { class: 'row' }, h('b', {}, t ? t.name : '?'), h('span', { class: 'muted small' }, t ? t.memberIds.map((x) => (byId('players', x) || {}).name).join(', ') : '')); }
         const p = byId('players', pid); return h('a', { class: 'row', href: '#/player/' + pid }, avatar(p, 32), h('b', {}, p ? p.name : '?'));
       }));
@@ -750,7 +765,7 @@ function lineupModal(m, ev) {
   const lm = liveMatch(m), isAd = isAdmin();
   const team = (id) => byId('teams', id) || { memberIds: [], name: '?' };
   const tA = team(m.sideA[0]), tB = team(m.sideB[0]);
-  const opts = (t, g) => [['', '— choose —']].concat(t.memberIds.map((id) => byId('players', id)).filter((p) => p && (!g || !p.gender || p.gender === g)).map((p) => [p.id, p.name + (p.gender ? ' (' + p.gender + ')' : '')]));
+  const opts = (t, g) => [['', '— choose —']].concat(t.memberIds.map((id) => byId('players', id)).filter((p) => p && (!g || !p.gender || p.gender === g)).sort(byName).map((p) => [p.id, p.name + (p.gender ? ' (' + p.gender + ')' : '')]));
   const rows = lm.rubbers.map((r) => {
     const size = r.size === 2 ? 2 : 1, locked = rubStarted(r) && !isAd;
     const mk = (t, cur) => Array.from({ length: size }, (_, i) => { const x = sel(opts(t, r.gender), cur[i] || ''); x.disabled = locked; return x; });
@@ -1017,7 +1032,7 @@ const refSportsTxt = (r) => (r.kind === 'chief' ? 'all sports' : (r.sports || []
 const REF_KIND_LABEL = { referee: 'Referee', chief: 'Chief referee', volunteer: 'Volunteer' };
 Views.referees = (embedded) => {
   if (embedded !== true) { location.replace('#/season/referees'); return h('p', { class: 'empty' }, 'Loading…'); }
-  const refs = S.referees.filter((r) => r.status !== 'pending');
+  const refs = S.referees.filter((r) => r.status !== 'pending').sort(byName);
   const organizer = isOrganizer();
   const assigned = (id) => { const ms = S.matches.filter((m) => (m.refereeIds || []).includes(id) && evOf(m)); return { n: ms.length, done: ms.filter((m) => E.derive(liveMatch(m), evOf(m)).status === 'completed').length }; };
   const scope = (r) => [...(r.sports || []).filter((k) => SPORT_LABEL[k]).map((k) => SPORT_ICON[k] + ' ' + SPORT_LABEL[k]), ...(r.eventIds || []).map((id) => (byId('events', id) || {}).name).filter(Boolean)];
