@@ -574,7 +574,7 @@ Views.event = (id) => {
   const body = tab === 'bracket' ? h('div', {}, championBanner(ev), bracketView(ev))
     : tab === 'standings' ? h('div', {}, championBanner(ev), standingsTable(ev), hasKO && fmt.type !== 'knockout' ? h('div', {}, h('h3', {}, 'Knockout'), bracketView(ev)) : null)
     : tab === 'dashboard' ? gameDashboard(ev, ms)
-    : tab === 'fixtures' ? h('div', {}, selectBar(ms.map((x) => x.m)), ms.length ? ms.map((x) => matchCard(x.m)) : h('p', { class: 'empty' }, 'No fixtures yet.'))
+    : tab === 'fixtures' ? h('div', {}, selectBar(ms.map((x) => x.m)), ms.length ? ms.map((x) => matchCard(x.m)) : h('div', {}, h('p', { class: 'empty' }, 'No fixtures yet.'), canManage(ev) ? h('div', { class: 'actions center' }, h('button', { class: 'btn', onclick: () => fixturesUploadModal(ev) }, '⬆ Upload fixtures from Excel / CSV')) : null))
       : ev.sideType === 'team' && canManage(ev) ? teamBuilder(ev)
       : h('div', { class: 'list' }, (ev.participantIds || []).map((pid) => {
         if (ev.sideType === 'team') { const t = byId('teams', pid); return h('div', { class: 'row' }, h('b', {}, t ? t.name : '?'), h('span', { class: 'muted small' }, t ? t.memberIds.map((x) => (byId('players', x) || {}).name).join(', ') : '')); }
@@ -591,6 +591,7 @@ Views.event = (id) => {
       isStaff() ? h('button', { class: 'btn ghost', onclick: () => window.print() }, '🖨 Print / PDF') : null,
       h('button', { class: 'btn ghost', onclick: () => shareText(standingsText(ev)) }, '↗ Share'),
       canManage(ev) ? h('button', { class: 'btn', onclick: () => needStaff(ev, () => fixtureModal(ev.id)) }, '+ Fixture') : null,
+      canManage(ev) ? h('button', { class: 'btn ghost', onclick: () => fixturesUploadModal(ev) }, '⬆ Upload fixtures') : null,
       canManage(ev) ? h('button', { class: 'btn ghost', onclick: () => needStaff(ev, () => generateModal(ev)) }, fmt.type === 'swiss' ? '⚡ Next Swiss round' : fmt.type === 'knockout' ? '⚡ Draw bracket' : fmt.type === 'groups' ? '⚡ Draw groups' : '⚡ Generate fixtures') : null,
       canManage(ev) && canNext ? h('button', { class: 'btn ghost', onclick: () => finalsFlow(ev) }, nextLabel) : null,
       canManage(ev) && hasDraw ? h('button', { class: 'btn ghost danger-t', onclick: () => resetDrawFlow(ev) }, '🗑 Delete all fixtures') : null,

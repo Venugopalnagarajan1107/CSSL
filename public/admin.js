@@ -702,6 +702,30 @@ async function finalsFlow(ev) {
   }
 }
 
+/* Upload fixtures already made elsewhere into one game: preview first, then import. */
+function fixturesUploadModal(ev) {
+  const send = (buf, dry) => fetch('/api/admin/events/' + ev.id + '/import-fixtures' + (dry ? '?dry=1' : ''), { method: 'POST', headers: { 'x-token': me.token, 'Content-Type': 'application/octet-stream' }, body: buf })
+    .then(async (r) => { const j = await r.json(); if (!r.ok) throw new Error(j.error || 'Upload failed'); return j; });
+  const pick = h('input', { type: 'file', hidden: true, accept: '.xlsx,.csv,.tsv,.txt', onchange: guard(async (e) => {
+    const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+    const buf = await f.arrayBuffer(), dry = await send(buf, true);
+    box.close();
+    const rowsTxt = (list) => list.slice(0, 30).map((x) => h('div', {}, (x.sheet ? x.sheet + ' ' : '') + 'row ' + x.row + ' – ' + x.name + ': ' + x.error));
+    modal('Check before importing', h('div', {},
+      h('p', {}, h('b', {}, dry.made + ' new fixture' + (dry.made === 1 ? '' : 's')), ' will be added to ' + ev.name + (dry.scored ? ', ' + dry.scored + ' with results' : '') + '.'),
+      dry.existing ? h('p', { class: 'small' }, dry.existing + ' already in the app – skipped, not duplicated.') : null,
+      dry.list.length ? h('div', { class: 'list small' }, dry.list.slice(0, 40).map((x) => h('div', { class: 'row' }, h('span', { class: 'grow' }, x.a + ' vs ' + x.b), h('span', { class: 'muted' }, [x.when.replace('T', ' '), x.court].filter(Boolean).join(' • '))))) : null,
+      dry.errors.length ? h('div', { class: 'warnbox small' }, h('b', {}, dry.errors.length + ' row(s) will be skipped:'), rowsTxt(dry.errors)) : null,
+      dry.warnings.length ? h('details', { class: 'small' }, h('summary', {}, dry.warnings.length + ' note(s) – those fixtures are still added'), rowsTxt(dry.warnings)) : null),
+      [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, dry.made ? { label: 'Import ' + dry.made, fn: async () => { const r = await send(buf, false); toast(r.made + ' fixtures added' + (r.scored ? ', ' + r.scored + ' with results' : '')); await refresh(); } } : null].filter(Boolean));
+  }) });
+  const box = modal('⬆ Upload fixtures – ' + ev.name, h('div', {},
+    h('p', { class: 'small' }, 'Fixtures you have already made (Excel or CSV), one row per match. The sheet only needs ', h('b', {}, (ev.sideType === 'team' ? 'Team' : 'Player') + ' A'), ' and ', h('b', {}, (ev.sideType === 'team' ? 'Team' : 'Player') + ' B'), ' columns – the game is this one.'),
+    h('ul', { class: 'small' }, h('li', {}, 'Optional columns: Round, Group, Date, Time, Court, Referee.'), h('li', {}, 'Names are matched to this game’s players; a unique first name works too. Doubles: “Asha & Meena”.'),
+      h('li', {}, 'Score (optional), e.g. 11-7, 9-11, 11-5 – entered only when a chief referee uploads.'), h('li', {}, 'Matches already in the app are not duplicated; you see a preview first.')),
+    h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: guard(() => downloadWith('/api/admin/events/' + ev.id + '/fixtures-template.xlsx', 'fixtures-' + ev.name.replace(/\W+/g, '-') + '.xlsx')) }, '⬇ Template'), pick,
+      h('button', { class: 'btn', onclick: () => pick.click() }, '⬆ Choose file'))));
+}
 function resetDrawFlow(ev) {
   const go = (force) => api('POST', '/api/admin/events/' + ev.id + '/reset-draw', { force }).then(async (r) => { toast(r.removed + ' fixtures removed'); await refresh(); });
   const n = S.matches.filter((m) => m.eventId === ev.id).length;
