@@ -603,7 +603,10 @@ async function notify(m, title, body) {
 }
 
 /* An organizer's contact number: the one set for them, else their player profile's. Shown on Contact us. */
-const orgPhone = (a) => (a && (a.phone || ((a.playerId && find('players', a.playerId)) || {}).phone)) || '';
+const nameKey = (n) => String(n || '').toLowerCase().replace(/^(dr|mr|mrs|ms)\.?\s+/, '').replace(/[^a-z0-9]/g, '');
+/* No number set and no linked profile: use the player with exactly the same name, if there is only one (phone only – the accounts are not linked). */
+const playerByName = (n) => { const k = nameKey(n); if (!k) return null; const hits = db.players.filter((p) => p.status !== 'rejected' && nameKey(p.name) === k && p.phone); return hits.length === 1 ? hits[0] : null; };
+const orgPhone = (a) => (a && (a.phone || ((a.playerId && find('players', a.playerId)) || {}).phone || (playerByName(a.name) || {}).phone)) || '';
 /* ---------------------------------------------------------- WhatsApp notify */
 const WA = { token: process.env.WHATSAPP_TOKEN || '', phoneId: process.env.WHATSAPP_PHONE_ID || '', template: process.env.WHATSAPP_TEMPLATE || '', lang: process.env.WHATSAPP_LANG || 'en', cc: String(process.env.PHONE_COUNTRY_CODE || '91').replace(/\D/g, '') || '91' };
 WA.on = !!(WA.token && WA.phoneId);

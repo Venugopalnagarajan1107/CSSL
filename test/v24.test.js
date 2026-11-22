@@ -55,5 +55,13 @@ test('cancelled matches, table tennis tie-breaks, referees in Notify, organizer 
     await call('PUT', '/api/admin/admins/' + me.id, { phone: '98450 12345' }, admin);
     const pub = (await call('GET', '/api/state')).body;
     assert.equal(pub.organizers.find((a) => a.id === me.id).phone, '98450 12345');
+    // an organizer typed by name takes the number of the one player with that exact name (Dr / Mr ignored); ambiguous or no match -> none
+    await call('POST', '/api/admin/players', { name: 'Kavitha Rao', phone: '9000000301' }, admin);
+    await call('POST', '/api/admin/players', { name: 'Same Name', phone: '9000000302' }, admin); await call('POST', '/api/admin/players', { name: 'Same Name', phone: '9000000303', section: 'kids' }, admin);
+    const kav = (await call('POST', '/api/admin/admins', { name: 'Dr Kavitha Rao', limited: true }, admin)).body.id;
+    const amb = (await call('POST', '/api/admin/admins', { name: 'Same Name', limited: true }, admin)).body.id;
+    const pub2 = (await call('GET', '/api/state')).body;
+    assert.equal(pub2.organizers.find((a) => a.id === kav).phone, '9000000301');
+    assert.equal(pub2.organizers.find((a) => a.id === amb).phone, '', 'two players with that name: no guess');
   } finally { await s.stop(); }
 });
