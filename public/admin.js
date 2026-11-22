@@ -274,8 +274,9 @@ function staffPicker(ev, sportSel) {
 }
 function showPins(pins, after) {
   if (!pins || !pins.length) { if (after) after(); return; }
-  modal('New PINs – shown only once', h('div', {}, h('p', { class: 'small' }, 'Give each person their PIN. They sign in from Menu → Sign in.'),
-    pins.map((x) => h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, x.name), h('div', { class: 'muted small' }, x.role)), h('div', { class: 'bigpin', style: 'font-size:22px' }, x.pin)))),
+  const fresh = pins.filter((x) => x.pin);
+  modal(fresh.length ? 'New PINs – shown only once' : 'Roles added', h('div', {}, h('p', { class: 'small' }, 'One PIN per person: it opens every role they have. ' + (fresh.length ? 'Give each new PIN to that person – they sign in from Menu → Sign in.' : '')),
+    pins.map((x) => h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, x.name), h('div', { class: 'muted small' }, x.role)), x.pin ? h('div', { class: 'bigpin', style: 'font-size:22px' }, x.pin) : h('span', { class: 'muted small' }, 'uses their own PIN')))),
   [{ label: 'Done', fn: () => { if (after) after(); } }]);
 }
 function newGameModal() {
@@ -749,6 +750,44 @@ async function attachChart(ev, f) {
   const r = await fetch('/api/admin/events/' + ev.id + '/fixture-docs?name=' + encodeURIComponent(f.name), { method: 'POST', headers: { 'x-token': me.token, 'Content-Type': type }, body });
   const j = await r.json(); if (!r.ok) throw new Error(j.error || 'Upload failed');
   toast('Fixture chart attached'); await refresh();
+}
+/* 🔄 Sync scores from a published scoreboard page: check first, then sync; optional automatic sync every 5 minutes */
+async function syncModal(ev) {
+  const s = await api('GET', '/api/admin/events/' + ev.id + '/sync-settings');
+  const url = h('input', { type: 'url', value: s.url || '', autocapitalize: 'off', placeholder: 'https://…' });
+  const cat = h('input', { value: s.category || '', placeholder: 'seniors / juniors' });
+  const auto = h('input', { type: 'checkbox', checked: !!s.auto });
+  const out = h('div', {});
+  const players = (ev.participantIds || []).map((id) => byId('players', id)).filter(Boolean).sort(byName);
+  const aliases = {};
+  const save = () => api('PUT', '/api/admin/events/' + ev.id + '/sync-settings', { url: url.value.trim(), category: cat.value.trim(), auto: auto.checked, aliases });
+  const list = (title, items, cls) => (items.length ? h('details', { class: 'small' + (cls ? ' ' + cls : ''), open: items.length <= 6 }, h('summary', {}, title + ' (' + items.length + ')'), h('ul', {}, items.slice(0, 80).map((x) => h('li', {}, x)))) : null);
+  const show = (p) => {
+    if (p.categories && !p.categories.includes(cat.value.trim())) cat.value = p.category;
+    out.replaceChildren(...[
+      h('div', { class: 'card tip small' }, h('b', {}, p.enter.length + ' new result' + (p.enter.length === 1 ? '' : 's')), ' to enter' + (p.create.length ? ', ' + p.create.length + ' new fixture' + (p.create.length === 1 ? '' : 's') : '') + ' • ' + p.same + ' already the same • ' + p.pending + ' still to play'),
+      p.categories.length > 1 ? h('p', { class: 'muted small' }, 'Categories on the page: ' + p.categories.join(', ')) : null,
+      list('New results', p.enter), list('New fixtures', p.create),
+      p.conflicts.length ? list('⚠ Different in the app – not changed', p.conflicts, 'warnbox') : null,
+      list('Results only in the app – kept', p.appOnly), list('Could not read', p.unreadable),
+      p.unknown.length ? h('div', { class: 'warnbox small' }, h('b', {}, 'Names on the page that need a player (' + p.unknown.length + ')'), h('p', {}, 'Pick the right player once – it is remembered for the next syncs.'),
+        p.unknown.map((u) => { const pick = h('select', { onchange: (e) => { aliases[u.name] = e.target.value; } }, [h('option', { value: '' }, '— choose —')].concat(players.map((pl) => h('option', { value: pl.id }, pl.name))));
+          return h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, u.name), h('div', { class: 'muted' }, u.error)), pick); })) : null].filter(Boolean));
+  };
+  const check = guard(async () => { out.replaceChildren(h('p', { class: 'muted' }, 'Reading the scoreboard…')); await save(); show(await api('POST', '/api/admin/events/' + ev.id + '/sync', { dry: true })); });
+  const last = s.last ? h('p', { class: 'muted small' }, (s.last.error ? '⚠ Last sync failed ' + ago(s.last.at) + ': ' + s.last.error : 'Last sync ' + ago(s.last.at) + (s.last.by ? ' by ' + s.last.by : '') + ': ' + (s.last.entered || 0) + ' results, ' + (s.last.created || 0) + ' new fixtures.')) : null;
+  modal('🔄 Sync scores – ' + ev.name, h('div', {},
+    h('p', { class: 'small' }, 'Reads the published scoreboard and brings its results into the app – set scores included. A result already in the app is never overwritten; anything different is listed for you.'),
+    field('Scoreboard link', url), field('Category on that page', cat, 'e.g. seniors or juniors'),
+    h('label', { class: 'chk' }, auto, 'Sync automatically every 5 minutes'), last,
+    h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: check }, '🔍 Check what is new')), out),
+  [{ label: 'Close', cls: 'ghost', fn: async () => { await save(); await refresh(); } }, { label: '🔄 Sync now', fn: async () => {
+    await save();
+    const p = await api('POST', '/api/admin/events/' + ev.id + '/sync', {});
+    toast(p.enter.length + ' results' + (p.create.length ? ', ' + p.create.length + ' fixtures' : '') + ' synced' + (p.conflicts.length ? ' • ' + p.conflicts.length + ' different – not changed' : ''), !!p.conflicts.length);
+    await refresh();
+  } }]);
+  check();
 }
 function resetDrawFlow(ev) {
   const go = (force) => api('POST', '/api/admin/events/' + ev.id + '/reset-draw', { force }).then(async (r) => { toast(r.removed + ' fixtures removed'); await refresh(); });

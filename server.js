@@ -13,6 +13,7 @@ const Engine = require('./public/engine.js');
 const Fx = require('./lib/fixtures.js');
 const SheetImport = require('./lib/sheet-import.js');
 const DocImport = require('./lib/doc-import.js');
+const Scoreboard = require('./lib/scoreboard.js');
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -173,6 +174,7 @@ function migrate(d) {
   const byNm = (n) => { const hits = (d.players || []).filter((p) => p.status !== 'rejected' && String(p.name).trim().toLowerCase() === String(n).trim().toLowerCase()); return hits.length === 1 ? hits[0].id : ''; };
   d.admins.forEach((a) => { if (a.playerId === undefined) a.playerId = byNm(a.name); });
   (d.referees || []).forEach((r) => { if (r.playerId === undefined) r.playerId = byNm(r.name); });
+  try { const n = consolidatePins(d); if (n) console.log('  One PIN per person: ' + n + ' existing PIN(s) moved onto player profiles.'); } catch (e) { console.error('PIN consolidation failed', e); }
   if (d.matches.some((m) => !m.plannedNo)) d.matches.forEach((m) => { if (!m.plannedNo && m.no) m.plannedNo = m.no; });
   { const keep = db; db = d; try { numberMatches(); } catch (e) { console.error('numbering failed', e); } finally { db = keep; } }
   return d;
@@ -608,6 +610,88 @@ const nameKey = (n) => String(n || '').toLowerCase().replace(/^(dr|mr|mrs|ms)\.?
 /* No number set and no linked profile: use the player with exactly the same name, if there is only one (phone only – the accounts are not linked). */
 const playerByName = (n) => { const k = nameKey(n); if (!k) return null; const hits = db.players.filter((p) => p.status !== 'rejected' && nameKey(p.name) === k && p.phone); return hits.length === 1 ? hits[0] : null; };
 const orgPhone = (a) => (a && (a.phone || ((a.playerId && find('players', a.playerId)) || {}).phone || (playerByName(a.name) || {}).phone)) || '';
+/* ---------------------------------------------------------- scoreboard sync
+   A game can follow a published scoreboard page (e.g. the CS table tennis one): new results are entered with their set
+   scores, missing fixtures are created. A result already in the app is never overwritten – a different one is listed. */
+const SYNC_DEFAULT_URL = 'https://cs-tt-tournament-2026.netlify.app/';
+const syncDefaults = (ev) => ({ url: SYNC_DEFAULT_URL, category: (ev.section || 'adults') === 'kids' ? 'juniors' : 'seniors', auto: false, aliases: {}, ...(ev.sync || {}) });
+function syncResolver(ev) {
+  const T = tour(ev.tid), key = (n) => String(n || '').toLowerCase().replace(/^(dr|mr|mrs|ms)\.?\s+/, '').replace(/[^a-z0-9]/g, '');
+  const inGame = (ev.participantIds || []).map((id) => find('players', id)).filter(Boolean);
+  const roster = ((T && T.playerIds) || []).map((id) => find('players', id)).filter((p) => p && (p.section || 'adults') === (ev.section || 'adults'));
+  const aliases = (ev.sync && ev.sync.aliases) || {};
+  return (name) => {
+    if (aliases[name] && find('players', aliases[name])) return { id: aliases[name] };
+    const k = key(name); if (!k) return { error: 'no name' };
+    for (const pool of [inGame, roster]) { const hit = pool.filter((p) => key(p.name) === k); if (hit.length === 1) return { id: hit[0].id }; if (hit.length > 1) return { error: 'two players are called "' + name + '"' }; }
+    const pre = inGame.filter((p) => k.length >= 3 && (key(p.name).startsWith(k) || key(p.name.split(' ')[0]) === k));
+    if (pre.length === 1) return { id: pre[0].id };
+    return { error: pre.length ? '"' + name + '" could be ' + pre.map((p) => p.name).join(' or ') : '"' + name + '" is not a player of this game' };
+  };
+}
+/* plan (and, when apply, carry out) a sync of one game from the page's data for one category */
+function syncGame(ev, board, category, apply, by) {
+  const cat = board[category]; if (!cat) throw new HttpError(400, 'The page has no "' + category + '" category (it has: ' + Object.keys(board).join(', ') + ').');
+  const res = syncResolver(ev), out = { enter: [], create: [], same: 0, pending: 0, conflicts: [], appOnly: [], unknown: {}, unreadable: [] };
+  const sideNm = (id) => (find('players', id) || {}).name || '?';
+  for (const m of cat.matches) {
+    const ra = res(m.a), rb = res(m.b);
+    if (!ra.id || !rb.id) { [[m.a, ra], [m.b, rb]].forEach(([n, r]) => { if (!r.id) out.unknown[n] = r.error; }); continue; }
+    const A = ra.id, B = rb.id, label = m.id + ' ' + sideNm(A) + ' v ' + sideNm(B);
+    const pair = db.matches.filter((x) => x.eventId === ev.id && ((x.sideA[0] === A && x.sideB[0] === B) || (x.sideA[0] === B && x.sideB[0] === A)));
+    let x = pair.find((y) => !y.cancelled) || pair[0];
+    const done = m.ga != null && m.gb != null && Number.isFinite(m.ga) && Number.isFinite(m.gb);
+    if (!x) {
+      out.create.push(label);
+      if (apply) {
+        [A, B].forEach((id) => { if (!ev.participantIds.includes(id)) ev.participantIds.push(id); });
+        addRoster(ev.tid, [A, B]);
+        x = normMatch({ eventId: ev.id, sideA: [A], sideB: [B], stage: 'League' }, null); db.matches.push(x);
+      }
+    }
+    if (!done) { if (x && Engine.derive(x, ev).status === 'completed') out.appOnly.push(label); else out.pending++; continue; }
+    const r = Scoreboard.orient(m); if (!r) { out.unreadable.push(label + ' "' + m.detail + '"'); continue; }
+    if (x && x.cancelled) { out.conflicts.push(label + ': cancelled in the app'); continue; }
+    if (x) {
+      const d = Engine.derive(x, ev), flip = x.sideA[0] !== A;
+      if (d.status === 'completed') { const ga = flip ? d.gamesB : d.gamesA, gb = flip ? d.gamesA : d.gamesB; if (ga === m.ga && gb === m.gb) out.same++; else out.conflicts.push(label + ': page ' + m.ga + '-' + m.gb + ', app ' + ga + '-' + gb); continue; }
+    }
+    out.enter.push(label + ' ' + m.ga + '-' + m.gb);
+    if (apply) {
+      const flip = x.sideA[0] !== A;
+      try { writeGames(x, { games: r.games.map(([a, b]) => (flip ? { a: b, b: a } : { a, b })) }, by, 'sync'); }
+      catch (e) { out.enter.pop(); out.unreadable.push(label + ': ' + e.message); }
+    }
+  }
+  out.unknown = Object.entries(out.unknown).map(([name, error]) => ({ name, error }));
+  return out;
+}
+async function runSync(ev, opts, by) {
+  const s = syncDefaults(ev), url = opts.url || s.url, category = opts.category || s.category;
+  let board;
+  try { board = Scoreboard.extract(await Scoreboard.fetchPage(url)); } catch (e) { throw new HttpError(400, 'Could not read the scoreboard: ' + e.message); }
+  const plan = syncGame(ev, board, category, !!opts.apply, by);
+  plan.categories = Object.keys(board); plan.category = category; plan.url = url;
+  plan.players = board[category] ? board[category].players : [];
+  if (opts.apply) {
+    ev.sync = { ...s, url, category, last: { at: Date.now(), by, entered: plan.enter.length, created: plan.create.length, conflicts: plan.conflicts.length } };
+    if (plan.enter.length || plan.create.length) audit(by, 'synced scores', ev.name + ': ' + plan.enter.length + ' results, ' + plan.create.length + ' new fixtures from ' + url);
+    save(); broadcast();
+  }
+  return plan;
+}
+/* auto-sync: every 5 minutes for games that ask for it */
+let syncBusy = false;
+setInterval(async () => {
+  if (syncBusy) return; syncBusy = true;
+  try {
+    for (const ev of db.events.filter((e) => e.sync && e.sync.auto && e.sync.url)) {
+      const T = tour(ev.tid); if (T && T.status === 'closed') continue;
+      try { await runSync(ev, { apply: true }, 'Scoreboard sync'); }
+      catch (e) { ev.sync.last = { at: Date.now(), by: 'Scoreboard sync', error: String(e.message).slice(0, 200) }; save(); }
+    }
+  } finally { syncBusy = false; }
+}, 5 * 60e3).unref();
 /* ---------------------------------------------------------- WhatsApp notify */
 const WA = { token: process.env.WHATSAPP_TOKEN || '', phoneId: process.env.WHATSAPP_PHONE_ID || '', template: process.env.WHATSAPP_TEMPLATE || '', lang: process.env.WHATSAPP_LANG || 'en', cc: String(process.env.PHONE_COUNTRY_CODE || '91').replace(/\D/g, '') || '91' };
 WA.on = !!(WA.token && WA.phoneId);
@@ -809,7 +893,7 @@ function normEvent(b, prev) {
   const rr = b.rubberRules || {}, pr = prev.rubberRules || {};
   const rubberRules = { clinch: rr.clinch != null ? !!rr.clinch : pr.clinch !== false, maxPerPlayer: clampN(rr.maxPerPlayer, 1, 6, pr.maxPerPlayer || 2) };
   return {
-    groups: prev.groups, bracket: prev.bracket, byes: prev.byes || [], format, rubbers, rubberRules, ageMin, ageMax, ...(prev.fixtureDocs ? { fixtureDocs: prev.fixtureDocs } : {}),
+    groups: prev.groups, bracket: prev.bracket, byes: prev.byes || [], format, rubbers, rubberRules, ageMin, ageMax, ...(prev.fixtureDocs ? { fixtureDocs: prev.fixtureDocs } : {}), ...(prev.sync ? { sync: prev.sync } : {}),
     id: prev.id || uid(), name: str(b.name || prev.name || 'Event', 80), sport: str(b.sport || prev.sport || 'other', 20), section,
     scoring: (b.scoring || prev.scoring) === 'result' ? 'result' : 'points', sideType, sideSize,
     note: str(b.note != null ? b.note : prev.note || '', 300), participantIds, config,
@@ -1164,7 +1248,7 @@ function findByPin(pin) {
   for (const [kind, list] of lists) for (const rec of list) { const h = kind === 'captain' ? rec.captainHash : rec.pinHash; if (h && rec.pinIdx === idx && checkPin(pin, h)) return { kind, rec }; }
   for (const [kind, list] of lists) for (const rec of list) {   // older PINs without a fingerprint: check, then remember the fingerprint
     const h = kind === 'captain' ? rec.captainHash : rec.pinHash;
-    if (kind !== 'player' && h && !rec.pinIdx && checkPin(pin, h)) { rec.pinIdx = idx; return { kind, rec }; }
+    if (h && !rec.pinIdx && checkPin(pin, h)) { rec.pinIdx = idx; return { kind, rec }; }
   }
   return null;
 }
@@ -1188,6 +1272,26 @@ function newPersonPin() {
   for (;;) { const pin = String(crypto.randomInt(100000, 1000000)); if (/^(\d)\1+$/.test(pin) || '0123456789'.includes(pin) || '9876543210'.includes(pin)) continue; if (!findByPin(pin)) return pin; }
 }
 function givePin(pl) { const pin = newPersonPin(); pl.pinHash = hashPin(pin); pl.pinIdx = pinIdx(pin); return pin; }
+/* One PIN per person. A person's PIN lives on their player profile and opens every role they have (admin, organizer, referee,
+   captain, player). Admin / referee accounts linked to a player keep no PIN of their own: the person's existing PIN is kept –
+   their admin PIN first, else their referee PIN – and moved onto the profile. Accounts not linked to a player keep theirs. */
+function consolidatePins(d) {
+  let moved = 0;
+  for (const pl of d.players || []) {
+    const recs = [...(d.admins || []).filter((a) => a.playerId === pl.id), ...(d.referees || []).filter((r) => r.playerId === pl.id && r.status !== 'pending')];
+    const withPin = recs.filter((r) => r.pinHash); if (!withPin.length) continue;
+    if (!pl.pinHash) { pl.pinHash = withPin[0].pinHash; pl.pinIdx = withPin[0].pinIdx || ''; moved++; }
+    withPin.forEach((r) => { r.pinHash = ''; r.pinIdx = ''; });
+  }
+  return moved;
+}
+/* a new admin / referee account made for someone from the player list: the PIN to hand out, or '' when they keep their own */
+function onePinFor(rec, plain) {
+  const pl = rec.playerId && find('players', rec.playerId); if (!pl) return plain;
+  rec.pinHash = ''; rec.pinIdx = '';
+  if (pl.pinHash) return '';
+  pl.pinHash = hashPin(plain); pl.pinIdx = pinIdx(plain); return plain;
+}
 const needAdmin = (u) => { needStaff(u); if (u.role !== 'admin') throw new HttpError(403, 'Admin only'); return u; };
 
 const fileCache = new Map();   /* app files are read once, compressed once, and revalidated with an ETag */
@@ -1376,9 +1480,9 @@ function tourStaff(b, pins, creator) {
   const orgIds = (Array.isArray(b.organizerIds) ? b.organizerIds : []).map(String).filter((id) => db.admins.some((a) => a.id === id));
   if (creator && creator.role === 'admin' && !orgIds.includes(creator.adminId)) orgIds.push(creator.adminId);
   const refIds = (Array.isArray(b.refereeIds) ? b.refereeIds : []).map(String).filter((id) => { const r = find('referees', id); return r && r.status !== 'pending'; });
-  staffNames(b.newOrganizers).forEach((x) => { const a = newOrganizer(x.name, { sports: [], limited: true }); if (x.playerId) a.playerId = x.playerId; pins.push({ role: 'Organizer', name: a.name, pin: a._pin }); delete a._pin; orgIds.push(a.id); });
+  staffNames(b.newOrganizers).forEach((x) => { const a = newOrganizer(x.name, { sports: [], limited: true }); if (x.playerId) a.playerId = x.playerId; pins.push({ role: 'Organizer', name: a.name, pin: onePinFor(a, a._pin) }); delete a._pin; orgIds.push(a.id); });
   const newSports = (Array.isArray(b.newRefereeSports) ? b.newRefereeSports : []).filter((k) => SPORTS.includes(k));
-  staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee', sports: newSports }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: r._plain }); delete r._plain; db.referees.push(r); refIds.push(r.id); });
+  staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee', sports: newSports }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: onePinFor(r, r._plain) }); delete r._plain; db.referees.push(r); refIds.push(r.id); });
   if (!orgIds.length) throw new HttpError(400, 'An event needs at least one organizer – choose one or add a new one.');
   if (!refIds.length) throw new HttpError(400, 'An event needs at least one referee – choose one or add a new one.');
   return { organizerIds: [...new Set(orgIds)], refereeIds: [...new Set(refIds)] };
@@ -1600,14 +1704,16 @@ async function route(req, res, url) {
   }
   /* My profile: change my PIN, add my photo. */
   if (p === '/api/me/pin' && m === 'POST') {
-    if (!user || !user.personId) throw new HttpError(401, 'Sign in first.');
-    const pl = find('players', user.personId); if (!pl) throw new HttpError(404, 'Profile not found');
+    if (!user) throw new HttpError(401, 'Sign in first.');
+    /* the person's one PIN – or, for an admin / referee sign-in not linked to a player, that account's own */
+    const pl = (user.personId && find('players', user.personId)) || (user.adminId && db.admins.find((a) => a.id === user.adminId && !a.playerId)) || (user.refId && db.referees.find((r) => r.id === user.refId && !r.playerId));
+    if (!pl) throw new HttpError(404, 'Profile not found');
     if (lockedFor('ip:' + ip)) throw new HttpError(429, 'Too many attempts. Try again later.');
     const pin = String((await readJson(req, 500)).pin || '');
     if (!/^\d{6,10}$/.test(pin)) throw new HttpError(400, 'Use 6 to 10 digits.');
     if (/^(\d)\1+$/.test(pin) || '0123456789'.includes(pin) || '9876543210'.includes(pin)) throw new HttpError(400, 'That PIN is too easy to guess – choose another.');
     const other = findByPin(pin);
-    if (other && !(other.kind === 'player' && other.rec === pl)) { recordFail('ip:' + ip, 8); throw new HttpError(400, 'Choose a different PIN.'); }   // counts like a wrong sign-in, so it cannot be used to guess PINs
+    if (other && other.rec !== pl) { recordFail('ip:' + ip, 8); throw new HttpError(400, 'Choose a different PIN.'); }   // counts like a wrong sign-in, so it cannot be used to guess PINs
     pl.pinHash = hashPin(pin); pl.pinIdx = pinIdx(pin);
     db.admins.forEach((a) => { if (a.playerId === pl.id) { a.pinHash = ''; a.pinIdx = ''; } });   // one PIN for everything
     db.referees.forEach((r) => { if (r.playerId === pl.id) { r.pinHash = ''; r.pinIdx = ''; } });
@@ -1953,6 +2059,30 @@ async function route(req, res, url) {
     if (m === 'DELETE') { T.guidelines = T.guidelines.filter((x) => x !== g); audit(user.name, 'removed guidelines', T.name + ' – ' + g.sport); save(); broadcast(); return json(res, 200, { ok: true }); }
     throw new HttpError(405, 'Method not allowed');
   }
+  /* A referee nominates themselves for a match that has no referee yet (their sport, not their own match) – or withdraws */
+  if ((mt = p.match(/^\/api\/staff\/matches\/([\w-]+)\/(take|release)$/)) && m === 'POST') {
+    if (!user || !user.refId) throw new HttpError(401, 'Sign in as a referee.');
+    const match = find('matches', mt[1]); if (!match) throw new HttpError(404, 'Match not found');
+    const ev = find('events', match.eventId), T = ev && tour(ev.tid), r = find('referees', user.refId);
+    if (!ev || !r || r.status === 'pending') throw new HttpError(403, 'Your referee role is not active.');
+    if (T && T.status === 'closed') throw new HttpError(409, T.name + ' is closed.');
+    const st = Engine.derive(match, ev).status;
+    if (match.cancelled || st === 'completed') throw new HttpError(409, 'This match is ' + (match.cancelled ? 'cancelled' : 'already completed') + '.');
+    match.refereeIds = match.refereeIds || [];
+    if (mt[2] === 'take') {
+      if (r.kind === 'volunteer') throw new HttpError(403, 'Volunteers do not referee matches.');
+      if (!refFor(r, ev)) throw new HttpError(403, 'You are not mapped to ' + sportName(ev.sport) + '.');
+      if (user.personId && inMatch(user.personId, match)) throw new HttpError(403, 'You (or your team) play in this match, so you cannot referee it.');
+      if (match.refereeIds.includes(r.id)) return json(res, 200, { ok: true });
+      if (match.refereeIds.length) throw new HttpError(409, 'Another referee has already taken this match.');
+      match.refereeIds.push(r.id); audit(r.name, 'took match as referee', ev.name + (match.no ? ' #' + match.no : ''), match.id);
+    } else {
+      if (!match.refereeIds.includes(r.id)) return json(res, 200, { ok: true });
+      if (st === 'live') throw new HttpError(409, 'The match has started – ask the organizer to change the referee.');
+      match.refereeIds = match.refereeIds.filter((x) => x !== r.id); audit(r.name, 'withdrew as referee', ev.name + (match.no ? ' #' + match.no : ''), match.id);
+    }
+    save(); broadcast(); return json(res, 200, { ok: true });
+  }
   if (p === '/api/staff/friendly' && m === 'POST') {
     if (!isStaffU(user)) throw new HttpError(401, 'Sign in to start a match.');
     const b = await readJson(req, 4000);
@@ -2217,7 +2347,9 @@ async function route(req, res, url) {
         if (b.name) a.name = str(b.name, 40);
         if (b.phone != null) a.phone = str(b.phone, 30);
         if (Array.isArray(b.sports)) { a.sports = normSports(b.sports); Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].adminId === a.id) db.sessions[t].sports = a.sports; }); }
-        if (b.resetPin) { do { pin = pinN(8); } while (db.admins.some((x) => checkPin(pin, x.pinHash))); a.pinHash = hashPin(pin); Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].adminId === a.id && t !== user.token) delete db.sessions[t]; }); }
+        const lp = a.playerId && find('players', a.playerId);
+        if (b.resetPin && lp) { pin = givePin(lp); a.pinHash = ''; a.pinIdx = ''; Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].personId === lp.id && t !== user.token) delete db.sessions[t]; }); }
+        else if (b.resetPin) { do { pin = pinN(8); } while (db.admins.some((x) => checkPin(pin, x.pinHash))); a.pinHash = hashPin(pin); Object.keys(db.sessions).forEach((t) => { if (db.sessions[t].adminId === a.id && t !== user.token) delete db.sessions[t]; }); }
         audit(user.name, b.resetPin ? 'reset admin PIN' : 'renamed admin', a.name); save();
         return json(res, 200, { id: a.id, name: a.name, pin });
       }
@@ -2705,7 +2837,7 @@ async function route(req, res, url) {
       const rec = b.type === 'admin' ? db.admins.find((a) => a.id === b.id) : find('referees', String(b.id || ''));
       if (!pl || !rec) throw new HttpError(404, 'Not found');
       if ((b.type === 'admin' ? db.admins : db.referees).some((x) => x !== rec && x.playerId === pl.id)) throw new HttpError(409, pl.name + ' already has that role.');
-      rec.playerId = pl.id; audit(user.name, 'linked account', rec.name + ' → ' + pl.name); save(); broadcast();
+      rec.playerId = pl.id; consolidatePins(db); audit(user.name, 'linked account', rec.name + ' → ' + pl.name + ' (one PIN)'); save(); broadcast();
       return json(res, 200, { ok: true });
     }
     /* ---- events: roster (enrol existing players / remove from the event) ---- */
@@ -2746,10 +2878,10 @@ async function route(req, res, url) {
     const gameStaff = (b, pins, ev) => {
       const orgIds = (Array.isArray(b.organizerIds) ? b.organizerIds : []).map(String).filter((id) => db.admins.some((a) => a.id === id));
       const refIds = (Array.isArray(b.refereeIds) ? b.refereeIds : []).map(String).filter((id) => { const r = find('referees', id); return r && r.status !== 'pending'; });
-      staffNames(b.newOrganizers).forEach((x) => { const a = newOrganizer(x.name, { sports: [], limited: true }); if (x.playerId) a.playerId = x.playerId; pins.push({ role: 'Organizer', name: a.name, pin: a._pin }); delete a._pin; orgIds.push(a.id); });
+      staffNames(b.newOrganizers).forEach((x) => { const a = newOrganizer(x.name, { sports: [], limited: true }); if (x.playerId) a.playerId = x.playerId; pins.push({ role: 'Organizer', name: a.name, pin: onePinFor(a, a._pin) }); delete a._pin; orgIds.push(a.id); });
       if (b.newOrganizer && str(b.newOrganizer, 40).trim()) { const a = newOrganizer(str(b.newOrganizer, 40).trim(), { sports: [], limited: true }); pins.push({ role: 'Organizer', name: a.name, pin: a._pin }); delete a._pin; orgIds.push(a.id); }
       const picked = mappedRefs(refIds, ev, !b.byDefault);
-      staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee', sports: [ev.sport] }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: r._plain }); delete r._plain; db.referees.push(r); picked.push(r.id); });
+      staffNames(b.newReferees).forEach((x) => { const r = COLS.referees({ name: x.name, kind: 'referee', sports: [ev.sport] }, null); if (x.playerId) r.playerId = x.playerId; pins.push({ role: 'Referee', name: r.name, pin: onePinFor(r, r._plain) }); delete r._plain; db.referees.push(r); picked.push(r.id); });
       refIds.length = 0; refIds.push(...picked);
       if (!refIds.length) throw new HttpError(400, 'Every game needs at least one referee mapped to ' + sportName(ev.sport) + ' – choose one or add a new one.');
       return { organizerIds: [...new Set(orgIds)], refereeIds: [...new Set(refIds)] };
@@ -3076,6 +3208,27 @@ async function route(req, res, url) {
         return json(res, 200, { source, dryRun: preview, made: out.fixturesMade || 0, existing: out.fixturesExisting || 0, scored: out.scored || 0, scoresSkipped: out.scoresSkipped || 0, rows: Object.values(out.rowsBySheet).reduce((a, b) => a + b, 0), list: made.slice(0, 200), errors, warnings });
       } finally { if (preview) Object.assign(db, JSON.parse(snap)); }
     }
+    /* ---- scoreboard sync of one game: settings, preview (dry) and apply ---- */
+    if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/sync(-settings)?$/))) {
+      const ev = find('events', mm[1]); if (!ev) throw new HttpError(404, 'Game not found');
+      const T = tour(ev.tid);
+      if (mm[2] && m === 'GET') return json(res, 200, syncDefaults(ev));
+      if (mm[2] && m === 'PUT') {
+        const b = await readJson(req, 20000), s = syncDefaults(ev);
+        if (b.url != null) { try { s.url = await Scoreboard.checkUrl(b.url); } catch (e) { throw new HttpError(400, e.message); } }
+        if (b.category != null) s.category = str(b.category, 40);
+        if (b.auto != null) s.auto = !!b.auto;
+        if (b.aliases && typeof b.aliases === 'object') Object.entries(b.aliases).slice(0, 200).forEach(([k, v]) => { const n = str(k, 60); if (!v) delete s.aliases[n]; else if (find('players', String(v))) s.aliases[n] = String(v); });
+        ev.sync = s; audit(user.name, 'scoreboard sync settings', ev.name + (s.auto ? ' (auto)' : '')); save(); broadcast();
+        return json(res, 200, s);
+      }
+      if (!mm[2] && m === 'POST') {
+        if (T && T.status === 'closed') throw new HttpError(409, T.name + ' is closed.');
+        const b = await readJson(req, 4000);
+        return json(res, 200, await runSync(ev, { apply: !b.dry, url: b.url, category: b.category }, user.name));
+      }
+      throw new HttpError(405, 'Method not allowed');
+    }
     if ((mm = p.match(/^\/api\/admin\/events\/([\w-]+)\/reset-draw$/)) && m === 'POST') {
       const ev = find('events', mm[1]); if (!ev) throw new HttpError(404, 'Event not found');
       const b = await readJson(req);
@@ -3112,7 +3265,8 @@ async function route(req, res, url) {
     if ((mm = p.match(/^\/api\/admin\/(players|teams|referees|events|matches|sponsors)(?:\/([\w-]+))?$/))) {
       const col = mm[1], id = mm[2];
       const finish = (item, code) => {
-        const plain = item._plain; delete item._plain;
+        let plain = item._plain; delete item._plain;
+        if (col === 'referees' && item.playerId && find('players', item.playerId) && plain) { const lp = find('players', item.playerId); lp.pinHash = hashPin(plain); lp.pinIdx = pinIdx(plain); item.pinHash = ''; item.pinIdx = ''; }
         save(); broadcast();
         return json(res, code || 200, col === 'referees' ? { id: item.id, name: item.name, kind: item.kind, sports: item.sports, eventIds: item.eventIds, status: item.status, pin: plain } : item);
       };
