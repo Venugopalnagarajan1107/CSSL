@@ -112,7 +112,7 @@ const fill = (el, ...kids) => el.replaceChildren(...kids.flat(Infinity).filter((
 const sel = (opts, val) => h('select', {}, opts.map(([v, l]) => h('option', { value: v, selected: String(val) === String(v) }, l)));
 const inp = (val, o) => h('input', { value: val == null ? '' : val, ...(o || {}) });
 const SECTION_OPTS = [['adults', 'Adults'], ['kids', 'Kids']];
-const playersIn = (section, tid) => { const T = tourById(tid || curTid()) || { playerIds: [] }; return S.players.filter((p) => (p.section || 'adults') === section && (T.kind === 'friendly' || T.playerIds.includes(p.id))); };
+const playersIn = (section, tid) => { const T = tourById(tid || curTid()) || { playerIds: [] }; return S.players.filter((p) => (p.section || 'adults') === section && (T.kind === 'friendly' || T.playerIds.includes(p.id))).sort(byName); };
 
 /* ------------------------------------------------------------------ player */
 const STYLE_HINTS = {
@@ -140,7 +140,7 @@ function secretText(prefix, v) {
 /* Add people by typing a name or picking someone from the player list. values(): ["Typed Name", { playerId }] */
 function staffAdder(label) {
   const picked = [], dl = 'pl-' + Math.random().toString(36).slice(2);
-  const list = h('datalist', { id: dl }, S.players.filter((p) => p.status !== 'pending').map((p) => h('option', { value: p.name })));
+  const list = h('datalist', { id: dl }, S.players.filter((p) => p.status !== 'pending').sort(byName).map((p) => h('option', { value: p.name })));
   const input = h('input', { list: dl, placeholder: label + ': type a name or pick a player', 'aria-label': label });
   const chips = h('div', { class: 'chips' });
   const draw = () => chips.replaceChildren(...picked.map((x, i) => h('span', { class: 'chip plain' }, (x.playerId ? '👤 ' : '') + x.name, ' ', h('button', { type: 'button', class: 'x', 'aria-label': 'Remove', onclick: () => { picked.splice(i, 1); draw(); } }, '✕'))));
@@ -154,7 +154,7 @@ function newEventModal() {
   const name = inp('', { placeholder: 'e.g. CSSL - Season 4 or Diwali Kids Cup', maxlength: 80 }), dates = inp('', { placeholder: 'e.g. 29–30 Nov 2026' }), venue = inp('');
   const myRef = me.role === 'referee' ? S.referees.find((r) => r.name === me.name) : null;
   const orgs = checkList((S.organizers || []).map((a) => ({ id: a.id, name: a.name })), isAdmin() ? [me.adminId] : []), newOrgs = staffAdder('New organizer');
-  const refs = checkList(S.referees.filter((r) => r.status !== 'pending').map((r) => ({ id: r.id, name: r.name + ' – ' + refSportsTxt(r) })), myRef ? [myRef.id] : []), newRefs = staffAdder('New referee'), newRefSports = sportChecks();
+  const refs = checkList(S.referees.filter((r) => r.status !== 'pending').sort(byName).map((r) => ({ id: r.id, name: r.name + ' – ' + refSportsTxt(r) })), myRef ? [myRef.id] : []), newRefs = staffAdder('New referee'), newRefSports = sportChecks();
   const copy = sel([['', '— set up games below —']].concat(realTours().map((t) => [t.id, 'Copy the games of ' + t.name])), '');
   const rows = [], box = h('div', {});
   const drawRows = () => box.replaceChildren(...rows.map((r, i) => h('div', { class: 'gamerow' }, r.sport, r.kind, r.section, r.name, h('button', { type: 'button', class: 'btn ghost sm', 'aria-label': 'Remove game', onclick: () => { rows.splice(i, 1); drawRows(); } }, '✕'))));
@@ -182,7 +182,7 @@ function tourDetailsModal(T) {
 }
 function tourStaffModal(T, what) {
   const orgsMode = what === 'organizers';
-  const pool = orgsMode ? (S.organizers || []).map((a) => ({ id: a.id, name: a.name })) : S.referees.filter((r) => r.status !== 'pending').map((r) => ({ id: r.id, name: r.name + ' – ' + refSportsTxt(r) }));
+  const pool = orgsMode ? (S.organizers || []).map((a) => ({ id: a.id, name: a.name })) : S.referees.filter((r) => r.status !== 'pending').sort(byName).map((r) => ({ id: r.id, name: r.name + ' – ' + refSportsTxt(r) }));
   const list = checkList(pool, orgsMode ? T.organizerIds : T.refereeIds), adder = staffAdder(orgsMode ? 'New organizer' : 'New referee'), adderSports = orgsMode ? null : sportChecks();
   modal((orgsMode ? 'Organizers' : 'Referees') + ' – ' + T.name, h('div', {}, h('p', { class: 'muted small' }, 'Tick existing ' + (orgsMode ? 'organizers' : 'referees') + ', or add new ones by name or from the player list. At least one is needed. New people get a PIN.'), list, adder.el, adderSports ? h('div', { class: 'muted small' }, 'Sports the new referees cover (each game only offers referees mapped to its sport). Change existing referees’ sports in the Referees tab → Edit.') : null, adderSports),
     [{ label: 'Save', fn: async () => { const r = await api('PUT', '/api/staff/tournaments/' + T.id, orgsMode ? { organizerIds: list.values(), newOrganizers: adder.values() } : { refereeIds: list.values(), newReferees: adder.values(), newRefereeSports: adderSports.values() }); await refresh(); showPins(r.pins); } }]);
@@ -198,7 +198,7 @@ function eventTeams(T) {
     mine && T.status !== 'closed' ? pickBar(S.teams, [{ label: '🗑 Delete teams', fn: (sel) => confirmBox('Delete ' + sel.length + ' team' + (sel.length === 1 ? '' : 's') + '? They leave their games; the players stay in the event. Teams that already have matches are kept. Deleted teams go to Trash for 30 days.',
       guard(async () => { const r = await api('POST', '/api/admin/teams/bulk-delete', { ids: sel }); ui.pickP = null; await refresh(); keptReport(r, 'deleted', 'Delete their matches first:'); }), 'Delete') }], 'teams') : null,
     S.teams.length ? groupBySection(S.teams, (t) => h('div', { class: 'row', onclick: () => (ui.pickP ? null : mine ? eventTeamModal(T, t) : null) }, ui.pickP && mine ? pickBox(t, true) : null, h('div', { class: 'grow' }, h('b', {}, t.name),
-      h('div', { class: 'muted small' }, t.memberIds.map((i) => (byId('players', i) || {}).name).filter(Boolean).join(', ') || 'No players yet'),
+      h('div', { class: 'muted small' }, t.memberIds.map((i) => byId('players', i)).filter(Boolean).sort(byName).map((p) => p.name).join(', ') || 'No players yet'),
       h('div', { class: 'small' }, '🏆 ' + (gamesOf(t).join(', ') || 'not in a game yet'))), mine && !ui.pickP ? h('span', { class: 'muted' }, '✏️ Edit') : null))
       : h('p', { class: 'empty' }, 'No teams yet.'));
 }
@@ -260,7 +260,7 @@ function staffPicker(ev, sportSel) {
     const g = { sport: sportSel ? sportSel.value : ev.sport, id: ev ? ev.id : '' }, label = SPORT_ICON[g.sport] ? SPORT_ICON[g.sport] + ' ' + SPORT_LABEL[g.sport] : 'this sport';
     const all = S.referees.filter((r) => r.status !== 'pending' && r.kind !== 'volunteer'), ok = all.filter((r) => refFor(r, g)), hidden = all.filter((r) => !refFor(r, g));
     const was = refList.values(), chosen = was.length ? was : ev ? ev.refereeIds || [] : curT().refereeIds || [];
-    refList = checkList(ok.map((r) => ({ id: r.id, name: r.name + (r.kind === 'chief' ? ' (chief)' : '') })), chosen.filter((id) => ok.some((r) => r.id === id)));
+    refList = checkList(ok.slice().sort(byName).map((r) => ({ id: r.id, name: r.name + (r.kind === 'chief' ? ' (chief)' : '') })), chosen.filter((id) => ok.some((r) => r.id === id)));
     const stale = ev ? (ev.refereeIds || []).map((id) => byId('referees', id)).filter((r) => r && !refFor(r, g)) : [];
     refBox.replaceChildren(...[h('div', { class: 'muted small' }, 'Only referees mapped to ' + label + ' are listed.'), refList,
       hidden.length ? h('div', { class: 'muted small' }, 'Not mapped to ' + label + ': ' + hidden.map((r) => r.name).join(', ') + ' – map sports in Event → Referees → Edit.') : null,
@@ -303,9 +303,9 @@ const shiftModal = () => modal('Running late?', shiftCard());
 
 /* ---- team builder (team game → Teams tab): players who chose the game, waiting for a team ---- */
 function teamBuilder(ev) {
-  const entered = (ev.participantIds || []).map((id) => byId('teams', id)).filter(Boolean);
+  const entered = (ev.participantIds || []).map((id) => byId('teams', id)).filter(Boolean).sort(byName);
   const placed = new Set(entered.flatMap((t) => t.memberIds));
-  const waiting = (ev.interestedIds || []).filter((id) => !placed.has(id)).map((id) => byId('players', id)).filter(Boolean);
+  const waiting = (ev.interestedIds || []).filter((id) => !placed.has(id)).map((id) => byId('players', id)).filter(Boolean).sort(byName);
   const hasFx = (tid) => S.matches.some((m) => m.eventId === ev.id && (m.sideA.includes(tid) || m.sideB.includes(tid)));
   const size = inp(4, { type: 'number', min: 2, max: 20, inputmode: 'numeric', 'aria-label': 'Players per team', style: 'width:70px' });
   const names = (ids) => ids.map((i) => (byId('players', i) || {}).name).filter(Boolean).join(', ');
@@ -450,7 +450,7 @@ function teamModal(t, defaultSection) {
   const draw = () => { members = checkList(playersIn(section.value, t && t.tid), ((t && t.section === section.value) ? t.memberIds : [])); wrap.replaceChildren(h('b', {}, 'Members'), members); };
   section.addEventListener('change', draw); draw();
   const capBox = t ? h('div', { class: 'card' }, h('b', {}, 'Captain'), h('p', { class: 'muted small' }, 'The captain signs in with a team code to choose and shuffle the line-up for their ties (until a tie starts). They cannot change the team.'),
-    (() => { const capSel = sel([['', '— choose captain —']].concat(t.memberIds.map((id) => [id, (byId('players', id) || {}).name || id])), t.captainId || '');
+    (() => { const capSel = sel([['', '— choose captain —']].concat(t.memberIds.map((id) => byId('players', id) || { id, name: id }).sort(byName).map((p) => [p.id, p.name])), t.captainId || '');
       return h('div', {}, capSel, h('button', { class: 'btn ghost', style: 'margin-top:8px', onclick: guard(async () => { if (!capSel.value) throw new Error('Choose a captain first'); const r = await api('POST', '/api/admin/teams/' + t.id + '/captain-code', { playerId: capSel.value }); await refresh(); modal('Captain code for ' + r.team, h('div', { class: 'center' }, h('div', { class: 'bigpin' }, r.code), h('p', { class: 'muted small' }, 'Share this with the captain privately. It is shown only now; issuing a new code signs the old one out.')), [{ label: 'Done', fn: () => {} }]); }) }, t.hasCode ? 'New captain code' : 'Issue captain code')); })()) : null;
   modal(t ? 'Edit team' : 'Create team', h('div', {}, field('Team name', name), field('Section', section), wrap, capBox),
     [t ? { label: 'Delete', cls: 'danger', close: false, fn: (close) => confirmBox('Delete team ' + t.name + '?', async () => { await api('DELETE', '/api/admin/teams/' + t.id); close(); await refresh(); }, 'Delete') } : null,
@@ -529,7 +529,7 @@ function eventModal(ev, defaultSection) {
   const drawEnrol = () => {
     const team = f.sideType.value === 'team', sec = f.section.value;
     const same = ev && ev.sideType === f.sideType.value && ev.section === sec;
-    boxes = checkList(team ? S.teams.filter((x) => (x.section || 'adults') === sec) : playersIn(sec), same ? ev.participantIds : []);
+    boxes = checkList(team ? S.teams.filter((x) => (x.section || 'adults') === sec).sort(byName) : playersIn(sec), same ? ev.participantIds : []);
     enrol.replaceChildren(h('b', {}, (team ? 'Teams' : 'Players') + ' in this event (' + SEC[sec] + ' section)'), boxes);
   };
   f.sideType.addEventListener('change', drawEnrol); f.section.addEventListener('change', drawEnrol); drawEnrol();
@@ -587,12 +587,12 @@ function fixtureModal(eventId, match) {
     const ev = byId('events', f.event.value);
     const col = ev.sideType === 'team' ? S.teams : S.players;
     const sameSec = col.filter((x) => (x.section || 'adults') === secOf(ev)).map((x) => x.id);
-    const pool = (ev.participantIds.length ? ev.participantIds : sameSec.filter((id) => ev.sideType === 'team' || (curT().playerIds || []).includes(id))).map((id) => [id, nameOf(ev, id)]);
+    const pool = (ev.participantIds.length ? ev.participantIds : sameSec.filter((id) => ev.sideType === 'team' || (curT().playerIds || []).includes(id))).map((id) => [id, nameOf(ev, id)]).sort((x, y) => byName({ name: x[1] }, { name: y[1] }));
     const lineup = (selects, prevIds) => {
       if (ev.sideType !== 'team') return null;
       const box = h('div', {});
       const draw = () => {
-        const members = selects.flatMap((s) => (byId('teams', s.value) || { memberIds: [] }).memberIds).map((id) => byId('players', id)).filter(Boolean);
+        const members = selects.flatMap((s) => (byId('teams', s.value) || { memberIds: [] }).memberIds).map((id) => byId('players', id)).filter(Boolean).sort(byName);
         box.list = checkList(members, prevIds);
         box.replaceChildren(h('div', { class: 'muted small' }, 'Players who played (optional – leave empty to count the whole team)'), box.list);
       };
@@ -618,7 +618,7 @@ function fixtureModal(eventId, match) {
     const chosen = refTouched ? refList.values() : match && match.eventId === ev.id ? match.refereeIds || [] : ev.refereeIds || [];
     const free = S.referees.filter((r) => r.status !== 'pending' && r.kind !== 'volunteer' && refFor(r, ev) && !(r.playerId && playing.has(r.playerId)));
     const blocked = S.referees.filter((r) => r.playerId && playing.has(r.playerId) && refFor(r, ev)), unmapped = S.referees.filter((r) => r.status !== 'pending' && r.kind !== 'volunteer' && !refFor(r, ev));
-    refList = checkList(free.map((r) => ({ id: r.id, name: r.name + (r.kind === 'chief' ? ' (chief)' : '') })), chosen.filter((id) => free.some((r) => r.id === id)));
+    refList = checkList(free.slice().sort(byName).map((r) => ({ id: r.id, name: r.name + (r.kind === 'chief' ? ' (chief)' : '') })), chosen.filter((id) => free.some((r) => r.id === id)));
     refList.addEventListener('change', () => { refTouched = true; });
     f.ref.replaceChildren(...[refList, blocked.length ? h('div', { class: 'muted small' }, 'Not offered because they play in this match: ' + blocked.map((r) => r.name).join(', ')) : null,
       unmapped.length ? h('div', { class: 'muted small' }, 'Not mapped to ' + (SPORT_LABEL[ev.sport] || 'this sport') + ': ' + unmapped.map((r) => r.name).join(', ')) : null,
