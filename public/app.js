@@ -490,6 +490,18 @@ setInterval(() => {
 
 /* ---- Round-robin dashboard: progress, standings, head-to-head grid, who still has to play whom, and a filtered match log ---- */
 /* completed / live / scheduled (date or time set) / pending (no time yet) / cancelled */
+/* The game's fixture charts (pictures, PDFs, documents of the schedule) */
+function fixtureDocsCard(ev) {
+  const docs = ev.fixtureDocs || []; if (!docs.length) return null;
+  const KL = { pdf: 'PDF', docx: 'Word', pptx: 'PowerPoint', xlsx: 'Excel', image: 'Picture' };
+  return h('div', { class: 'card' }, h('div', { class: 'card-h' }, h('b', {}, '📎 Fixture chart' + (docs.length > 1 ? 's' : '')), h('span', { class: 'muted small' }, 'as shared by the organizers')),
+    docs.map((d) => h('div', {},
+      d.kind === 'image' ? h('a', { href: d.url, target: '_blank', rel: 'noopener' }, h('img', { class: 'g-img', src: d.url, alt: d.name, loading: 'lazy' })) : null,
+      h('div', { class: 'g-file' }, h('span', { class: 'g-ic', 'aria-hidden': 'true' }, { pdf: '📄', docx: '📝', pptx: '📊', xlsx: '📗', image: '🖼' }[d.kind] || '📎'),
+        h('div', { class: 'grow' }, h('b', {}, d.name), h('div', { class: 'muted small' }, [KL[d.kind], fileSize(d.size)].filter(Boolean).join(' • '))),
+        h('a', { class: 'btn sm', href: d.url, target: '_blank', rel: 'noopener' }, ['pdf', 'image'].includes(d.kind) ? 'Open' : 'Download'),
+        canManage(ev) ? h('button', { class: 'btn ghost sm', 'aria-label': 'Remove ' + d.name, onclick: () => confirmBox('Remove “' + d.name + '” from ' + ev.name + '?', guard(async () => { await api('DELETE', '/api/admin/events/' + ev.id + '/fixture-docs/' + d.id); await refresh(); }), 'Remove') }, '✕') : null))));
+}
 function mStatus(m, d) { return d.status === 'cancelled' ? 'cancelled' : d.status === 'completed' ? 'completed' : d.status === 'live' ? 'live' : (m.startsAt || m.time) ? 'scheduled' : 'pending'; }
 const ST_LABEL = { completed: '✅ Completed', live: '● Live', scheduled: '🗓 Scheduled', pending: '⏳ Pending', cancelled: '✕ Cancelled' };
 function gameDashboard(ev, ms) {
@@ -559,7 +571,7 @@ function gameDashboard(ev, ms) {
         h('td', { class: 'l' }, x.st === 'completed' ? (x.d.draw ? 'Draw' : sideLabel(ev, x.d.winner === 'A' ? x.m.sideA : x.m.sideB)) : '—'),
         h('td', {}, h('span', { class: 'chip st-' + x.st }, ST_LABEL[x.st]))))))) : h('p', { class: 'empty' }, 'No matches for this filter.'),
     h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: () => shareText(dashText(ev, st, left, done, live)) }, '📲 Share on WhatsApp')));
-  return h('div', { class: 'dash' }, summary, table, matrix, remaining, logCard);
+  return h('div', { class: 'dash' }, fixtureDocsCard(ev), summary, table, matrix, remaining, logCard);
 }
 function dashText(ev, st, left, done, live) {
   const nm = (id) => nameOf(ev, id);
@@ -581,7 +593,7 @@ Views.event = (id) => {
   const body = tab === 'bracket' ? h('div', {}, championBanner(ev), bracketView(ev))
     : tab === 'standings' ? h('div', {}, championBanner(ev), standingsTable(ev), hasKO && fmt.type !== 'knockout' ? h('div', {}, h('h3', {}, 'Knockout'), bracketView(ev)) : null)
     : tab === 'dashboard' ? gameDashboard(ev, ms)
-    : tab === 'fixtures' ? h('div', {}, selectBar(ms.map((x) => x.m)), ms.length ? ms.map((x) => matchCard(x.m)) : h('div', {}, h('p', { class: 'empty' }, 'No fixtures yet.'), canManage(ev) ? h('div', { class: 'actions center' }, h('button', { class: 'btn', onclick: () => fixturesUploadModal(ev) }, '⬆ Upload fixtures from Excel / CSV')) : null))
+    : tab === 'fixtures' ? h('div', {}, fixtureDocsCard(ev), selectBar(ms.map((x) => x.m)), ms.length ? ms.map((x) => matchCard(x.m)) : h('div', {}, h('p', { class: 'empty' }, 'No fixtures yet.'), canManage(ev) ? h('div', { class: 'actions center' }, h('button', { class: 'btn', onclick: () => fixturesUploadModal(ev) }, '⬆ Upload fixtures from Excel / CSV')) : null))
       : ev.sideType === 'team' && canManage(ev) ? teamBuilder(ev)
       : h('div', { class: 'list' }, (ev.participantIds || []).map((pid) => {
         if (ev.sideType === 'team') { const t = byId('teams', pid); return h('div', { class: 'row' }, h('b', {}, t ? t.name : '?'), h('span', { class: 'muted small' }, t ? t.memberIds.map((x) => (byId('players', x) || {}).name).join(', ') : '')); }

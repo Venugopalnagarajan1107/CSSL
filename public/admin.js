@@ -705,26 +705,50 @@ async function finalsFlow(ev) {
 /* Upload fixtures already made elsewhere into one game: preview first, then import. */
 function fixturesUploadModal(ev) {
   const send = (buf, dry) => fetch('/api/admin/events/' + ev.id + '/import-fixtures' + (dry ? '?dry=1' : ''), { method: 'POST', headers: { 'x-token': me.token, 'Content-Type': 'application/octet-stream' }, body: buf })
-    .then(async (r) => { const j = await r.json(); if (!r.ok) throw new Error(j.error || 'Upload failed'); return j; });
-  const pick = h('input', { type: 'file', hidden: true, accept: '.xlsx,.csv,.tsv,.txt', onchange: guard(async (e) => {
+    .then(async (r) => { const j = await r.json(); if (!r.ok) { const er = new Error(j.error || 'Upload failed'); er.data = j; throw er; } return j; });
+  const isChartOnly = (f) => /^image\//.test(f.type) || /\.(pdf|jpe?g|png|webp|heic)$/i.test(f.name);
+  const pick = h('input', { type: 'file', hidden: true, accept: '.xlsx,.csv,.tsv,.txt,.docx,.pptx,.pdf,image/*', onchange: guard(async (e) => {
     const f = e.target.files[0]; e.target.value = ''; if (!f) return;
-    const buf = await f.arrayBuffer(), dry = await send(buf, true);
+    if (isChartOnly(f)) { box.close(); return chartOffer(f, 'Pictures and PDFs cannot be read into matches reliably.'); }
+    const buf = await f.arrayBuffer();
+    let dry;
+    try { dry = await send(buf, true); } catch (er) { if (er.data && er.data.chart) { box.close(); return chartOffer(f, er.message.split('. ')[0] + '.'); } throw er; }
     box.close();
     const rowsTxt = (list) => list.slice(0, 30).map((x) => h('div', {}, (x.sheet ? x.sheet + ' ' : '') + 'row ' + x.row + ' – ' + x.name + ': ' + x.error));
     modal('Check before importing', h('div', {},
       h('p', {}, h('b', {}, dry.made + ' new fixture' + (dry.made === 1 ? '' : 's')), ' will be added to ' + ev.name + (dry.scored ? ', ' + dry.scored + ' with results' : '') + '.'),
       dry.existing ? h('p', { class: 'small' }, dry.existing + ' already in the app – skipped, not duplicated.') : null,
       dry.list.length ? h('div', { class: 'list small' }, dry.list.slice(0, 40).map((x) => h('div', { class: 'row' }, h('span', { class: 'grow' }, x.a + ' vs ' + x.b), h('span', { class: 'muted' }, [x.when.replace('T', ' '), x.court].filter(Boolean).join(' • '))))) : null,
+      dry.source && dry.source !== 'sheet' ? h('p', { class: 'muted small' }, 'Read from the ' + (dry.source === 'docx' ? 'Word' : 'PowerPoint') + ' file’s tables and “… vs …” lines.') : null,
       dry.errors.length ? h('div', { class: 'warnbox small' }, h('b', {}, dry.errors.length + ' row(s) will be skipped:'), rowsTxt(dry.errors)) : null,
       dry.warnings.length ? h('details', { class: 'small' }, h('summary', {}, dry.warnings.length + ' note(s) – those fixtures are still added'), rowsTxt(dry.warnings)) : null),
       [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, dry.made ? { label: 'Import ' + dry.made, fn: async () => { const r = await send(buf, false); toast(r.made + ' fixtures added' + (r.scored ? ', ' + r.scored + ' with results' : '')); await refresh(); } } : null].filter(Boolean));
   }) });
+  /* a picture / PDF (or a document without fixtures): show it to everyone as the game's fixture chart */
+  const chartOffer = (f, why) => modal('Attach as a fixture chart?', h('div', {}, h('p', { class: 'small' }, why + ' Attach “' + f.name + '” to ' + ev.name + ' so everyone can see it on the Fixtures tab and the dashboard?'),
+    h('p', { class: 'muted small' }, 'To get live scores and standings, also add the matches with “+ Fixture” or an Excel / Word sheet.')),
+    [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, { label: '📎 Attach', fn: () => attachChart(ev, f) }]);
+  const chartPick = h('input', { type: 'file', hidden: true, accept: 'image/*,.pdf,.docx,.pptx,.xlsx', onchange: guard(async (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) { box.close(); await attachChart(ev, f); } }) });
   const box = modal('⬆ Upload fixtures – ' + ev.name, h('div', {},
-    h('p', { class: 'small' }, 'Fixtures you have already made (Excel or CSV), one row per match. The sheet only needs ', h('b', {}, (ev.sideType === 'team' ? 'Team' : 'Player') + ' A'), ' and ', h('b', {}, (ev.sideType === 'team' ? 'Team' : 'Player') + ' B'), ' columns – the game is this one.'),
+    h('p', { class: 'small' }, 'Fixtures you have already made – Excel, CSV, Word or PowerPoint – become real matches (live scores, standings). Pictures and PDFs are attached as a fixture chart for everyone to see.'),
+    h('p', { class: 'small' }, 'Excel / CSV: one row per match. The sheet only needs ', h('b', {}, (ev.sideType === 'team' ? 'Team' : 'Player') + ' A'), ' and ', h('b', {}, (ev.sideType === 'team' ? 'Team' : 'Player') + ' B'), ' columns – the game is this one.'),
     h('ul', { class: 'small' }, h('li', {}, 'Optional columns: Round, Group, Date, Time, Court, Referee.'), h('li', {}, 'Names are matched to this game’s players; a unique first name works too. Doubles: “Asha & Meena”.'),
       h('li', {}, 'Score (optional), e.g. 11-7, 9-11, 11-5 – entered only when a chief referee uploads.'), h('li', {}, 'Matches already in the app are not duplicated; you see a preview first.')),
     h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: guard(() => downloadWith('/api/admin/events/' + ev.id + '/fixtures-template.xlsx', 'fixtures-' + ev.name.replace(/\W+/g, '-') + '.xlsx')) }, '⬇ Template'), pick,
-      h('button', { class: 'btn', onclick: () => pick.click() }, '⬆ Choose file'))));
+      h('button', { class: 'btn', onclick: () => pick.click() }, '⬆ Choose file')),
+    h('p', { class: 'small' }, h('b', {}, 'Word / PowerPoint: '), 'a table with Player A and Player B columns, or lines like “Raja vs Manjesh – 29/11 10:30 Table 2”.'),
+    h('hr'), h('b', {}, '📎 Fixture chart'), h('p', { class: 'muted small' }, 'Just want to show a picture, PDF or document of the schedule? Attach it – it appears on the Fixtures tab and the dashboard.'),
+    h('div', { class: 'actions' }, chartPick, h('button', { class: 'btn ghost', onclick: () => chartPick.click() }, '📎 Attach fixture chart'))));
+}
+const CHART_TYPES = { pdf: 'application/pdf', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
+async function attachChart(ev, f) {
+  let body = f, type = f.type || CHART_TYPES[(f.name.split('.').pop() || '').toLowerCase()] || '';
+  /* phone photos (HEIC etc.) and big pictures: turned into a JPG the browser can show */
+  if (/^image\//.test(type) && (!['image/jpeg', 'image/png', 'image/webp'].includes(type) || f.size > 4e6)) { body = await resizeImage(f, 2400, 'image/jpeg'); type = 'image/jpeg'; }
+  if (f.size > 25e6 && !/^image\//.test(type)) throw new Error('That file is too large (max 25 MB).');
+  const r = await fetch('/api/admin/events/' + ev.id + '/fixture-docs?name=' + encodeURIComponent(f.name), { method: 'POST', headers: { 'x-token': me.token, 'Content-Type': type }, body });
+  const j = await r.json(); if (!r.ok) throw new Error(j.error || 'Upload failed');
+  toast('Fixture chart attached'); await refresh();
 }
 function resetDrawFlow(ev) {
   const go = (force) => api('POST', '/api/admin/events/' + ev.id + '/reset-draw', { force }).then(async (r) => { toast(r.removed + ' fixtures removed'); await refresh(); });
