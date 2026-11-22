@@ -2036,6 +2036,30 @@ async function route(req, res, url) {
     if (m === 'DELETE') { T.guidelines = T.guidelines.filter((x) => x !== g); audit(user.name, 'removed guidelines', T.name + ' – ' + g.sport); save(); broadcast(); return json(res, 200, { ok: true }); }
     throw new HttpError(405, 'Method not allowed');
   }
+  /* A referee nominates themselves for a match that has no referee yet (their sport, not their own match) – or withdraws */
+  if ((mt = p.match(/^\/api\/staff\/matches\/([\w-]+)\/(take|release)$/)) && m === 'POST') {
+    if (!user || !user.refId) throw new HttpError(401, 'Sign in as a referee.');
+    const match = find('matches', mt[1]); if (!match) throw new HttpError(404, 'Match not found');
+    const ev = find('events', match.eventId), T = ev && tour(ev.tid), r = find('referees', user.refId);
+    if (!ev || !r || r.status === 'pending') throw new HttpError(403, 'Your referee role is not active.');
+    if (T && T.status === 'closed') throw new HttpError(409, T.name + ' is closed.');
+    const st = Engine.derive(match, ev).status;
+    if (match.cancelled || st === 'completed') throw new HttpError(409, 'This match is ' + (match.cancelled ? 'cancelled' : 'already completed') + '.');
+    match.refereeIds = match.refereeIds || [];
+    if (mt[2] === 'take') {
+      if (r.kind === 'volunteer') throw new HttpError(403, 'Volunteers do not referee matches.');
+      if (!refFor(r, ev)) throw new HttpError(403, 'You are not mapped to ' + sportName(ev.sport) + '.');
+      if (user.personId && inMatch(user.personId, match)) throw new HttpError(403, 'You (or your team) play in this match, so you cannot referee it.');
+      if (match.refereeIds.includes(r.id)) return json(res, 200, { ok: true });
+      if (match.refereeIds.length) throw new HttpError(409, 'Another referee has already taken this match.');
+      match.refereeIds.push(r.id); audit(r.name, 'took match as referee', ev.name + (match.no ? ' #' + match.no : ''), match.id);
+    } else {
+      if (!match.refereeIds.includes(r.id)) return json(res, 200, { ok: true });
+      if (st === 'live') throw new HttpError(409, 'The match has started – ask the organizer to change the referee.');
+      match.refereeIds = match.refereeIds.filter((x) => x !== r.id); audit(r.name, 'withdrew as referee', ev.name + (match.no ? ' #' + match.no : ''), match.id);
+    }
+    save(); broadcast(); return json(res, 200, { ok: true });
+  }
   if (p === '/api/staff/friendly' && m === 'POST') {
     if (!isStaffU(user)) throw new HttpError(401, 'Sign in to start a match.');
     const b = await readJson(req, 4000);

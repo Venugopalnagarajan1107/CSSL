@@ -267,3 +267,11 @@ a.card,a.row,a.grow,a.chip,.list a,.ev-top a,.tbl.rank td a{color:inherit;text-d
 .tbl.dash-st tr.top1 td{background:color-mix(in srgb,#f5c518 14%,transparent)}
 .tbl.dash-st tr.top2 td{background:color-mix(in srgb,#b8c2cc 16%,transparent)}
 .tbl.dash-st tr.top3 td{background:color-mix(in srgb,#cd7f32 14%,transparent)}
+/* Personal dashboard */
+.dash-me{display:flex;align-items:center;gap:12px}
+.dash-row{cursor:pointer;align-items:flex-start}
+.dash-row .actions{margin:6px 0 0}
+.dr-res{text-align:right;display:flex;flex-direction:column;align-items:flex-end;gap:2px;min-width:72px}
+.dash-pos{width:36px;text-align:center;font-size:22px;font-weight:700;flex:none}
+.dash-pts{white-space:nowrap}
+.dr-res .res{display:inline-grid;place-items:center;width:30px;height:30px;border-radius:8px;font-weight:800;font-size:14px}
