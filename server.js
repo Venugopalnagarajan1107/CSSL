@@ -2375,7 +2375,9 @@ async function route(req, res, url) {
     /* Look at every sheet of an uploaded workbook: which ones hold players, and how their columns map. */
     if (p === '/api/admin/import-inspect' && m === 'POST') {
       const wb = await loadWorkbook(await readBody(req, 5e6));
-      const evs = db.events.filter((e) => e.tid === tidOf(url.searchParams.get('tid')));
+      const master = url.searchParams.get('tid') === 'none';   /* master player list: players only, no event */
+      if (master && isLead(user)) throw new HttpError(403, 'Only a main admin uploads to the master player list.');
+      const evs = master ? [] : db.events.filter((e) => e.tid === tidOf(url.searchParams.get('tid')));
       return json(res, 200, {
         fields: SheetImport.FIELDS.map((f) => ({ key: f.key, label: f.label })),
         sheets: wb.worksheets.map((ws, i) => ({ index: i, ...SheetImport.inspectSheet(ws, evs) })),
@@ -2383,10 +2385,14 @@ async function route(req, res, url) {
     }
     if (p === '/api/admin/import-players' && m === 'POST') {
       const wb = await loadWorkbook(await readBody(req, 5e6));
-      const impTid = tidOf(url.searchParams.get('tid')), impT = tour(impTid);
-      if (impT.status === 'closed') throw new HttpError(409, impT.name + ' is closed.');
-      const evs = db.events.filter((e) => e.tid === impTid);
-      const fullPlan = importPlan(wb, req.headers['x-import-options'], evs);
+      const master = url.searchParams.get('tid') === 'none';   /* master player list: add / update profiles only – no event, games, teams or fixtures */
+      if (master && isLead(user)) throw new HttpError(403, 'Only a main admin uploads to the master player list.');
+      const impTid = master ? '' : tidOf(url.searchParams.get('tid')), impT = master ? null : tour(impTid);
+      if (impT && impT.status === 'closed') throw new HttpError(409, impT.name + ' is closed.');
+      const evs = master ? [] : db.events.filter((e) => e.tid === impTid);
+      const plan0 = importPlan(wb, req.headers['x-import-options'], evs);
+      const fullPlan = master ? plan0.filter((x) => x.kind === 'players') : plan0;
+      const masterSkipped = master ? plan0.filter((x) => x.kind !== 'players').map((x) => x.ws.name) : [];
       const preview = url.searchParams.get('dry') === '1';
       /* A preview runs the real import on the live data and then puts the data back exactly as it was. */
       const snap = preview ? JSON.stringify({ players: db.players, teams: db.teams, events: db.events, matches: db.matches, tournaments: db.tournaments, nextPlayerNo: db.nextPlayerNo }) : null;
@@ -2434,13 +2440,15 @@ async function route(req, res, url) {
               pl.status = 'approved'; pl.profilePublic = false; pl.dupOf = dupCandidates(pl); if (pl.dupOf.length) flagged++;
               db.players.push(pl); seen.set(key, pl); made.push(pl.id); isNew = true; created++;
             }
-            addRoster(impTid, [pl.id]);
+            if (!master) addRoster(impTid, [pl.id]);
             let pp = plans.get(pl.id);
             if (!pp) plans.set(pl.id, (pp = { pl, existed: !made.includes(pl.id), sheet: sh.ws.name, want: new Set(), covered: new Set(), set: {}, old: {} }));
             rowEvs.forEach((e) => pp.want.add(e.id));
-            (sh.sportCols || []).forEach((c) => pp.covered.add(c.sport));
-            (sh.eventCols || []).forEach((c) => { const e = find('events', c.eventId); if (e) pp.covered.add(e.sport); });
-            if (sh.map && sh.map.games) pp.covered.add('*');
+            if (!master) {   /* the master list never changes anyone's games */
+              (sh.sportCols || []).forEach((c) => pp.covered.add(c.sport));
+              (sh.eventCols || []).forEach((c) => { const e = find('events', c.eventId); if (e) pp.covered.add(e.sport); });
+              if (sh.map && sh.map.games) pp.covered.add('*');
+            }
             if (pp.existed) {   // latest sheet wins for every detail it provides
               FIELDS.forEach((k) => { const v = String(x[k] || '').slice(0, k === 'email' ? 80 : 60).trim(); if (v) pp.set[k] = v; });
               if (x.section !== pl.section) pp.set.section = x.section;
@@ -2450,7 +2458,7 @@ async function route(req, res, url) {
             const mine = rowEvs.filter((e) => (e.section || 'adults') === sec);
             if (!dry) {
               let t = null;
-              if (x.team) { t = db.teams.find((q) => q.name.toLowerCase() === x.team.toLowerCase() && q.section === sec && q.tid === impTid); if (!t) { t = COLS.teams({ name: x.team, section: sec, memberIds: [], tid: impTid }, null); db.teams.push(t); stat.teamsMade++; } if (!t.memberIds.includes(pl.id)) t.memberIds.push(pl.id); }
+              if (x.team && !master) { t = db.teams.find((q) => q.name.toLowerCase() === x.team.toLowerCase() && q.section === sec && q.tid === impTid); if (!t) { t = COLS.teams({ name: x.team, section: sec, memberIds: [], tid: impTid }, null); db.teams.push(t); stat.teamsMade++; } if (!t.memberIds.includes(pl.id)) t.memberIds.push(pl.id); }
               mine.forEach((e) => {
                 if (e.sideType !== 'team') { if (!e.participantIds.includes(pl.id)) { e.participantIds.push(pl.id); stat.games++; } return; }
                 if (t) { if (!e.participantIds.includes(t.id)) { e.participantIds.push(t.id); stat.teamEntries++; } stat.games++; }
@@ -2507,7 +2515,8 @@ async function route(req, res, url) {
       delete extra.rowsBySheet;
       void nextNo;
       if (!preview) { audit(user.name, 'imported from Excel', [created + ' players added', updated + ' updated', extra.gamesMade ? extra.gamesMade + ' games' : '', extra.teamsCreated || extra.teamsUpdated ? (extra.teamsCreated || 0) + ' teams made, ' + (extra.teamsUpdated || 0) + ' updated' : '', extra.fixturesMade ? extra.fixturesMade + ' fixtures' : '', errors.length + ' skipped'].filter(Boolean).join(', ')); save(); broadcast(); }
-      return json(res, 200, { created, updated, changed, removedGames, flagged, merged, errors, warnings, dryRun: preview, sheets: perSheet, ...totals, ...extra });
+      masterSkipped.forEach((n) => warnings.push({ name: n, error: 'not a players sheet – games, teams and fixtures are uploaded from 🏆 Event → Players' }));
+      return json(res, 200, { created, updated, changed, removedGames, flagged, merged, errors, warnings, dryRun: preview, sheets: perSheet, master, ...totals, ...extra });
       } finally { if (preview) Object.assign(db, JSON.parse(snap)); }
     }
     /* ---- teams under an event: create one from the event's players and pick the team games it plays ---- */
@@ -2846,6 +2855,20 @@ async function route(req, res, url) {
     }
     /* Delete the matches an organizer ticked (one, several or all) – one Trash item restores them all. */
     /* Delete player profiles in bulk – only people who never played and hold no role (duplicates, test entries). Each goes to Trash. */
+    /* Delete several teams or referees at once. Teams that already have matches, and anything you do not manage, are kept and named. Each goes to Trash. */
+    if ((mm = p.match(/^\/api\/admin\/(teams|referees)\/bulk-delete$/)) && m === 'POST') {
+      const col = mm[1], b = await readJson(req, 200000), done = [], kept = [];
+      if (col === 'referees' && isLead(user)) throw new HttpError(403, 'Only a main admin removes referees.');
+      for (const id of [...new Set((Array.isArray(b.ids) ? b.ids : []).map(String))].slice(0, 2000)) {
+        const x = find(col, id); if (!x) continue;
+        if (col === 'teams' && x.tid && !canTour(user, x.tid)) { kept.push(x.name + ' (not your event)'); continue; }
+        if (col === 'teams' && db.matches.some((m2) => [...m2.sideA, ...m2.sideB].includes(id))) { kept.push(x.name + ' (has matches)'); continue; }
+        const snap = snapshot(col, id); cascadeDelete(col, id); pushTrash(snap); done.push(x.name);
+      }
+      if (!done.length && !kept.length) throw new HttpError(400, 'Select at least one.');
+      if (done.length) { audit(user.name, 'deleted ' + col, done.length + ': ' + done.slice(0, 20).join(', ') + ' – in Trash'); save(); broadcast(); }
+      return json(res, 200, { ok: true, removed: done.length, kept });
+    }
     if (p === '/api/admin/players/bulk-delete' && m === 'POST') {
       if (isLead(user)) throw new HttpError(403, 'Only a main admin deletes player profiles.');
       const b = await readJson(req, 200000), done = [], kept = [];

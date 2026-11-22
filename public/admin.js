@@ -4,14 +4,22 @@
 /* Tick the sports a referee covers. */
 const sportChecks = (sel) => checkList(['badminton', 'tt', 'carrom', 'chess'].map((k) => ({ id: k, name: SPORT_ICON[k] + ' ' + SPORT_LABEL[k] })), sel || []);
 /* Select players (one, several or all) – a sticky bar with the count, Select all, the action and Done. */
-function playerSelBar(shown, actionLabel, onAction, eligible) {
-  const ok = shown.filter((p) => !eligible || eligible(p));
-  if (!ui.pickP) return h('div', { class: 'actions noprint' }, h('button', { class: 'btn ghost sm', onclick: () => { ui.pickP = new Set(); render(); } }, '☑ Select players'));
-  const ids = new Set(ok.map((p) => p.id)), sel = [...ui.pickP].filter((id) => ids.has(id)), all = ok.length > 0 && sel.length === ok.length;
-  return h('div', { class: 'selbar noprint' }, h('b', {}, sel.length + ' of ' + ok.length + ' selected'),
-    h('button', { class: 'btn ghost sm', disabled: !ok.length, onclick: () => { ok.forEach((p) => (all ? ui.pickP.delete(p.id) : ui.pickP.add(p.id))); render(); } }, all ? 'Select none' : 'Select all (' + ok.length + ')'),
-    h('button', { class: 'btn sm danger', disabled: !sel.length, onclick: () => onAction(sel) }, actionLabel + (sel.length ? ' (' + sel.length + ')' : '')),
+/* Select one, several or all items of a list (players, teams, referees) – a sticky bar with the count, Select all, the actions and Done.
+   actions: [{ label, fn(selectedIds), cls }] */
+function pickBar(shown, actions, noun) {
+  noun = noun || 'players';
+  if (!shown.length) return null;
+  if (!ui.pickP) return h('div', { class: 'actions noprint' }, h('button', { class: 'btn ghost sm', onclick: () => { ui.pickP = new Set(); render(); } }, '☑ Select ' + noun));
+  const ids = new Set(shown.map((p) => p.id)), sel = [...ui.pickP].filter((id) => ids.has(id)), all = sel.length === shown.length;
+  return h('div', { class: 'selbar noprint' }, h('b', {}, sel.length + ' of ' + shown.length + ' selected'),
+    h('button', { class: 'btn ghost sm', onclick: () => { shown.forEach((p) => (all ? ui.pickP.delete(p.id) : ui.pickP.add(p.id))); render(); } }, all ? 'Select none' : 'Select all (' + shown.length + ')'),
+    actions.filter(Boolean).map((a) => h('button', { class: 'btn sm ' + (a.cls || 'danger'), disabled: !sel.length, onclick: () => a.fn(sel) }, a.label + (sel.length ? ' (' + sel.length + ')' : ''))),
     h('button', { class: 'btn ghost sm', onclick: () => { ui.pickP = null; render(); } }, 'Done'));
+}
+/* "3 deleted, 2 kept" – with the reasons for the ones that were kept. */
+function keptReport(r, verb, why) {
+  if (r.kept && r.kept.length) modal(r.removed + ' ' + verb + ', ' + r.kept.length + ' kept', h('div', {}, h('p', { class: 'small' }, why), h('ul', {}, r.kept.map((x) => h('li', {}, x)))), [{ label: 'OK', fn: () => {} }]);
+  else toast(r.removed + ' ' + verb + ' – restore from Admin → Trash');
 }
 const pickBox = (p, enabled) => h('input', { type: 'checkbox', class: 'pick', checked: ui.pickP.has(p.id), disabled: !enabled, 'aria-label': 'Select ' + p.name, onclick: (e) => e.stopPropagation(), onchange: (e) => { if (e.target.checked) ui.pickP.add(p.id); else ui.pickP.delete(p.id); render(); } });
 /* Has this person played (a match, a line-up, a team that played, or results from a past season)? Their profile is then permanent. */
@@ -20,6 +28,42 @@ function playedSet() {
   SA.matches.forEach((m) => { [...(m.sideA || []), ...(m.sideB || [])].forEach(add); (m.rubbers || []).forEach((r) => [...(r.sideA || []), ...(r.sideB || [])].forEach((x) => set.add(x))); JSON.stringify([m.lineupA || '', m.lineupB || '']).replace(/"([\w-]{6,})"/g, (_, id) => set.add(id)); });
   (SA.seasons || []).forEach((x) => Object.keys(x.records || {}).forEach((id) => set.add(id)));
   return set;
+}
+/* The master player list (everyone, in or outside events): search, select one / several / all, edit, add to an event,
+   delete profiles of people who never played, and upload a player sheet straight into the list. */
+function masterPlayers(inAdmin) {
+  const q = ui.pq || '', admin = isAdmin(), main = isOrganizer();
+  const shown = SA.players.filter((p) => (p.section || 'adults') === ui.section && p.name.toLowerCase().includes(q)).sort((a, b) => a.name.localeCompare(b.name));
+  const played = playedSet(), picking = !!ui.pickP && admin;
+  const eventsOf1 = (p) => realTours().filter((t) => (t.playerIds || []).includes(p.id)).map((t) => t.name + (t.status === 'closed' ? ' (closed)' : ''));
+  const search = h('input', { class: 'search', type: 'search', value: q, 'aria-label': 'Search players', placeholder: 'Search ' + SA.players.length + ' players…',
+    oninput: (e) => { ui.pq = e.target.value.toLowerCase(); clearTimeout(masterPlayers.t); masterPlayers.t = setTimeout(() => { render(); const x = document.querySelector('input.search'); if (x) { x.focus(); x.setSelectionRange(x.value.length, x.value.length); } }, 250); } });
+  const addToEvent = (ids) => {
+    const open = realTours().filter((t) => t.status !== 'closed' && canManageTour(t));
+    if (!open.length) return toast('No open event you organize', true);
+    const pick = sel(open.map((t) => [t.id, t.name]), curTid());
+    modal('Add ' + ids.length + ' player' + (ids.length === 1 ? '' : 's') + ' to an event', h('div', {}, field('Event', pick), h('p', { class: 'muted small' }, 'They join the event’s player list. Then put them in games from the game’s settings, or let them choose when registering.')),
+      [{ label: 'Cancel', cls: 'ghost', fn: () => {} }, { label: 'Add', fn: async () => { const r = await api('POST', '/api/admin/tournaments/' + pick.value + '/roster', { add: ids }); ui.pickP = null; toast(r.added + ' added to ' + tourById(pick.value).name); await refresh(); } }]);
+  };
+  const del = (sel) => confirmBox('Delete ' + sel.length + ' player profile' + (sel.length === 1 ? '' : 's') + '? Only people who never played a match and hold no role are deleted (duplicates, test entries) – everyone else stays for good. Deleted profiles go to Admin → Trash for 30 days.',
+    guard(async () => { const r = await api('POST', '/api/admin/players/bulk-delete', { ids: sel }); ui.pickP = null; await refresh(); keptReport(r, 'deleted', 'These profiles are permanent:'); }), 'Delete');
+  const rows = shown.map((p) => {
+    const st = playerStats(p.id).totals, evs = eventsOf1(p);
+    const body = [avatar(p, 40), h('div', { class: 'grow' }, h('b', {}, p.name, played.has(p.id) ? h('span', { class: 'muted small', title: 'Has played – profile is permanent' }, ' 🏅') : null),
+      h('div', { class: 'muted small' }, [p.status === 'pending' ? '⏳ Pending approval' : '', p.ageGroup, st.played + ' played', st.won + ' won'].filter(Boolean).join(' • ')),
+      admin ? h('div', { class: 'muted small' }, evs.length ? '🏆 ' + evs.join(', ') : 'Not in any event') : null)];
+    return picking ? h('div', { class: 'row' }, pickBox(p, true), ...body)
+      : h('a', { class: 'row', href: '#/player/' + p.id }, ...body, admin ? cardBtn('✏️', 'Edit', () => playerModal(p)) : null);
+  });
+  return h('div', {},
+    inAdmin ? null : h('h1', {}, 'Players'),
+    h('p', { class: 'muted small' }, 'Everyone who has ever joined – inside or outside an event. Profiles of people who have played are kept for good.'),
+    admin ? h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: () => playerModal(null, ui.section) }, '+ New player'),
+      main ? h('button', { class: 'btn ghost', onclick: () => { ui.showUpload = !ui.showUpload; render(); } }, ui.showUpload ? '✕ Close upload' : '⬆ Upload players (Excel)') : null) : null,
+    admin && main && ui.showUpload ? importCard(true) : null,
+    sectionTabs(), search,
+    admin ? pickBar(shown, [{ label: '➕ Add to event', cls: 'ghost', fn: addToEvent }, main ? { label: '🗑 Delete', fn: del } : null]) : null,
+    rows.length ? h('div', { class: 'list' }, rows) : h('p', { class: 'empty' }, SA.players.length ? 'No players match.' : 'No players yet.'));
 }
 const checkList = (items, selected) => {
   const boxes = items.map((it) => ({ it, cb: h('input', { type: 'checkbox', checked: selected.includes(it.id), 'aria-label': it.name }) }));
@@ -118,9 +162,11 @@ function eventTeams(T) {
     mine && T.status !== 'closed' ? h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: () => eventTeamModal(T, null) }, '+ New team'), !teamGames.length ? h('span', { class: 'muted small' }, 'Tip: add a team game first (Games → + New game → Team).') : null) : null,
     teamGames.map((ev) => { const placed = new Set(ev.participantIds.flatMap((id) => (byId('teams', id) || { memberIds: [] }).memberIds)); const w = (ev.interestedIds || []).filter((id) => !placed.has(id)).length;
       return w && mine ? h('a', { class: 'card tip', href: '#/event/' + ev.id, onclick: () => { ui.eventTab[ev.id] = 'people'; } }, '🙋 ' + w + ' players chose ' + ev.name + ' and are waiting for a team – build or auto-make teams ›') : null; }),
-    S.teams.length ? groupBySection(S.teams, (t) => h('div', { class: 'row', onclick: () => (mine ? eventTeamModal(T, t) : null) }, h('div', { class: 'grow' }, h('b', {}, t.name),
+    mine && T.status !== 'closed' ? pickBar(S.teams, [{ label: '🗑 Delete teams', fn: (sel) => confirmBox('Delete ' + sel.length + ' team' + (sel.length === 1 ? '' : 's') + '? They leave their games; the players stay in the event. Teams that already have matches are kept. Deleted teams go to Trash for 30 days.',
+      guard(async () => { const r = await api('POST', '/api/admin/teams/bulk-delete', { ids: sel }); ui.pickP = null; await refresh(); keptReport(r, 'deleted', 'Delete their matches first:'); }), 'Delete') }], 'teams') : null,
+    S.teams.length ? groupBySection(S.teams, (t) => h('div', { class: 'row', onclick: () => (ui.pickP ? null : mine ? eventTeamModal(T, t) : null) }, ui.pickP && mine ? pickBox(t, true) : null, h('div', { class: 'grow' }, h('b', {}, t.name),
       h('div', { class: 'muted small' }, t.memberIds.map((i) => (byId('players', i) || {}).name).filter(Boolean).join(', ') || 'No players yet'),
-      h('div', { class: 'small' }, '🏆 ' + (gamesOf(t).join(', ') || 'not in a game yet'))), mine ? h('span', { class: 'muted' }, 'Edit') : null))
+      h('div', { class: 'small' }, '🏆 ' + (gamesOf(t).join(', ') || 'not in a game yet'))), mine && !ui.pickP ? h('span', { class: 'muted' }, '✏️ Edit') : null))
       : h('p', { class: 'empty' }, 'No teams yet.'));
 }
 function eventTeamModal(T, t) {
@@ -143,12 +189,13 @@ function eventTeamModal(T, t) {
 /* Event → Players: the event's roster. Players join by registering, an uploaded list, or being enrolled by an organizer. */
 function eventPlayers(T) {
   const mine = canManageTour(T), R = S.registration || {};
-  let q = '';
+  let q = ui.pq || '';
   const list = h('div', { class: 'list' });
   const shown = () => S.players.filter((p) => (T.playerIds || []).includes(p.id) && p.name.toLowerCase().includes(q)).sort((a, b) => a.name.localeCompare(b.name));
   const picking = !!ui.pickP && mine && T.status !== 'closed';
   const draw = () => list.replaceChildren(...shown().map((p) =>
     h('div', { class: 'row' }, picking ? pickBox(p, true) : null, avatar(p, 32), h('a', { class: 'grow', href: '#/player/' + p.id }, h('b', {}, p.name), h('div', { class: 'muted small' }, [SEC[p.section || 'adults'], S.events.filter((e) => e.participantIds.includes(p.id) || (e.interestedIds || []).includes(p.id)).map((e) => e.name).join(', ') || 'no games yet'].join(' • '))),
+      isAdmin() && !picking ? h('button', { class: 'btn ghost sm', 'aria-label': 'Edit ' + p.name, onclick: () => playerModal(p) }, '✏️ Edit') : null,
       mine && T.status !== 'closed' && !picking ? h('button', { class: 'btn ghost sm', 'aria-label': 'Remove ' + p.name + ' from ' + T.name, onclick: () => confirmBox('Remove ' + p.name + ' from ' + T.name + '? Their profile stays in the player database.', guard(async () => { await api('POST', '/api/admin/tournaments/' + T.id + '/roster', { remove: p.id }); await refresh(); }), 'Remove') }, '✕') : null)));
   draw();
   return h('div', {},
@@ -157,11 +204,11 @@ function eventPlayers(T) {
         h('div', { class: 'actions' }, h('a', { class: 'btn ghost sm', href: '#/admin', onclick: () => { ui.adminTab = 'registration'; } }, 'Settings & approvals ›'), R.open ? copyBtn(BASE() + '/#/register/' + T.id, 'Copy registration link') : null)),
       importCard(),
       h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: () => enrolModal(T) }, '➕ Enrol existing player'), h('button', { class: 'btn ghost', onclick: () => playerModal(null, ui.section) }, '+ New player'))) : null,
-    h('input', { class: 'search', type: 'search', placeholder: 'Search ' + (T.playerIds || []).length + ' players…', 'aria-label': 'Search players', oninput: (e) => { q = e.target.value.toLowerCase(); draw(); } }),
-    mine && T.status !== 'closed' && (T.playerIds || []).length ? playerSelBar(shown(), '✕ Remove from event', (sel) => confirmBox('Remove ' + sel.length + ' player' + (sel.length === 1 ? '' : 's') + ' from ' + T.name + ' (and its games and teams)? Their profiles, history and other events stay. Players who already have fixtures here are skipped.',
+    h('input', { class: 'search', type: 'search', value: q, placeholder: 'Search ' + (T.playerIds || []).length + ' players…', 'aria-label': 'Search players', oninput: (e) => { q = ui.pq = e.target.value.toLowerCase(); draw(); } }),
+    mine && T.status !== 'closed' ? pickBar(shown(), [{ label: '✕ Remove from event', fn: (sel) => confirmBox('Remove ' + sel.length + ' player' + (sel.length === 1 ? '' : 's') + ' from ' + T.name + ' (and its games and teams)? Their profiles, history and other events stay. Players who already have fixtures here are skipped.',
       guard(async () => { const r = await api('POST', '/api/admin/tournaments/' + T.id + '/roster', { remove: sel }); ui.pickP = null; await refresh();
         if (r.skipped.length) modal(r.removed + ' removed, ' + r.skipped.length + ' kept', h('div', {}, h('p', { class: 'small' }, 'These players already have fixtures in this event. Delete those fixtures (or use Withdraw / replace in the game) first:'), h('ul', {}, r.skipped.map((x) => h('li', {}, x)))), [{ label: 'OK', fn: () => {} }]);
-        else toast(r.removed + ' removed from ' + T.name); }), 'Remove')) : null,
+        else toast(r.removed + ' removed from ' + T.name); }), 'Remove') }]) : null,
     list, !(T.playerIds || []).length ? h('p', { class: 'empty' }, 'No players in this event yet. They register, are uploaded, or are enrolled.') : null);
 }
 function enrolModal(T) {
@@ -645,7 +692,7 @@ Views.admin = () => {
   const R = S.registration || {};
   const tabs = [['setup', 'Setup'], ['registration', 'Registration' + (R.pending ? ' (' + R.pending + ')' : '')], ['broadcast', 'Announce'], ['safety', 'Event day'], ['reach', 'Reachability'], ['players', 'Players'], ...(isOrganizer() ? [['people', 'People & roles']] : []), ['sponsors', 'Sponsors'], ['disputes', 'Reports' + (S.openDisputes ? ' (' + S.openDisputes + ')' : '')], ['trash', 'Trash'], ['data', 'Data']];
   const t = tabs.some(([k]) => k === ui.adminTab) ? ui.adminTab : 'setup';
-  return h('div', {}, h('h1', {}, 'Admin'), h('a', { class: 'card tip', href: '#/season' }, '🏆 Games, teams, organizers and referees are set up under ', h('b', {}, 'Event'), ' – pick the event at the top of that page ›'), h('div', { class: 'seg scroll' }, tabs.map(([k, l]) => h('button', { class: t === k ? 'on' : '', onclick: () => { ui.adminTab = k; render(); } }, l))), adminTabs[t]());
+  return h('div', {}, h('h1', {}, 'Admin'), h('a', { class: 'card tip', href: '#/season' }, '🏆 Games, teams, organizers and referees are set up under ', h('b', {}, 'Event'), ' – pick the event at the top of that page ›'), h('div', { class: 'seg scroll' }, tabs.map(([k, l]) => h('button', { class: t === k ? 'on' : '', onclick: () => { ui.adminTab = k; ui.pickP = null; render(); } }, l))), adminTabs[t]());
 };
 
 function rolesModal(x, done) {
@@ -708,20 +755,7 @@ const adminTabs = {
         h('button', { class: 'btn', onclick: guard(async () => { await api('POST', '/api/admin/pin', { pin: pin.value }); pin.value = ''; toast('PIN changed'); }) }, 'Change PIN')),
       isOrganizer() ? h('a', { class: 'btn ghost', href: '#/season/organizers' }, '👔 Organizers & sign-out of lost phones ›') : null);
   },
-  players() {
-    const played = ui.pickP ? playedSet() : new Set(), roles = new Set([...(SA.referees || []).map((r) => r.playerId), ...(SA.organizers || []).map((a) => a.playerId)].filter(Boolean));
-    const canDel = (p) => !played.has(p.id) && !roles.has(p.id);
-    return h('div', {},
-      h('a', { class: 'card tip', href: '#/season/players' }, '➕ To add players, upload a player list or enrol someone, open ', h('b', {}, '🏆 Event → Players'), ' for ' + curT().name + '. Every player who joins an event stays in this database for good.'),
-      isOrganizer() && S.players.length ? (() => {
-        return h('div', {}, ui.pickP ? h('p', { class: 'muted small' }, 'Only players who never played a match and hold no role can be deleted (duplicates, test entries). Anyone with results stays for good. Deleted profiles go to Trash for 30 days.') : null,
-          playerSelBar(S.players, '🗑 Delete profiles', (sel) => confirmBox('Delete ' + sel.length + ' player profile' + (sel.length === 1 ? '' : 's') + '? They are removed from every event and go to Admin → Trash for 30 days.', guard(async () => {
-            const r = await api('POST', '/api/admin/players/bulk-delete', { ids: sel }); ui.pickP = null; await refresh();
-            if (r.kept.length) modal(r.removed + ' deleted, ' + r.kept.length + ' kept', h('div', {}, h('p', { class: 'small' }, 'These profiles are permanent:'), h('ul', {}, r.kept.map((x) => h('li', {}, x)))), [{ label: 'OK', fn: () => {} }]); else toast(r.removed + ' deleted – restore from Trash'); }), 'Delete'),
-            canDel)); })() : null,
-      groupBySection(S.players, (p) => h('div', { class: 'row', onclick: () => (ui.pickP ? null : playerModal(p)) }, ui.pickP ? (canDel(p) ? pickBox(p, true) : h('span', { class: 'chip plain', title: played.has(p.id) ? 'Has played – permanent' : 'Has an admin / referee role' }, played.has(p.id) ? '🏅' : '🛡')) : null, avatar(p, 32), h('div', { class: 'grow' }, h('b', {}, p.name), h('div', { class: 'muted small' }, [p.ageGroup, realTours().filter((t) => (t.playerIds || []).includes(p.id)).map((t) => t.name).join(', ')].filter(Boolean).join(' • '))), h('span', { class: 'muted' }, 'Edit'))),
-      !S.players.length ? h('p', { class: 'empty' }, 'No players yet.') : null);
-  },
+  players() { return masterPlayers(true); },
   people() {
     if (!isOrganizer()) return h('p', { class: 'empty' }, 'Only a main admin manages people and roles.');
     const box = h('div', {}, h('p', { class: 'muted' }, 'Loading…'));
@@ -802,10 +836,11 @@ function adminsCard() {
 /* Excel import of players, their games and teams (shared by Registration, Players and Safety screens).
    Step 1: the server inspects every sheet. Step 2: the admin picks sheets and checks the column mapping.
    Step 3: preview (dry run). Step 4: import. */
-function importCard() {
+function importCard(master) {
+  const tidQ = master ? 'none' : curTid();
   const imp = h('input', { type: 'file', accept: '.xlsx,.csv,.tsv,.txt', hidden: true, onchange: guard(async (e) => {
     const f = e.target.files[0]; if (!f) return; const buf = await f.arrayBuffer(); e.target.value = '';
-    const send = (path, q, opts) => fetch(path + '?tid=' + encodeURIComponent(curTid()) + (q ? '&' + q.replace(/^\?/, '') : ''), { method: 'POST', headers: { 'x-token': me.token, 'Content-Type': 'application/octet-stream', ...(opts ? { 'x-import-options': JSON.stringify(opts) } : {}) }, body: buf })
+    const send = (path, q, opts) => fetch(path + '?tid=' + encodeURIComponent(tidQ) + (q ? '&' + q.replace(/^\?/, '') : ''), { method: 'POST', headers: { 'x-token': me.token, 'Content-Type': 'application/octet-stream', ...(opts ? { 'x-import-options': JSON.stringify(opts) } : {}) }, body: buf })
       .then(async (r) => { const j = await r.json(); if (!r.ok) throw new Error(j.error); return j; });
     const info = await send('/api/admin/import-inspect');
     chooseSheets(info, send);
@@ -814,8 +849,8 @@ function importCard() {
     const evOpts = [['', '— none (use the Games column) —']].concat(S.events.map((e) => [e.id, e.name + ((e.section || 'adults') === 'kids' ? ' (kids)' : '')]));
     const blocks = info.sheets.map((sh) => {
       const KIND = { players: 'Players', games: 'Games', teams: 'Teams', fixtures: 'Fixtures', other: 'Not recognised' };
-      const cb = h('input', { type: 'checkbox', checked: sh.kind !== 'other' && sh.rows > 0, 'aria-label': 'Import sheet ' + sh.name });
-      const kind = sel([['players', 'Players'], ['games', 'Games'], ['teams', 'Teams'], ['fixtures', 'Fixtures']], sh.kind === 'other' ? 'players' : sh.kind);
+      const cb = h('input', { type: 'checkbox', checked: (master ? sh.kind === 'players' : sh.kind !== 'other') && sh.rows > 0, 'aria-label': 'Import sheet ' + sh.name });
+      const kind = sel(master ? [['players', 'Players']] : [['players', 'Players'], ['games', 'Games'], ['teams', 'Teams'], ['fixtures', 'Fixtures']], master || sh.kind === 'other' ? 'players' : sh.kind);
       const KC = { name: 'Game', sport: 'Sport', section: 'Category', type: 'Type', team: 'Team', games: 'Game', members: 'Members', member: 'Player columns', game: 'Game', a: 'Side A', b: 'Side B', stage: 'Round', group: 'Group', date: 'Date', time: 'Time', when: 'Date & time', court: 'Court', referee: 'Referee', bestOf: 'Best of', target: 'Points' };
       const colOpts = [['', '— not in this sheet —']].concat(sh.headers.map((x) => [x.col, x.text]));
       const maps = info.fields.map((fd) => ({ key: fd.key, label: fd.label, s: sel(colOpts, sh.map[fd.key] || '') }));
@@ -829,9 +864,10 @@ function importCard() {
         h('p', { class: 'muted small' }, 'Pick which column of this sheet holds each detail. Header row: ' + sh.headerRow + '.'),
         maps.map((m) => field(m.label, m.s)),
         sh.eventCols.length ? h('p', { class: 'small' }, 'Event columns (a "Yes"/✓ enters the player): ' + sh.eventCols.map((x) => x.eventName).join(', ')) : null,
-        sportSel.length ? h('div', {}, h('b', { class: 'small' }, 'Sport columns – which game a "Yes" enters'), h('p', { class: 'muted small' }, 'Automatic picks the game of that sport that fits the player’s section, gender and age (individual games first; for a team game the player goes on its interested list).'),
+        master ? h('p', { class: 'muted small' }, 'Master list upload: profiles are added or updated only – game columns are ignored. Upload from 🏆 Event → Players to also enter games, teams and fixtures.') : null,
+        !master && sportSel.length ? h('div', {}, h('b', { class: 'small' }, 'Sport columns – which game a "Yes" enters'), h('p', { class: 'muted small' }, 'Automatic picks the game of that sport that fits the player’s section, gender and age (individual games first; for a team game the player goes on its interested list).'),
           sportSel.map((x) => field(SPORT_ICON[x.sport] + ' ' + SPORT_LABEL[x.sport] + ' – ' + (x.section === 'kids' ? 'kids' : 'adults'), x.s))) : null,
-        field('Players with no games go into', ev, sh.eventId ? 'Guessed from the sheet name.' : 'Useful when each sheet is one event, e.g. a sheet called "Chess".'),
+        master ? null : field('Players with no games go into', ev, sh.eventId ? 'Guessed from the sheet name.' : 'Useful when each sheet is one event, e.g. a sheet called "Chess".'),
         field('Section when the sheet has no Section column', sec));
       const other = h('div', { class: 'muted small' }, sh.kind !== 'players' && sh.kind !== 'other' ? 'Recognised: ' + Object.keys(sh.kindCols || {}).map((k) => KC[k] || k).join(', ') : '');
       const showKind = () => { details.hidden = kind.value !== 'players'; other.hidden = kind.value === 'players'; };
@@ -873,6 +909,9 @@ function importCard() {
       dry.errors.length ? h('div', { class: 'warnbox small' }, h('b', {}, dry.errors.length + ' rows will be skipped:'), dry.errors.slice(0, 20).map((x) => h('div', {}, (x.sheet ? x.sheet + ' ' : '') + 'row ' + x.row + ' ' + x.name + ': ' + x.error))) : null),
     [any ? { label: 'Import', fn: async () => { const r = await run(); toast([r.gamesMade ? r.gamesMade + ' games' : '', r.teamsCreated ? r.teamsCreated + ' teams' : '', r.fixturesMade ? r.fixturesMade + ' fixtures' : ''].filter(Boolean).concat(['']).join(' • ') + r.created + ' players added' + (r.updated ? ' • ' + r.updated + ' updated' : '') + ' • ' + r.games + ' game entries' + (r.teamsMade ? ' • ' + r.teamsMade + ' new teams' : '') + (r.teamEntries ? ' • ' + r.teamEntries + ' team entries' : '') + (r.interested ? ' • ' + r.interested + ' on interested lists' : '')); await refresh(); } } : null].filter(Boolean));
   }
+  if (master) return h('div', { class: 'card' }, h('b', {}, '📥 Upload players to the master list (Excel / CSV)'),
+    h('p', { class: 'muted small' }, 'Adds new players and updates existing ones (same name + phone) with the sheet’s latest details. Nobody is put into an event or game – use ➕ Add to event afterwards, or upload from 🏆 Event → Players to fill games, teams and fixtures too. You see a preview first.'),
+    h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: guard(() => downloadWith('/api/admin/import-template.xlsx?tid=none', 'players-import-template.xlsx')) }, '⬇ Template'), imp, h('button', { class: 'btn', onclick: () => imp.click() }, '⬆ Upload filled sheet')));
   return h('div', { class: 'card' }, h('b', {}, '📥 Upload to ' + curT().name + ': players, games, teams & fixtures (Excel)'),
     h('p', { class: 'muted small' }, 'Upload any Excel or CSV file (a Google Forms export works) – one sheet or many. Sheets can hold players, games, teams or fixtures; download the Template to see each layout. Columns like “Select Games to Participate [Badminton]” with Yes, Category (Seniors / Under-16), Villa Number and Age are understood. Players already in the app are not duplicated: the latest sheet updates their details and game choices (upload it every season), and the old values are kept in their private notes. You choose which sheets to import, and columns are matched by their header (Name, Phone, Dept, Games, Team…), so your own layout works. A sheet named after an event (e.g. "Chess") puts its players in that event. You see a preview first, and possible duplicates are flagged rather than blocked.'),
     h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: guard(() => downloadWith('/api/admin/import-template.xlsx?tid=' + encodeURIComponent(curTid()), 'players-import-template.xlsx')) }, '⬇ Template'), imp, h('button', { class: 'btn', onclick: () => imp.click() }, '⬆ Upload filled sheet')));

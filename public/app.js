@@ -759,6 +759,7 @@ function activityBox(m) {
 
 /* ------- players ------- */
 Views.players = () => {
+  if (isAdmin()) return masterPlayers(false);
   let q = '';
   const list = h('div', { class: 'list' });
   const draw = () => {
@@ -911,10 +912,12 @@ Views.referees = (embedded) => {
   return h('div', {},
     S.tournament.refSignupOpen && !me.role ? h('a', { class: 'card tip', href: '#/refsignup' }, '🙋 Want to referee? Tap here to sign up – the organizers approve every referee.') : null,
     organizer ? refereesAdmin() : null,
+    organizer ? pickBar(refs, [{ label: '🗑 Remove referees', fn: (sel) => confirmBox('Remove ' + sel.length + ' referee' + (sel.length === 1 ? '' : 's') + '? They are taken off every game and match, and their referee sign-in stops (their player profile stays). They go to Admin → Trash for 30 days.',
+      guard(async () => { const r = await api('POST', '/api/admin/referees/bulk-delete', { ids: sel }); ui.pickP = null; await refresh(); keptReport(r, 'removed', ''); }), 'Remove') }], 'referees') : null,
     refs.length ? h('div', { class: 'list' }, refs.map((r) => { const c = assigned(r.id), sc = scope(r);
-      return h('div', { class: 'row' }, h('div', { class: 'grow' }, h('b', {}, r.name),
+      return h('div', { class: 'row' }, organizer && ui.pickP ? pickBox(r, true) : null, h('div', { class: 'grow' }, h('b', {}, r.name),
         h('div', { class: 'muted small' }, [REF_KIND_LABEL[r.kind] || 'Referee', r.kind === 'chief' ? 'All sports' : sc.length ? sc.join(', ') : '⚠ No sport mapped – not offered for any game' + (organizer ? ' (tap Edit)' : ''), c.n ? c.done + ' of ' + c.n + ' assigned matches done' : ''].filter(Boolean).join(' • '))),
-        organizer ? h('button', { class: 'btn ghost sm', onclick: () => refereeModal(r) }, 'Edit') : null); }))
+        organizer && !ui.pickP ? h('button', { class: 'btn ghost sm', onclick: () => refereeModal(r) }, '✏️ Edit') : null); }))
       : h('p', { class: 'empty' }, 'No referees yet.' + (organizer ? '' : ' The organizers add them.')));
 };
 Views.refsignup = () => {
@@ -1515,7 +1518,7 @@ function busy() {
   return document.querySelector('.modal') || (/^#\/(admin|login|certs|gallery|season)/.test(location.hash) && document.activeElement && document.activeElement.matches('input,select,textarea'));
 }
 
-window.addEventListener('hashchange', () => { ui.pick = null; ui.pickP = null; });
+window.addEventListener('hashchange', () => { ui.pick = null; ui.pickP = null; ui.pq = ''; });
 window.addEventListener('hashchange', render);
 window.addEventListener('DOMContentLoaded', async () => {
   applyTheme();
