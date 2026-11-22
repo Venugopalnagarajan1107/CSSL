@@ -1698,6 +1698,11 @@ async function route(req, res, url) {
   }
   if (p === '/api/me' && m === 'GET') {
     if (!user) return json(res, 200, { role: null });
+    /* roles may have changed since signing in (linked to a player, made referee…): rebuild the session from the records */
+    const src = user.personId && find('players', user.personId) ? { kind: 'player', rec: find('players', user.personId) } : user.adminId && db.admins.find((a) => a.id === user.adminId) ? { kind: 'admin', rec: db.admins.find((a) => a.id === user.adminId) }
+      : user.refId && find('referees', user.refId) ? { kind: 'referee', rec: find('referees', user.refId) } : null;
+    const fresh = src && sessionFor(src);
+    if (fresh) { const keep = db.sessions[user.token]; db.sessions[user.token] = { ...fresh, exp: keep.exp }; Object.assign(user, fresh); }
     const pl = user.personId && find('players', user.personId);
     const mine = pl ? (({ pinHash, pinIdx: _i, editTokenHash, ...x }) => x)(pl) : null;
     return json(res, 200, { ...sessOut(user.token, user), token: undefined, profile: mine, hasPin: !!(pl && pl.pinHash) });
