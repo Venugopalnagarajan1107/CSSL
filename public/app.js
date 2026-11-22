@@ -55,7 +55,7 @@ let me = store.get('me', { role: null });
 let pending = store.get('pending', []);
 let offline = false;
 const Views = {};
-let ui = { pick: null, tid: store.get('tid', ''), sport: store.get('sport', ''), eventTab: {}, matchFilter: { event: '', status: '' }, adminTab: 'setup', certJob: null, section: store.get('section', 'adults'), matchView: 'list', playerSection: '', tvIdx: 0, rubber: {} };
+let ui = { pick: null, pickP: null, tid: store.get('tid', ''), sport: store.get('sport', ''), eventTab: {}, matchFilter: { event: '', status: '' }, adminTab: 'setup', certJob: null, section: store.get('section', 'adults'), matchView: 'list', playerSection: '', tvIdx: 0, rubber: {} };
 
 /* ------------------------------------------------------------------- api */
 async function api(method, url, body, raw) {
@@ -773,7 +773,7 @@ Views.players = () => {
   draw(); return wrap;
 };
 
-/* ------- season: one active season (e.g. "CSSL - Season 3") holds all games; past seasons are kept read-only ------- */
+/* ------- events: several can run side by side (e.g. "CSSL - Season 3" and a kids' cup); closed ones stay read-only ------- */
 function seasonCard() {
   const t = S.tournament;
   const ds = S.matches.filter((m) => evOf(m)).map((m) => E.derive(liveMatch(m), evOf(m)).status);
@@ -849,7 +849,8 @@ function eventSwitcher() {
   const ts = realTours().slice().sort((a, b) => (a.status === 'closed') - (b.status === 'closed') || (b.createdAt || 0) - (a.createdAt || 0));
   return h('div', { class: 'evswitch' },
     ts.length > 1 ? h('select', { 'aria-label': 'Event', onchange: (e) => pickEvent(e.target.value) }, ts.map((t) => h('option', { value: t.id, selected: t.id === curTid() }, t.name + (t.status === 'closed' ? ' (closed)' : '')))) : null,
-    isStaff() ? h('button', { class: 'btn ghost sm', onclick: () => newEventModal() }, '+ New event') : null);
+    isStaff() ? h('button', { class: 'btn ghost sm', onclick: () => newEventModal() }, '+ New event') : null,
+    ts.length && ts.every((t) => t.status === 'closed') ? h('div', { class: 'card tip small' }, 'No event is running right now – the ones below are closed and kept for results and rankings.' + (isStaff() ? ' Start one with “+ New event” when you need it.' : '')) : null);
 }
 
 /* ------- rankings: points for wins/draws plus medals, per sport or overall, this season or all-time ------- */
@@ -1452,10 +1453,42 @@ function renderHeader() {
   document.title = t.name;
 }
 
-function renderNav(name) {
-  const items = [['', '🏠', 'Home'], ['season', '🏆', 'Event'], ['matches', '🏸', 'Matches'], ['rankings', '🏅', 'Rankings'], ['players', '👥', 'Players'], ['gallery', '📷', 'Gallery']];
-  $('#nav').replaceChildren(...items.map(([r, i, l]) => h('a', { href: '#/' + r, class: (name === r || (r === '' && name === 'home')) ? 'on' : '' }, h('span', {}, i), l)));
+/* Outline icons drawn in the text colour: grey on the menu bar, white on the highlighted tab. */
+const ICON_PATHS = {
+  home: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/>',
+  event: '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0z"/><path d="M17 5h3v2a3 3 0 0 1-3 3M7 5H4v2a3 3 0 0 0 3 3"/>',
+  matches: '<rect x="3" y="4.5" width="18" height="16" rx="2"/><path d="M3 9.5h18M8 2.5v4M16 2.5v4"/>',
+  rankings: '<path d="M4 20v-8h5v8M9.5 20V6h5v14M15 20v-5h5v5M3 20h18"/>',
+  players: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14.5a6.5 6.5 0 0 1 3.5 5.5"/>',
+  gallery: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 16-5-5L5 20"/>',
+  contact: '<path d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2"/>',
+};
+function icon(k) { const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); s.setAttribute('viewBox', '0 0 24 24'); s.setAttribute('aria-hidden', 'true'); s.setAttribute('class', 'ic'); s.innerHTML = ICON_PATHS[k] || ''; return s; }
+/* Which menu tab a page belongs to: a match or game opened from Event keeps Event lit; a friendly match keeps Matches lit. */
+function navKey(name, arg) {
+  if (name === 'home' || name === '') return '';
+  if (name === 'match' || name === 'event') { const ev = name === 'event' ? byId('events', arg) : evOf(byId('matches', arg) || {}); return ev && isFriendlyEv(ev) ? 'matches' : 'season'; }
+  return { season: 'season', seasons: 'season', matches: 'matches', rankings: 'rankings', players: 'players', player: 'players', gallery: 'gallery', contact: 'contact' }[name] || null;
 }
+function renderNav(name) {
+  const items = [['', 'home', 'Home'], ['season', 'event', 'Event'], ['matches', 'matches', 'Matches'], ['rankings', 'rankings', 'Rankings'], ['players', 'players', 'Players'], ['gallery', 'gallery', 'Gallery'], ['contact', 'contact', 'Contact us']];
+  const key = navKey(name, location.hash.replace(/^#\/?/, '').split('/')[1]);
+  $('#nav').replaceChildren(...items.map(([r, i, l]) => h('a', { href: '#/' + r, class: key === r ? 'on' : '', 'aria-current': key === r ? 'page' : null }, icon(i), h('span', { class: 'lbl' }, l))));
+  const bar = $('#bar'); if (bar) document.documentElement.style.setProperty('--barh', bar.offsetHeight + 'px');
+}
+/* Contact us: who runs each event (names only – no phone numbers are shown publicly). */
+Views.contact = () => {
+  const orgs = SA.organizers || [], nm = (id) => (orgs.find((a) => a.id === id) || {}).name;
+  const open = realTours().filter((t) => t.status !== 'closed'), main = orgs.filter((a) => a.main || (!a.limited && !(a.sports || []).length));
+  return h('div', {}, h('h1', {}, 'Contact us'),
+    h('p', { class: 'muted small' }, 'For questions about an event – registration, fixtures, timings or scores – speak to its organizers.'),
+    open.length ? open.map((t) => { const names = (t.organizerIds || []).map(nm).filter(Boolean);
+      return h('div', { class: 'card' }, h('b', {}, '🏆 ' + t.name), t.dates || t.venue ? h('div', { class: 'muted small' }, [t.dates, t.venue].filter(Boolean).join(' • ')) : null,
+        names.length ? h('div', { class: 'list' }, names.map((n) => h('div', { class: 'row' }, icon('players'), h('b', { class: 'grow' }, n)))) : h('p', { class: 'muted small' }, 'Organizers not named yet.')); })
+      : h('p', { class: 'empty' }, 'No event is running right now.'),
+    main.length ? h('div', { class: 'card' }, h('b', {}, 'App administrators'), h('div', { class: 'list' }, main.map((a) => h('div', { class: 'row' }, icon('players'), h('b', { class: 'grow' }, a.name))))) : null,
+    h('p', { class: 'muted small' }, 'Found a wrong score? Open the match and tap ⚑ Report a score problem.'));
+};
 
 function render() {
   if (SA && S === SA) scope();
@@ -1482,7 +1515,7 @@ function busy() {
   return document.querySelector('.modal') || (/^#\/(admin|login|certs|gallery|season)/.test(location.hash) && document.activeElement && document.activeElement.matches('input,select,textarea'));
 }
 
-window.addEventListener('hashchange', () => { ui.pick = null; });
+window.addEventListener('hashchange', () => { ui.pick = null; ui.pickP = null; });
 window.addEventListener('hashchange', render);
 window.addEventListener('DOMContentLoaded', async () => {
   applyTheme();

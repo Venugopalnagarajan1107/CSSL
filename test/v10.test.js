@@ -60,7 +60,7 @@ test('multi-sheet excel import: sheet picker, header mapping, event-per-sheet, m
     assert.equal((await post('/api/admin/import-players', '?dry=1', { sheets: [{ index: 2, map: {} }] })).status, 400);
 
     // profiles are permanent; the organizer removes the player from the event instead
-    assert.equal((await call('DELETE', '/api/admin/players/' + alpha[0].id, null, admin)).status, 403);
+    // (a profile with no match history may be deleted – covered in v21)
     const tid = (await call('GET', '/api/state', null, admin)).body.tournaments[0].id;
     assert.equal((await call('POST', '/api/admin/tournaments/' + tid + '/roster', { remove: alpha[0].id }, admin)).status, 200);
     const g = (await call('GET', '/api/state', null, admin)).body;
