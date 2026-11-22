@@ -254,6 +254,59 @@ const BUB = { green: '#16a34a', yellow: '#eab308', red: '#dc2626' };
 const bubble = (pid) => { const p = byId('players', pid), c = p && p.card; return h('span', { class: 'bubble', title: c ? (c.bubble === 'red' ? 'Suspended: ' + c.left + ' game(s) left' : c.bubble === 'yellow' ? 'Warning on record' : 'Clean record') : '', style: 'background:' + (BUB[(c || {}).bubble] || BUB.green) }); };
 const chip = (status) => h('span', { class: 'chip ' + status }, { live: '● LIVE', completed: 'Full time', scheduled: 'Upcoming' }[status]);
 
+/* 🔔 Notify – WhatsApp the players of a match that is still to be played (organizers and referees). */
+const canNotify = (ev) => !!ev && isStaff() && (!!me.refId || canManage(ev) || isFriendlyEv(ev));
+function notifyBtn(m, ev, d, cls) {
+  if (!canNotify(ev) || d.status !== 'scheduled') return null;
+  const n = m.notified;
+  return h('button', { type: 'button', class: 'btn notify ' + (cls || 'ghost sm'), title: n ? 'Notified ' + ago(n.at) + ' by ' + n.by : 'Send a WhatsApp reminder to the players', 'aria-label': 'Notify players on WhatsApp',
+    onclick: (e) => { e.preventDefault(); e.stopPropagation(); notifyModal(m); } }, h('span', { 'aria-hidden': 'true' }, n ? '🔔✓' : '🔔'), ' Notify');
+}
+/* "Delete this match?" plus what happens to the numbers after it. */
+function delMsg(m, what) {
+  const later = SA.matches.filter((x) => x.eventId === m.eventId && x.no > (m.no || 0)).map((x) => x.no), top = later.length ? Math.max(...later) : 0;
+  return 'Delete ' + what + (m.no ? ' #' + m.no : '') + '?' + (m.no && top ? ' Match' + (top > m.no + 1 ? 'es #' + (m.no + 1) + '–#' + top + ' will become #' + m.no + '–#' + (top - 1) : ' #' + top + ' will become #' + m.no) + '.' : '');
+}
+const plannedTxt = (m) => (m.plannedNo && m.no && m.plannedNo !== m.no ? 'planned #' + m.plannedNo : null);
+const renumbered = (m) => !!(m.notified && m.notified.no && m.no && m.notified.no !== m.no);
+function ago(t) { const s = Math.max(0, (Date.now() - t) / 1000); return s < 90 ? 'just now' : s < 5400 ? Math.round(s / 60) + ' min ago' : s < 129600 ? Math.round(s / 3600) + ' h ago' : Math.round(s / 86400) + ' days ago'; }
+async function notifyModal(m) {
+  const plan = await api('POST', '/api/staff/matches/' + m.id + '/notify', { base: BASE() }).catch((e) => { toast(e.message, true); return null; });
+  if (!plan) return;
+  const sent = new Set();
+  const msg = h('textarea', { rows: 8, 'aria-label': 'Message', oninput: () => draw() }, plan.message);
+  const textFor = (r) => msg.value.replace(/\{name\}/g, r.first).replace(/\{link\}/g, plan.link);
+  const list = h('div', { class: 'list' });
+  const draw = () => {
+    list.replaceChildren(...plan.recipients.map((r) => h('div', { class: 'row' },
+      h('div', { class: 'grow' }, h('b', {}, r.name), h('div', { class: 'muted small' }, maskPhone(r.phone) + (r.error ? ' • ⚠ ' + r.error : ''))),
+      r.sent ? h('span', { class: 'chip completed' }, '✓ Sent') :
+        h('a', { class: 'btn sm ' + (sent.has(r.id) ? 'ghost' : 'wa'), href: 'https://wa.me/' + r.phone + '?text=' + encodeURIComponent(textFor(r)), target: '_blank', rel: 'noopener',
+          onclick: () => { sent.add(r.id); setTimeout(draw, 50); } }, sent.has(r.id) ? '✓ Opened' : 'WhatsApp'))));
+  };
+  draw();
+  const n = plan.recipients.length, last = m.notified;
+  const box = modal('🔔 Notify players', h('div', {},
+    h('p', { class: 'small' }, h('b', {}, plan.title), h('br'), plan.line.split(' • ').slice(1).join(' • ')),
+    last ? h('div', { class: (renumbered(m) ? 'warnbox' : 'tip card') + ' small' }, 'Already notified ' + ago(last.at) + ' by ' + last.by + ' (' + last.n + ' player' + (last.n === 1 ? '' : 's') + ').' + (renumbered(m) ? ' The match number has changed since then (was #' + last.no + ', now #' + m.no + ') – send again so players have the new number.' : '')) : null,
+    field('Message', msg, '{name} becomes each player’s first name, {link} the live-score link.'),
+    n ? h('div', {}, h('b', {}, n + ' player' + (n === 1 ? '' : 's') + ' with a phone number'),
+      h('p', { class: 'muted small' }, plan.auto ? 'Send them all at once, or one by one.' : 'Tap each WhatsApp button – WhatsApp opens with the message ready; press send there, then come back for the next player.'), list)
+      : h('div', { class: 'warnbox small' }, 'None of the players in this match has a phone number saved.'),
+    plan.missing.length ? h('div', { class: 'warnbox small' }, 'No phone number: ' + plan.missing.join(', ') + '. Add it in their profile, or tell them in person.') : null,
+    h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: guard(async () => { await navigator.clipboard.writeText(msg.value.replace(/\{link\}/g, plan.link)); toast('Copied'); }) }, 'Copy message'),
+      h('a', { class: 'btn ghost', href: '#', onclick: (e) => { e.preventDefault(); window.open('https://wa.me/?text=' + encodeURIComponent(msg.value.replace(/\{name\}/g, 'everyone').replace(/\{link\}/g, plan.link)), '_blank', 'noopener'); } }, 'Send to a WhatsApp group'))),
+    plan.auto && n ? [{ label: 'Close', cls: 'ghost', fn: () => {} }, { label: 'Send to all ' + n, fn: async () => {
+      const r = await api('POST', '/api/staff/matches/' + m.id + '/notify', { send: true, message: msg.value, base: BASE() });
+      const ok = r.recipients.filter((x) => x.sent).length;
+      plan.recipients = r.recipients; draw(); toast(ok + ' of ' + n + ' sent on WhatsApp', ok < n); await refresh();
+      return ok < n ? false : undefined;
+    } }] : null);
+  /* Remember who was messaged by hand once the sheet closes. */
+  const mark = () => { if (sent.size) api('POST', '/api/staff/matches/' + m.id + '/notify', { mark: sent.size, message: msg.value }).then(() => refresh()).catch(() => {}); };
+  new MutationObserver((_, ob) => { if (!box.el.isConnected) { ob.disconnect(); mark(); } }).observe(document.body, { childList: true });
+}
+
 function matchCard(m, opts) {
   opts = opts || {};
   const ev = evOf(m); if (!ev) return null;
@@ -264,14 +317,15 @@ function matchCard(m, opts) {
   if (ev.scoring === 'result' && d.status === 'completed') mid = d.draw ? '½ – ½' : d.winner === 'A' ? '1 – 0' : '0 – 1';
   return h('a', { class: 'card match ' + d.status, href: '#/match/' + m.id },
     h('div', { class: 'mc-top' }, chip(d.status),
-      h('span', { class: 'muted' }, [opts.event ? ev.name + (m.no ? ' #' + m.no : '') : m.no ? 'Match #' + m.no : null, m.stage !== 'League' ? m.stage : (m.round ? 'Round ' + m.round + (m.totalRounds ? ' of ' + m.totalRounds : '') : null), m.court, fmtSlot(m)].filter(Boolean).join(' • '))),
+      h('span', { class: 'muted' }, [opts.event ? ev.name + (m.no ? ' #' + m.no : '') : m.no ? 'Match #' + m.no : null, plannedTxt(m) ? '(' + plannedTxt(m) + ')' : null, m.stage !== 'League' ? m.stage : (m.round ? 'Round ' + m.round + (m.totalRounds ? ' of ' + m.totalRounds : '') : null), m.court, fmtSlot(m)].filter(Boolean).join(' • '))),
     h('div', { class: 'mc-row' },
       h('div', { class: 'mc-side' + (d.winner === 'A' ? ' win' : '') }, A),
       h('div', { class: 'mc-mid' }, mid),
       h('div', { class: 'mc-side right' + (d.winner === 'B' ? ' win' : '') }, B)),
     d.status === 'live' && ev.scoring === 'points' && d.current ? h('div', { class: 'mc-live' }, 'Game ' + (d.games.length + 1) + ': ' + d.current.a + ' – ' + d.current.b) : null,
     d.tie ? h('div', { class: 'mc-games' }, d.rubbers.filter((x) => x.status !== 'scheduled').map((x) => x.name + ' ' + (x.status === 'completed' ? (x.winner === 'A' ? '✓' : '✗') + ' ' + E.scoreText(x) : '● ' + (x.current ? x.current.a + '–' + x.current.b : ''))).join(' • ') || 'Line-ups and rubbers: tap to open') : null,
-    !d.tie && (d.games.length || d.outcome) ? h('div', { class: 'mc-games' }, [d.outcome ? OUT[d.outcome].trim() : '', d.outcome === 'walkover' || d.outcome === 'dq' ? '' : E.scoreText(d)].filter(Boolean).join(' • ')) : null);
+    !d.tie && (d.games.length || d.outcome) ? h('div', { class: 'mc-games' }, [d.outcome ? OUT[d.outcome].trim() : '', d.outcome === 'walkover' || d.outcome === 'dq' ? '' : E.scoreText(d)].filter(Boolean).join(' • ')) : null,
+    d.status === 'scheduled' && canNotify(ev) ? h('div', { class: 'mc-notify' }, m.notified ? h('span', { class: renumbered(m) ? 'warn small' : 'muted small' }, renumbered(m) ? '⚠ Number changed since notified (was #' + m.notified.no + ')' : '🔔 Notified ' + ago(m.notified.at)) : h('span'), notifyBtn(m, ev, d)) : null);
 }
 
 function standingsRows(ev, rows, qualText) {
@@ -514,8 +568,9 @@ Views.match = (id) => {
   const np = pendingFor(m.id);
   return h('div', {},
     h('div', { class: 'page-h' }, h('a', { class: 'back', href: isFriendlyEv(ev) ? '#/matches' : '#/event/' + ev.id }, '‹'), h('h1', {}, ev.name + (m.no ? ' #' + m.no : ''))),
-    h('div', { class: 'muted small center' }, [m.stage === 'League' && m.round ? 'Round ' + m.round + (m.totalRounds ? ' of ' + m.totalRounds : '') : m.stage, m.court, m.time, ref ? 'Referee: ' + ref.name : null].filter(Boolean).join(' • ')),
+    h('div', { class: 'muted small center' }, [plannedTxt(m) ? 'Planned as #' + m.plannedNo : null, m.stage === 'League' && m.round ? 'Round ' + m.round + (m.totalRounds ? ' of ' + m.totalRounds : '') : m.stage, m.court, m.time, ref ? 'Referee: ' + ref.name : null].filter(Boolean).join(' • ')),
     h('div', { class: 'center' }, chip(d.status)),
+    d.status === 'scheduled' && canNotify(ev) ? h('div', { class: 'actions center' }, notifyBtn(m, ev, d, 'ghost')) : null,
     h('div', { class: 'scoreboard' }, side('A', A), h('div', { class: 'sb-vs' }, 'VS'), side('B', B)),
     staff || isAdmin() ? playersChips(m, ev) : null,
     ev.scoring === 'points' && d.status !== 'completed' ? h('div', { class: 'center muted' }, 'Game ' + (d.games.length + 1) + ' of ' + ev.config.bestOf + ' • first to ' + ev.config.target + (ev.config.winBy > 1 ? ' (win by ' + ev.config.winBy + ')' : '')) : null,
@@ -534,7 +589,7 @@ Views.match = (id) => {
     isAdmin() ? h('div', { class: 'actions' },
       h('button', { class: 'btn ghost', onclick: () => fixtureModal(ev.id, m) }, 'Edit fixture'),
       h('button', { class: 'btn ghost', onclick: guard(async () => { await api('POST', '/api/admin/announce', { matchId: m.id }); toast('“Up next” notification sent'); }) }, '🔔 Call to court'),
-      h('button', { class: 'btn danger', onclick: () => confirmBox('Delete this match?', guard(async () => { await api('DELETE', '/api/admin/matches/' + m.id); location.hash = '#/event/' + ev.id; await refresh(); }), 'Delete') }, 'Delete')) : null,
+      h('button', { class: 'btn danger', onclick: () => confirmBox(delMsg(m, 'match'), guard(async () => { await api('DELETE', '/api/admin/matches/' + m.id); location.hash = '#/event/' + ev.id; await refresh(); }), 'Delete') }, 'Delete')) : null,
     isAdmin() ? activityBox(m) : null);
 };
 
@@ -603,8 +658,9 @@ function tieView(m) {
   });
   return h('div', {},
     h('div', { class: 'page-h' }, h('a', { class: 'back', href: isFriendlyEv(ev) ? '#/matches' : '#/event/' + ev.id }, '‹'), h('h1', {}, ev.name + (m.no ? ' #' + m.no : ''))),
-    h('div', { class: 'muted small center' }, [m.stage, m.court, fmtSlot(m), ref ? 'Referee: ' + ref.name : null].filter(Boolean).join(' • ')),
+    h('div', { class: 'muted small center' }, [plannedTxt(m) ? 'Planned as #' + m.plannedNo : null, m.stage, m.court, fmtSlot(m), ref ? 'Referee: ' + ref.name : null].filter(Boolean).join(' • ')),
     h('div', { class: 'center' }, chip(d.status)),
+    d.status === 'scheduled' && canNotify(ev) ? h('div', { class: 'actions center' }, notifyBtn(m, ev, d, 'ghost')) : null,
     h('div', { class: 'scoreboard' },
       h('div', { class: 'sb-side' + (d.winner === 'A' ? ' win' : '') }, h('div', { class: 'sb-name' }, A), h('div', { class: 'sb-pts' }, d.gamesA), h('div', { class: 'sb-games' }, 'rubbers won')),
       h('div', { class: 'sb-vs' }, 'VS'),
@@ -623,7 +679,7 @@ function tieView(m) {
     isAdmin() ? h('div', { class: 'actions' },
       h('button', { class: 'btn ghost', onclick: () => fixtureModal(ev.id, m) }, 'Edit fixture'),
       h('button', { class: 'btn ghost', onclick: guard(async () => { await api('POST', '/api/admin/announce', { matchId: m.id }); toast('“Up next” notification sent'); }) }, '🔔 Call to court'),
-      h('button', { class: 'btn danger', onclick: () => confirmBox('Delete this tie?', guard(async () => { await api('DELETE', '/api/admin/matches/' + m.id); location.hash = '#/event/' + ev.id; await refresh(); }), 'Delete') }, 'Delete')) : null,
+      h('button', { class: 'btn danger', onclick: () => confirmBox(delMsg(m, 'tie'), guard(async () => { await api('DELETE', '/api/admin/matches/' + m.id); location.hash = '#/event/' + ev.id; await refresh(); }), 'Delete') }, 'Delete')) : null,
     isAdmin() ? activityBox(m) : null);
 }
 
