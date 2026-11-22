@@ -666,28 +666,57 @@ function syncGame(ev, board, category, apply, by) {
   out.unknown = Object.entries(out.unknown).map(([name, error]) => ({ name, error }));
   return out;
 }
+/* Which tab of the page belongs to a game: by its section (adults -> seniors, kids -> juniors), else the one named in its settings. */
+const SECTION_CAT = { kids: /junior|kid|child|youth|under|\bu\s?\d/i, adults: /senior|adult|open|elite/i };
+function catFor(ev, board) {
+  const keys = Object.keys(board), bySec = keys.filter((k) => SECTION_CAT[ev.section || 'adults'].test(k));
+  if (bySec.length === 1) return bySec[0];
+  const want = String((ev.sync && ev.sync.category) || '').trim().toLowerCase(), named = keys.find((k) => k.toLowerCase() === want);
+  if (named) return named;
+  return keys.length === 1 ? keys[0] : null;
+}
+const sisterGame = (e, ev) => e.tid === ev.tid && e.sport === ev.sport && (e.sideType || 'player') === (ev.sideType || 'player') && (e.sideSize || 1) === (ev.sideSize || 1);
+/* The games one scoreboard page feeds: this game and the other games of the same sport in the same event (one per tab). */
+function syncTargets(ev, board) {
+  const sib = db.events.filter((e) => sisterGame(e, ev)), byCat = {};
+  sib.forEach((e) => { const c = catFor(e, board); if (c) (byCat[c] = byCat[c] || []).push(e); });
+  return Object.entries(byCat).map(([cat, list]) => {
+    const pick = list.find((e) => e.id === ev.id) || (list.length === 1 ? list[0] : list.find((e) => e.sync && e.sync.url));
+    return pick ? { ev: pick, cat } : null;
+  }).filter(Boolean).sort((a, b) => (a.ev.id === ev.id ? -1 : b.ev.id === ev.id ? 1 : 0));
+}
+/* One sync reads the page once and brings every tab into its game (e.g. seniors -> Table Tennis, juniors -> Kids – Table Tennis). */
 async function runSync(ev, opts, by) {
-  const s = syncDefaults(ev), url = opts.url || s.url, category = opts.category || s.category;
+  const s = syncDefaults(ev), url = opts.url || s.url;
   let board;
   try { board = Scoreboard.extract(await Scoreboard.fetchPage(url)); } catch (e) { throw new HttpError(400, 'Could not read the scoreboard: ' + e.message); }
-  const plan = syncGame(ev, board, category, !!opts.apply, by);
-  plan.categories = Object.keys(board); plan.category = category; plan.url = url;
-  plan.players = board[category] ? board[category].players : [];
+  const targets = syncTargets(ev, board);
+  if (!targets.some((t) => t.ev.id === ev.id)) throw new HttpError(400, 'No tab on the page matches ' + ev.name + ' (the page has: ' + Object.keys(board).join(', ') + ').');
+  const games = targets.map(({ ev: g, cat }) => {
+    const plan = syncGame(g, board, cat, !!opts.apply, by);
+    return { eventId: g.id, name: g.name, category: cat, players: board[cat].players, ...plan };
+  });
   if (opts.apply) {
-    ev.sync = { ...s, url, category, last: { at: Date.now(), by, entered: plan.enter.length, created: plan.create.length, conflicts: plan.conflicts.length } };
-    if (plan.enter.length || plan.create.length) audit(by, 'synced scores', ev.name + ': ' + plan.enter.length + ' results, ' + plan.create.length + ' new fixtures from ' + url);
+    targets.forEach(({ ev: g, cat }, i) => {
+      const p = games[i], gs = syncDefaults(g);
+      g.sync = { ...gs, url, category: cat, auto: g.id === ev.id ? s.auto : (gs.auto || s.auto), last: { at: Date.now(), by, entered: p.enter.length, created: p.create.length, conflicts: p.conflicts.length } };
+      if (p.enter.length || p.create.length) audit(by, 'synced scores', g.name + ' (' + cat + '): ' + p.enter.length + ' results, ' + p.create.length + ' new fixtures from ' + url);
+    });
     save(); broadcast();
   }
-  return plan;
+  const sum = (k) => games.reduce((a, g) => a + (Array.isArray(g[k]) ? g[k].length : g[k]), 0);
+  return { ...games[0], categories: Object.keys(board), url, games, totals: { enter: sum('enter'), create: sum('create'), same: sum('same'), pending: sum('pending'), conflicts: sum('conflicts'), unknown: sum('unknown') } };
 }
-/* auto-sync: every 5 minutes for games that ask for it */
+/* auto-sync: every 5 minutes for games that ask for it (one read of the page covers its sister games) */
 let syncBusy = false;
 setInterval(async () => {
   if (syncBusy) return; syncBusy = true;
   try {
+    const done = new Set();
     for (const ev of db.events.filter((e) => e.sync && e.sync.auto && e.sync.url)) {
+      if (done.has(ev.id)) continue;
       const T = tour(ev.tid); if (T && T.status === 'closed') continue;
-      try { await runSync(ev, { apply: true }, 'Scoreboard sync'); }
+      try { const r = await runSync(ev, { apply: true }, 'Scoreboard sync'); r.games.forEach((g) => done.add(g.eventId)); }
       catch (e) { ev.sync.last = { at: Date.now(), by: 'Scoreboard sync', error: String(e.message).slice(0, 200) }; save(); }
     }
   } finally { syncBusy = false; }
@@ -3224,13 +3253,15 @@ async function route(req, res, url) {
         if (b.category != null) s.category = str(b.category, 40);
         if (b.auto != null) s.auto = !!b.auto;
         if (b.aliases && typeof b.aliases === 'object') Object.entries(b.aliases).slice(0, 200).forEach(([k, v]) => { const n = str(k, 60); if (!v) delete s.aliases[n]; else if (find('players', String(v))) s.aliases[n] = String(v); });
-        ev.sync = s; audit(user.name, 'scoreboard sync settings', ev.name + (s.auto ? ' (auto)' : '')); save(); broadcast();
+        ev.sync = s;
+        db.events.filter((e) => e.id !== ev.id && sisterGame(e, ev)).forEach((e) => { e.sync = { ...syncDefaults(e), url: s.url, auto: s.auto }; });   /* one page feeds all its tabs' games */
+        audit(user.name, 'scoreboard sync settings', ev.name + (s.auto ? ' (auto)' : '')); save(); broadcast();
         return json(res, 200, s);
       }
       if (!mm[2] && m === 'POST') {
         if (T && T.status === 'closed') throw new HttpError(409, T.name + ' is closed.');
         const b = await readJson(req, 4000);
-        return json(res, 200, await runSync(ev, { apply: !b.dry, url: b.url, category: b.category }, user.name));
+        return json(res, 200, await runSync(ev, { apply: !b.dry, url: b.url }, user.name));
       }
       throw new HttpError(405, 'Method not allowed');
     }
